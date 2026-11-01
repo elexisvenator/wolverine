@@ -72,6 +72,17 @@ public class natural_key_aggregate_on_ancillary_store : IAsyncLifetime
             opts.Projections.Snapshot<NkGadget>(SnapshotLifecycle.Inline);
         }).IntegrateWithWolverine();
 
+        // The string-identity natural-key endpoints in the endpoint assembly need this store
+        builder.Services.AddMartenStore<INkStringStore>(m =>
+        {
+            m.Connection(Servers.PostgresConnectionString);
+            m.DatabaseSchemaName = "nk_http_strings";
+            m.Events.DatabaseSchemaName = "nk_http_strings";
+            m.Events.StreamIdentity = JasperFx.Events.StreamIdentity.AsString;
+            m.DisableNpgsqlLogging = true;
+            m.Projections.Snapshot<NkStringGadget>(SnapshotLifecycle.Inline);
+        }).IntegrateWithWolverine();
+
         builder.Services.AddResourceSetupOnStartup();
         builder.Services.AddWolverineHttp();
 
@@ -231,6 +242,46 @@ public class natural_key_aggregate_on_ancillary_store : IAsyncLifetime
         {
             s.Post.Json(new CreateNkGadget(code.Value, "Second")).ToUrl("/nkgadgets");
             s.StatusCodeShouldBe(409);
+        });
+    }
+
+    private async Task<NkStringGadget?> loadStringGadget(string streamKey)
+    {
+        var store = theHost.Services.GetRequiredService<INkStringStore>();
+        await using var session = store.LightweightSession();
+        return await session.LoadAsync<NkStringGadget>(streamKey, TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task write_and_read_by_a_natural_key_in_the_route_on_a_string_identity_store()
+    {
+        // Without the key type the route value would be the stream key, which any string parses into
+        var streamKey = "stream-" + Guid.NewGuid().ToString("N");
+        var code = new GadgetCode("G-" + Guid.NewGuid().ToString("N"));
+
+        var store = theHost.Services.GetRequiredService<INkStringStore>();
+        await using (var session = store.LightweightSession())
+        {
+            session.Events.StartStream<NkStringGadget>(streamKey, new NkStringGadgetCreated(code, "Original"));
+            await session.SaveChangesAsync(TestContext.Current.CancellationToken);
+        }
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkStringGadget("Renamed")).ToUrl($"/nkstring-gadgets/{code.Value}/rename");
+            s.StatusCodeShouldBe(204);
+        });
+
+        (await loadStringGadget(streamKey))!.Name.ShouldBe("Renamed");
+
+        var gadget = await theHost.GetAsJson<NkStringGadget>($"/nkstring-gadgets/{code.Value}");
+        gadget!.Id.ShouldBe(streamKey);
+
+        // The stream key is not the natural key
+        await theHost.Scenario(s =>
+        {
+            s.Get.Url($"/nkstring-gadgets/{streamKey}");
+            s.StatusCodeShouldBe(404);
         });
     }
 }

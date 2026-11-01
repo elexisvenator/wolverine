@@ -64,6 +64,17 @@ public class deduplication_races_on_an_ancillary_store : IAsyncLifetime
             m.Projections.Snapshot<NkGadget>(SnapshotLifecycle.Inline);
         }).IntegrateWithWolverine().UseLightweightSessions();
 
+        // The string-identity natural-key endpoints in the endpoint assembly need this store
+        builder.Services.AddMartenStore<INkStringStore>(m =>
+        {
+            m.Connection(Servers.PostgresConnectionString);
+            m.DatabaseSchemaName = "http_dedup_races_strings";
+            m.Events.DatabaseSchemaName = "http_dedup_races_strings";
+            m.Events.StreamIdentity = JasperFx.Events.StreamIdentity.AsString;
+            m.DisableNpgsqlLogging = true;
+            m.Projections.Snapshot<NkStringGadget>(SnapshotLifecycle.Inline);
+        }).IntegrateWithWolverine();
+
         builder.Services.AddResourceSetupOnStartup();
         builder.Services.AddWolverineHttp();
 

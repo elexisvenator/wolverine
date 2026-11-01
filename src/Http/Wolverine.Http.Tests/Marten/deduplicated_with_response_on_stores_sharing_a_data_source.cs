@@ -63,6 +63,17 @@ public class deduplicated_with_response_on_stores_sharing_a_data_source : IAsync
             m.Projections.Snapshot<NkGadget>(SnapshotLifecycle.Inline);
         }).IntegrateWithWolverine();
 
+        // The string-identity natural-key endpoints in the endpoint assembly need this store
+        builder.Services.AddMartenStore<INkStringStore>(m =>
+        {
+            m.Connection(Servers.PostgresConnectionString);
+            m.DatabaseSchemaName = "http_dedup_shared_strings";
+            m.Events.DatabaseSchemaName = "http_dedup_shared_strings";
+            m.Events.StreamIdentity = JasperFx.Events.StreamIdentity.AsString;
+            m.DisableNpgsqlLogging = true;
+            m.Projections.Snapshot<NkStringGadget>(SnapshotLifecycle.Inline);
+        }).IntegrateWithWolverine();
+
         builder.Services.AddResourceSetupOnStartup();
         builder.Services.AddWolverineHttp();
 
