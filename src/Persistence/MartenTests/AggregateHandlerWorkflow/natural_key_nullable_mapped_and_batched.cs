@@ -10,6 +10,7 @@ using Marten;
 using Marten.Events;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using System.Text.RegularExpressions;
 using Shouldly;
 using Wolverine;
 using Wolverine.ComplianceTests;
@@ -147,6 +148,46 @@ public class natural_key_nullable_mapped_and_batched : PostgresqlContext, IAsync
 
         (await loadProduct(streamId))!.Stock.ShouldBe(2);
         NkProductHandler.LastProductCount.ShouldBeGreaterThanOrEqualTo(2);
+    }
+
+    // FetchForWriting<NkProduct, NkSku>(<message>.Sku, <message>.Version...), on the session or the batch
+    private static readonly string fetchWithVersion =
+        $@"FetchForWriting<{Regex.Escape(typeof(NkProduct).FullNameInCode())}, {Regex.Escape(typeof(NkSku).FullNameInCode())}>\([^;]*\.Sku, [^;]*\.Version[,)]";
+
+    [Fact]
+    public async Task a_natural_key_load_checks_the_command_version()
+    {
+        var sku = new NkSku("VERSION-1");
+        var streamId = await listProduct(sku, 1);
+
+        sourceFor<RestockNkProductAtVersion>().ShouldMatch(fetchWithVersion);
+
+        // Listed and restocked: version 2
+        await _host.InvokeMessageAndWaitAsync(new RestockNkProductAtVersion(sku, 2, 4));
+        (await loadProduct(streamId))!.Stock.ShouldBe(5);
+
+        // Now at version 3, so 2 is stale and nothing is appended
+        await Should.ThrowAsync<ConcurrencyException>(() =>
+            _host.InvokeMessageAndWaitAsync(new RestockNkProductAtVersion(sku, 2, 10)));
+        (await loadProduct(streamId))!.Stock.ShouldBe(5);
+    }
+
+    [Fact]
+    public async Task a_batched_natural_key_load_checks_the_command_version()
+    {
+        var sku = new NkSku("VERSION-BATCHED-1");
+        var streamId = await listProduct(sku, 1);
+
+        var code = sourceFor<AuditNkProductAtVersion>();
+        code.ShouldContain("CreateBatchQuery");
+        code.ShouldMatch(fetchWithVersion);
+
+        await _host.InvokeMessageAndWaitAsync(new AuditNkProductAtVersion(sku, 2));
+        (await loadProduct(streamId))!.Stock.ShouldBe(2);
+
+        await Should.ThrowAsync<ConcurrencyException>(() =>
+            _host.InvokeMessageAndWaitAsync(new AuditNkProductAtVersion(sku, 2)));
+        (await loadProduct(streamId))!.Stock.ShouldBe(2);
     }
 }
 
@@ -396,6 +437,13 @@ public record LockAndRestockNkProduct(NkSku Sku, int Quantity);
 
 public record AuditNkProduct(NkSku Sku);
 
+#region sample_wolverine_marten_natural_key_command_with_version
+// The version is checked on load, as it is for a command carrying the stream id
+public record RestockNkProductAtVersion(NkSku Sku, long Version, int Quantity);
+#endregion
+
+public record AuditNkProductAtVersion(NkSku Sku, long Version);
+
 public record StockNkShelf(NkSku Sku, NkShelfCode Code);
 
 public static class NkProductHandler
@@ -420,6 +468,16 @@ public static class NkProductHandler
         => new(command.Quantity);
 
     public static NkProductRestocked Handle(AuditNkProduct command, [WriteAggregate] NkProduct product,
+        [Wolverine.Persistence.All] IReadOnlyList<NkProduct> all)
+    {
+        LastProductCount = all.Count;
+        return new NkProductRestocked(1);
+    }
+
+    public static NkProductRestocked Handle(RestockNkProductAtVersion command, [WriteAggregate] NkProduct product)
+        => new(command.Quantity);
+
+    public static NkProductRestocked Handle(AuditNkProductAtVersion command, [WriteAggregate] NkProduct product,
         [Wolverine.Persistence.All] IReadOnlyList<NkProduct> all)
     {
         LastProductCount = all.Count;

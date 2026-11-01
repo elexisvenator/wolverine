@@ -1185,7 +1185,7 @@ public class StrongLetterAggregate
     public void Apply(DEvent _) => DCount++;
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/strong_named_identifiers.cs#L187-L210' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_strong_typed_identifier_with_aggregate' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/strong_named_identifiers.cs#L227-L250' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_strong_typed_identifier_with_aggregate' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 And now let's use that identifier type in message handlers:
@@ -1266,7 +1266,7 @@ public static class StrongLetterHandler
     }
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/strong_named_identifiers.cs#L127-L183' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_using_strong_typed_identifier_with_aggregate_handler_workflow' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/strong_named_identifiers.cs#L149-L223' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_using_strong_typed_identifier_with_aggregate_handler_workflow' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 And also in some of the equivalent Wolverine.HTTP endpoints:
@@ -1400,7 +1400,7 @@ aggregate's `TKey` key, and Marten treats both as the same key:
 // NkSku is a struct, and the command may carry it as NkSku?
 public record RestockNkProduct(NkSku? Sku, int Quantity);
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L388-L391' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_nullable_natural_key_command' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L429-L432' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_nullable_natural_key_command' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 A command whose key is `null` finds no aggregate. A required `[WriteAggregate]` then fails the way it does
@@ -1429,7 +1429,7 @@ public class NkProductStock
     public void Apply(NkProductRestocked e) => Stock += e.Quantity;
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L349-L365' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_mapped_natural_key' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L390-L406' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_mapped_natural_key' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 A command carrying the owner's key type then loads the read model through the owner's lookup, at its current
@@ -1445,7 +1445,7 @@ public static NkProductRestocked Handle(RestockNkProductStock command, [WriteAgg
     return new NkProductRestocked(command.Quantity);
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L409-L416' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_mapped_natural_key_handler' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L457-L464' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_mapped_natural_key_handler' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 Wolverine looks for a command member matching the aggregate's own natural key first, then each of its mapped
@@ -1490,7 +1490,7 @@ public static class NkProductViewHandler
     }
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L438-L467' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_read_aggregate_by_natural_key' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L496-L525' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_read_aggregate_by_natural_key' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 A required read whose key matches no stream stops the handler, as it does for a stream id.
@@ -1502,6 +1502,25 @@ A required read whose key matches no stream stops the handler, as it does for a 
 
 A natural key load also joins Wolverine's batched query when the handler loads more than one thing from
 Marten. Marten resolves the key inside the batch, so the handler still makes a single round trip.
+
+### Expected Version
+
+A command that carries a version alongside the natural key gets the same optimistic check as one carrying
+the stream id. The member is found the same way: `Version` by convention, or the member named by
+`VersionSource`. The load fails with a `ConcurrencyException` if the stream isn't at that version, before
+the handler runs:
+
+<!-- snippet: sample_wolverine_marten_natural_key_command_with_version -->
+<a id='snippet-sample_wolverine_marten_natural_key_command_with_version'></a>
+```cs
+// The version is checked on load, as it is for a command carrying the stream id
+public record RestockNkProductAtVersion(NkSku Sku, long Version, int Quantity);
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L440-L443' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_natural_key_command_with_version' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+An exclusive load ignores the version, as it does for a stream id. This check is Marten-only for now: on
+Polecat a natural-key load still ignores the version.
 
 For more details on how natural keys work at the Marten level, see the [Marten natural keys documentation](https://martendb.io/events/natural-keys).
 

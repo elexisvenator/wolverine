@@ -52,15 +52,18 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
     /// <summary>
     /// <c>FetchForWriting&lt;T, TNaturalKey&gt;</c>, or <c>FetchForExclusiveWriting&lt;T, TNaturalKey&gt;</c> for
     /// an exclusive load, which used to be silently loaded non-exclusively. The same call on a session and on
-    /// a batch query: both have the natural key overloads.
+    /// a batch query: both have the natural key overloads. An optimistic load with a version passes it, as a
+    /// stream id load does, so a stale version fails on load instead of being ignored.
     /// </summary>
     private string NaturalKeyFetchForWriting(string targetUsage, string? cancellationTokenUsage = null)
     {
         var aggType = _att.AggregateType.FullNameInCode();
         var nkType = _identity.VariableType.FullNameInCode();
-        var args = cancellationTokenUsage != null
-            ? $"{_identity.Usage}, {cancellationTokenUsage}"
-            : _identity.Usage;
+        var args = _version != null ? $"{_identity.Usage}, {_version.Usage}" : _identity.Usage;
+        if (cancellationTokenUsage != null)
+        {
+            args += $", {cancellationTokenUsage}";
+        }
         var method = _att.LoadStyle == CoreConcurrencyStyle.Exclusive
             ? "FetchForExclusiveWriting"
             : "FetchForWriting";
@@ -193,7 +196,8 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
         var method = _att.LoadStyle == CoreConcurrencyStyle.Exclusive
             ? "FetchForExclusiveWriting"
             : "FetchForWriting";
-        return $"{targetUsage}.Events.{method}<{aggType}, {nkType}>({_identity.FSharpUsage}, {cancellationTokenUsage})";
+        var version = _version != null ? $", {_version.FSharpUsage}" : "";
+        return $"{targetUsage}.Events.{method}<{aggType}, {nkType}>({_identity.FSharpUsage}{version}, {cancellationTokenUsage})";
     }
 
     public override void GenerateFSharpCode(GeneratedMethod method, ISourceWriter writer)
