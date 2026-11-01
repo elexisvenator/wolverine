@@ -49,6 +49,11 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
     public Variable Stream { get; }
     public bool IsNaturalKey => _att.IsNaturalKey;
 
+    /// <summary>
+    /// <c>FetchForWriting&lt;T, TNaturalKey&gt;</c>, or <c>FetchForExclusiveWriting&lt;T, TNaturalKey&gt;</c> for
+    /// an exclusive load, which used to be silently loaded non-exclusively. The same call on a session and on
+    /// a batch query: both have the natural key overloads.
+    /// </summary>
     private string NaturalKeyFetchForWriting(string targetUsage, string? cancellationTokenUsage = null)
     {
         var aggType = _att.AggregateType.FullNameInCode();
@@ -56,23 +61,20 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
         var args = cancellationTokenUsage != null
             ? $"{_identity.Usage}, {cancellationTokenUsage}"
             : _identity.Usage;
-        return $"{targetUsage}.Events.FetchForWriting<{aggType}, {nkType}>({args})";
+        var method = _att.LoadStyle == CoreConcurrencyStyle.Exclusive
+            ? "FetchForExclusiveWriting"
+            : "FetchForWriting";
+        return $"{targetUsage}.Events.{method}<{aggType}, {nkType}>({args})";
     }
 
     public void WriteCodeToEnlistInBatchQuery(GeneratedMethod method, ISourceWriter writer)
     {
-        // GH-4567: this used to emit batchQuery.Events.FetchForWriting<T, TNaturalKey>(...), which is
-        // precisely the overload IBatchedQuery does not have -- so had it ever run it would have emitted
-        // code that does not compile. It could not run: MartenBatchingPolicy is the only thing that enlists
-        // these frames and MartenBatchingPolicy.IsBatchable refuses natural-key loads for exactly that
-        // reason. Kept as a throw rather than deleted so that relaxing IsBatchable fails here, loudly and
-        // at codegen time, instead of producing an uncompilable generated type.
+        // GH-4567: IBatchedQuery now has the natural key overloads, and resolves the key inside the batch, so
+        // a natural key load is one more item in the same round trip.
         if (_att.IsNaturalKey)
         {
-            throw new InvalidOperationException(
-                $"A natural-key aggregate load for {_att.AggregateType.FullNameInCode()} cannot be batched: " +
-                $"IBatchedQuery has no FetchForWriting<T, TNaturalKey> overload. " +
-                $"{nameof(MartenBatchingPolicy)}.IsBatchable is supposed to have excluded this frame.");
+            writer.WriteLine($"var {_batchQueryItem!.Usage} = {NaturalKeyFetchForWriting(_batchQuery!.Usage)};");
+            return;
         }
 
         if (_att.LoadStyle == CoreConcurrencyStyle.Exclusive)
@@ -188,7 +190,10 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
     {
         var aggType = _att.AggregateType.FSharpName();
         var nkType = _identity.VariableType.FSharpName();
-        return $"{targetUsage}.Events.FetchForWriting<{aggType}, {nkType}>({_identity.FSharpUsage}, {cancellationTokenUsage})";
+        var method = _att.LoadStyle == CoreConcurrencyStyle.Exclusive
+            ? "FetchForExclusiveWriting"
+            : "FetchForWriting";
+        return $"{targetUsage}.Events.{method}<{aggType}, {nkType}>({_identity.FSharpUsage}, {cancellationTokenUsage})";
     }
 
     public override void GenerateFSharpCode(GeneratedMethod method, ISourceWriter writer)

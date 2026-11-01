@@ -154,6 +154,19 @@ public interface IEventSourcingFrameProvider
     /// directly, which is still null at this point on an HTTP chain.
     /// </remarks>
     Type? TryDetermineNaturalKeyType(Type aggregateType, IChain chain, IServiceContainer container) => null;
+
+    /// <summary>
+    /// The types of the aggregate's <b>mapped</b> natural keys: keys whose lookup another projection owns,
+    /// declared with <c>[MappedNaturalKey&lt;T&gt;]</c> or <c>[NaturalKey(SourceProjection = ...)]</c>. The
+    /// aggregate's owned key is <see cref="TryDetermineNaturalKeyType"/>'s, and is not repeated here. Empty —
+    /// the default — for a store without mapped keys.
+    /// </summary>
+    /// <remarks>
+    /// Resolve the store the same way as <see cref="TryDetermineNaturalKeyType"/> (GH-4439). Every type is the
+    /// key's own type, never <c>Nullable&lt;T&gt;</c>; the workflow also matches a <c>T?</c> command member.
+    /// </remarks>
+    IReadOnlyList<Type> DetermineMappedNaturalKeyTypes(Type aggregateType, IChain chain,
+        IServiceContainer container) => [];
 }
 
 internal static class EventSourcingFrameProviderExtensions

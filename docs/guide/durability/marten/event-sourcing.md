@@ -1201,8 +1201,26 @@ public record IncrementBOnBoth(LetterId Id1, LetterId Id2);
 
 public record FetchCounts(LetterId Id);
 
+public record RaiseStrong(LetterId Id, int A, int B);
+
 public static class StrongLetterHandler
 {
+    public static (UpdatedAggregate, Events) Handle(RaiseStrong command, [WriteAggregate] StrongLetterAggregate aggregate)
+    {
+        var events = new Events();
+        for (int i = 0; i < command.A; i++)
+        {
+            events.Add(new AEvent());
+        }
+
+        for (int i = 0; i < command.B; i++)
+        {
+            events.Add(new BEvent());
+        }
+
+        return (new UpdatedAggregate(), events);
+    }
+
     public static StrongLetterAggregate Handle(FetchCounts counts,
         [ReadAggregate] StrongLetterAggregate aggregate) => aggregate;
 
@@ -1370,6 +1388,78 @@ public static class NkOrderHandler
 ```
 <sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_aggregate_handler_workflow.cs#L179-L204' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_natural_key_handlers' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
+
+### Nullable Natural Keys
+
+A natural key whose type is a struct may be carried on the command as `TKey?`. Wolverine matches it to the
+aggregate's `TKey` key, and Marten treats both as the same key:
+
+<!-- snippet: sample_wolverine_marten_nullable_natural_key_command -->
+<a id='snippet-sample_wolverine_marten_nullable_natural_key_command'></a>
+```cs
+// NkSku is a struct, and the command may carry it as NkSku?
+public record RestockNkProduct(NkSku? Sku, int Quantity);
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L260-L263' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_nullable_natural_key_command' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+A command whose key is `null` finds no aggregate. A required `[WriteAggregate]` then fails the way it does
+for a stream that does not exist.
+
+### Mapped Natural Keys
+
+An aggregate can also be found by a [mapped natural key](https://martendb.io/events/natural-keys#mapped-natural-keys),
+one whose lookup another projection owns. This is how an `Async` read model is loaded by natural key:
+
+<!-- snippet: sample_wolverine_marten_mapped_natural_key -->
+<a id='snippet-sample_wolverine_marten_mapped_natural_key'></a>
+```cs
+// An async read model of the product stream, reachable by the product's key
+public class NkProductStock
+{
+    public Guid Id { get; set; }
+
+    [MappedNaturalKey<NkProduct>]
+    public NkSku Sku { get; set; }
+
+    public int Stock { get; set; }
+
+    public static NkProductStock Create(NkProductListed e) => new() { Sku = e.Sku };
+
+    public void Apply(NkProductRestocked e) => Stock += e.Quantity;
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L221-L237' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_mapped_natural_key' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+A command carrying the owner's key type then loads the read model through the owner's lookup, at its current
+state, whether or not the async daemon has caught up:
+
+<!-- snippet: sample_wolverine_marten_mapped_natural_key_handler -->
+<a id='snippet-sample_wolverine_marten_mapped_natural_key_handler'></a>
+```cs
+// Loaded through the product's lookup, at its current state, before the daemon has caught up
+public static NkProductRestocked Handle(RestockNkProductStock command, [WriteAggregate] NkProductStock stock)
+{
+    LastStockSeen = stock.Stock;
+    return new NkProductRestocked(command.Quantity);
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L281-L288' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_mapped_natural_key_handler' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+Wolverine looks for a command member matching the aggregate's own natural key first, then each of its mapped
+keys. Every key of an aggregate has a distinct type, so a command carrying members for more than one of them
+is ambiguous, and Wolverine refuses to generate the handler. Name the member to use with
+`[WriteAggregate("...")]`, or mark it with `[Identity]`.
+
+### Exclusive Loads and Batching
+
+`[WriteAggregate(LoadStyle = ConcurrencyStyle.Exclusive)]` loads a natural key aggregate with
+`FetchForExclusiveWriting<TAggregate, TNaturalKey>()`, locking the stream as it does for a stream id.
+
+A natural key load also joins Wolverine's batched query when the handler loads more than one thing from
+Marten. Marten resolves the key inside the batch, so the handler still makes a single round trip.
 
 For more details on how natural keys work at the Marten level, see the [Marten natural keys documentation](https://martendb.io/events/natural-keys).
 

@@ -57,6 +57,18 @@ internal partial class MartenPersistenceFrameProvider : IEventSourcingFrameProvi
         return storeOptions.Projections.FindNaturalKeyDefinition(aggregateType)?.OuterType;
     }
 
+    [UnconditionalSuppressMessage("Trimming", "IL2072",
+        Justification = "The aggregate type comes from handler discovery, which already roots it. Codegen-time only. See docs/guide/aot.md.")]
+    public IReadOnlyList<Type> DetermineMappedNaturalKeyTypes(Type aggregateType, IChain chain,
+        IServiceContainer container)
+    {
+        if (resolveStoreOptions(chain, container) is not { } storeOptions) return [];
+
+        return storeOptions.Projections.TryFindAggregate(aggregateType, out var projection)
+            ? projection.MappedNaturalKeyDefinitions.Select(x => x.OuterType).ToArray()
+            : [];
+    }
+
     /// <summary>
     /// The <see cref="StoreOptions"/> of the store this chain writes to. GH-4439.
     /// </summary>
