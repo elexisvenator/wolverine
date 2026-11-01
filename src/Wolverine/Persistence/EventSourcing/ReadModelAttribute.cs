@@ -86,6 +86,13 @@ public class ReadModelAttribute : WolverineParameterAttribute, IDataRequirement,
         set => _onMissing = value;
     }
 
+    /// <summary>
+    ///     Read the model by this natural key type rather than by its stream id. Found the same way as for
+    ///     <see cref="WriteModelAttribute.NaturalKey" />. <c>[ReadModel&lt;TKey&gt;]</c> and
+    ///     <c>[ReadAggregate&lt;TKey&gt;]</c> set this.
+    /// </summary>
+    public Type? NaturalKey { get; set; }
+
     public override Variable Modify(IChain chain, ParameterInfo parameter, IServiceContainer container,
         GenerationRules rules)
     {
@@ -104,7 +111,17 @@ public class ReadModelAttribute : WolverineParameterAttribute, IDataRequirement,
             container);
 
         Frame? frame = null;
-        if (!tryFindIdentityVariable(chain, parameter, idType, out var identity))
+        Variable? identity;
+        if (NaturalKey != null)
+        {
+            // Named explicitly, so the stream id is never considered
+            identity = NaturalKeyIdentity.FindByKeyType(provider, parameter.ParameterType, NaturalKey, chain,
+                container, ArgumentName, ValueSource);
+            frame = provider.BuildFetchLatestByNaturalKeyFrame(parameter.ParameterType, identity)
+                    ?? throw new InvalidOperationException(
+                        $"The {provider.StoreName} integration cannot read {parameter.ParameterType.FullNameInCode()} by its natural key on {chain.HandlerCalls().First()}.");
+        }
+        else if (!tryFindIdentityVariable(chain, parameter, idType, out identity))
         {
             // Fall back to strong typed ID matching
             identity = tryFindStrongTypedIdentityVariable(chain, parameter.ParameterType, idType);
@@ -218,5 +235,27 @@ public class ReadModelAttribute : WolverineParameterAttribute, IDataRequirement,
         }
 
         return null;
+    }
+}
+
+/// <summary>
+///     <see cref="ReadModelAttribute" /> reading the model by its <typeparamref name="TNaturalKey" /> natural
+///     key. Equivalent to <c>[ReadModel(NaturalKey = typeof(TNaturalKey))]</c>.
+/// </summary>
+/// <typeparam name="TNaturalKey">
+///     The model's own natural key type, or one it maps from another projection. Never <c>TKey?</c>: a
+///     <c>TKey?</c> member is still matched to <c>TKey</c>.
+/// </typeparam>
+[AttributeUsage(AttributeTargets.Parameter)]
+public class ReadModelAttribute<TNaturalKey> : ReadModelAttribute where TNaturalKey : notnull
+{
+    public ReadModelAttribute()
+    {
+        NaturalKey = typeof(TNaturalKey);
+    }
+
+    public ReadModelAttribute(string argumentName) : base(argumentName)
+    {
+        NaturalKey = typeof(TNaturalKey);
     }
 }

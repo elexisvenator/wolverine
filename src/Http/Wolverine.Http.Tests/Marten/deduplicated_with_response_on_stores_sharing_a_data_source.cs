@@ -59,6 +59,8 @@ public class deduplicated_with_response_on_stores_sharing_a_data_source : IAsync
 
             // The natural-key endpoints in the same assembly need it
             m.Projections.Snapshot<NkThing>(SnapshotLifecycle.Inline);
+            // Every host scanning the endpoint assembly builds the NkGadget endpoints too
+            m.Projections.Snapshot<NkGadget>(SnapshotLifecycle.Inline);
         }).IntegrateWithWolverine();
 
         builder.Services.AddResourceSetupOnStartup();

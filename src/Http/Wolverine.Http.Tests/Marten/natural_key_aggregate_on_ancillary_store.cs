@@ -68,12 +68,19 @@ public class natural_key_aggregate_on_ancillary_store : IAsyncLifetime
             opts.Events.DatabaseSchemaName = "nk_http_things";
             opts.DisableNpgsqlLogging = true;
             opts.Projections.Snapshot<NkThing>(SnapshotLifecycle.Inline);
+            // Every host scanning the endpoint assembly builds the NkGadget endpoints too
+            opts.Projections.Snapshot<NkGadget>(SnapshotLifecycle.Inline);
         }).IntegrateWithWolverine();
 
         builder.Services.AddResourceSetupOnStartup();
         builder.Services.AddWolverineHttp();
 
-        theHost = await AlbaHost.For(builder, app => { app.MapWolverineEndpoints(); });
+        theHost = await AlbaHost.For(builder, app =>
+        {
+            // A second stream claiming an existing natural key is a 409. Every chain, because the default
+            // filter (IsTransactional) is evaluated before AutoApplyTransactions marks a plain session endpoint.
+            app.MapWolverineEndpoints(opts => opts.MapConcurrencyFailuresToConflict(_ => true));
+        });
     }
 
     public async ValueTask DisposeAsync()
@@ -139,5 +146,91 @@ public class natural_key_aggregate_on_ancillary_store : IAsyncLifetime
         var thing = await load(streamId);
         thing.ShouldNotBeNull();
         thing.IsArchived.ShouldBeTrue();
+    }
+
+    private async Task<(Guid StreamId, GadgetCode Code)> seedGadget(string name)
+    {
+        var streamId = Guid.NewGuid();
+        var code = new GadgetCode("G-" + Guid.NewGuid().ToString("N"));
+
+        var store = theHost.Services.GetRequiredService<INkThingStore>();
+        await using var session = store.LightweightSession();
+        session.Events.StartStream<NkGadget>(streamId, new NkGadgetCreated(code, name));
+        await session.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        return (streamId, code);
+    }
+
+    private async Task<NkGadget?> loadGadget(Guid streamId)
+    {
+        var store = theHost.Services.GetRequiredService<INkThingStore>();
+        await using var session = store.LightweightSession();
+        return await session.LoadAsync<NkGadget>(streamId, TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task write_aggregate_by_a_natural_key_in_the_route()
+    {
+        var (streamId, code) = await seedGadget("Original");
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkGadget("Renamed")).ToUrl($"/nkgadgets/{code.Value}/rename");
+            s.StatusCodeShouldBe(204);
+        });
+
+        (await loadGadget(streamId))!.Name.ShouldBe("Renamed");
+    }
+
+    [Fact]
+    public async Task write_aggregate_by_a_natural_key_in_the_query_string()
+    {
+        var (streamId, code) = await seedGadget("Original");
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkGadget("By query")).ToUrl("/nkgadgets-by-query/rename").QueryString("code", code.Value);
+            s.StatusCodeShouldBe(204);
+        });
+
+        (await loadGadget(streamId))!.Name.ShouldBe("By query");
+    }
+
+    [Fact]
+    public async Task an_unknown_natural_key_in_the_route_is_a_404()
+    {
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkGadget("Nobody")).ToUrl("/nkgadgets/G-NONE/rename");
+            s.StatusCodeShouldBe(404);
+        });
+
+        await theHost.Scenario(s =>
+        {
+            s.Get.Url("/nkgadgets/G-NONE");
+            s.StatusCodeShouldBe(404);
+        });
+    }
+
+    [Fact]
+    public async Task read_aggregate_by_a_natural_key_in_the_route()
+    {
+        var (streamId, code) = await seedGadget("Readable");
+
+        var gadget = await theHost.GetAsJson<NkGadget>($"/nkgadgets/{code.Value}");
+        gadget!.Id.ShouldBe(streamId);
+        gadget.Name.ShouldBe("Readable");
+    }
+
+    [Fact]
+    public async Task a_duplicate_natural_key_is_a_409()
+    {
+        var (_, code) = await seedGadget("First");
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new CreateNkGadget(code.Value, "Second")).ToUrl("/nkgadgets");
+            s.StatusCodeShouldBe(409);
+        });
     }
 }

@@ -503,7 +503,9 @@ public class WolverineHttpOptions
     /// <para>
     /// Covers everything deriving from <see cref="JasperFx.ConcurrencyException"/>:
     /// <c>EventStreamUnexpectedMaxEventIdException</c>, document revision/version violations,
-    /// <c>DcbConcurrencyException</c> and <c>SagaConcurrencyException</c>.
+    /// <c>DcbConcurrencyException</c> and <c>SagaConcurrencyException</c>. Also
+    /// <c>JasperFx.Events.DuplicateNaturalKeyException</c>, a second stream claiming a natural key that
+    /// another stream already has.
     /// </para>
     ///
     /// <para>
@@ -524,6 +526,7 @@ public class WolverineHttpOptions
         filter ??= ConflictMapping.IsTransactional;
 
         AddMiddleware(typeof(ConcurrencyExceptionMiddleware), filter);
+        AddMiddleware(typeof(DuplicateNaturalKeyMiddleware), filter);
         Policies.Add(new ConflictProblemPolicy(filter));
     }
 

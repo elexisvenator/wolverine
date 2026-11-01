@@ -1400,7 +1400,7 @@ aggregate's `TKey` key, checks it for null, and fetches by its value with `Fetch
 // NkSku is a struct, and the command may carry it as NkSku?
 public record RestockNkProduct(NkSku? Sku, int Quantity);
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L502-L505' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_nullable_natural_key_command' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L508-L511' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_nullable_natural_key_command' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 A null key is treated the way Marten treats a null `string` stream id:
@@ -1451,13 +1451,67 @@ public static NkProductRestocked Handle(RestockNkProductStock command, [WriteAgg
     return new NkProductRestocked(command.Quantity);
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L530-L537' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_mapped_natural_key_handler' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L536-L543' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_mapped_natural_key_handler' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 Wolverine looks for a command member matching the aggregate's own natural key first, then each of its mapped
 keys. Every key of an aggregate has a distinct type, so a command carrying members for more than one of them
-is ambiguous, and Wolverine refuses to generate the handler. Name the member to use with
-`[WriteAggregate("...")]`, or mark it with `[Identity]`.
+is ambiguous, and Wolverine refuses to generate the handler. Name the key type to load by, as shown next.
+
+### Naming the Natural Key
+
+Name the key type on the attribute to load by that natural key explicitly: `[WriteAggregate<TKey>]`,
+`[ReadAggregate<TKey>]`, `[WriteModel<TKey>]` or `[ReadModel<TKey>]`, or `NaturalKey = typeof(TKey)` on any of
+them (the form to use from F#). The key type is the aggregate's own natural key or one of its mapped keys:
+
+<!-- snippet: sample_wolverine_marten_write_aggregate_by_named_natural_key -->
+<a id='snippet-sample_wolverine_marten_write_aggregate_by_named_natural_key'></a>
+```cs
+// The message carries both of the shelf's keys, so the attribute names the one to load by
+public static NkShelfAudited Handle(AuditNkShelfByCode command, [WriteAggregate<NkShelfCode>] NkShelf shelf)
+    => new();
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_explicit_key_type.cs#L229-L233' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_write_aggregate_by_named_natural_key' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+With the key type named, the stream id is never considered, and only members of that type (or `TKey?` for a
+struct key) are. Wolverine takes, in order:
+
+1. the member or value named in the attribute, as in `[WriteAggregate<OrderNumber>("Number")]`;
+2. a member of that type marked with `[Identity]`;
+3. a member named `{aggregate}Id` or `Id`;
+4. the only member of that type.
+
+Naming a type the aggregate doesn't have is an error at build time (`JFXEVT014`), and so is naming `TKey?`
+(`JFXEVT015`). Wolverine checks both again when it generates the handler.
+
+Without a key type, `[Identity]` on a member of one of the aggregate's natural key types is refused when the
+handler is generated: it would otherwise be taken as the stream id.
+
+#### Natural Keys over HTTP
+
+A natural key in an HTTP route or query string always needs the key type named. Without it, Wolverine reads the
+value as the stream id, which a route value parses into whatever its type is:
+
+<!-- snippet: sample_wolverine_http_write_aggregate_by_natural_key_route -->
+<a id='snippet-sample_wolverine_http_write_aggregate_by_natural_key_route'></a>
+```cs
+// The route value is parsed into a GadgetCode and the gadget is loaded by its natural key
+[WolverinePost("/nkgadgets/{code}/rename")]
+[EmptyResponse]
+public static NkGadgetRenamed Rename(RenameNkGadget command, [WriteAggregate<GadgetCode>("code")] NkGadget gadget)
+    => new(command.Name);
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/Wolverine.Http.Tests.AncillaryStore/NaturalKeyGadgetEndpoints.cs#L44-L50' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_http_write_aggregate_by_natural_key_route' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+- Wolverine.Http parses route and query values into value types only, so a key from the route or query string
+  must be a value type wrapping a single value, like `readonly record struct Sku(string Value)`, or a type with its
+  own `TryParse`. A reference-type key can still come from the request body.
+- As for a stream id, a query string value is only seen through a parameter of the endpoint with that name.
+- An unknown key on a required load answers 404.
+- `MapConcurrencyFailuresToConflict()` (and the Marten and Polecat versions of it) also answers 409 for a
+  `DuplicateNaturalKeyException`: a second stream claiming a key that another stream already has.
 
 ### Reading by Natural Key
 
@@ -1496,7 +1550,7 @@ public static class NkProductViewHandler
     }
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L569-L598' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_read_aggregate_by_natural_key' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L575-L604' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_read_aggregate_by_natural_key' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 A required read whose key matches no stream stops the handler, as it does for a stream id.
@@ -1522,7 +1576,7 @@ the handler runs:
 // The version is checked on load, as it is for a command carrying the stream id
 public record RestockNkProductAtVersion(NkSku Sku, long Version, int Quantity);
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L513-L516' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_natural_key_command_with_version' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L519-L522' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_natural_key_command_with_version' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 An exclusive load ignores the version, as it does for a stream id. This check is Marten-only for now: on

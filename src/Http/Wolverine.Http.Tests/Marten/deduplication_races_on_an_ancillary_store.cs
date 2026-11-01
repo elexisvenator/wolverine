@@ -60,6 +60,8 @@ public class deduplication_races_on_an_ancillary_store : IAsyncLifetime
 
             // The natural-key endpoints in the same assembly need it
             m.Projections.Snapshot<NkThing>(SnapshotLifecycle.Inline);
+            // Every host scanning the endpoint assembly builds the NkGadget endpoints too
+            m.Projections.Snapshot<NkGadget>(SnapshotLifecycle.Inline);
         }).IntegrateWithWolverine().UseLightweightSessions();
 
         builder.Services.AddResourceSetupOnStartup();

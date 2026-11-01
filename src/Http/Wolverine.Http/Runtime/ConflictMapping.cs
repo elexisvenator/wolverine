@@ -37,6 +37,20 @@ public static class ConcurrencyExceptionMiddleware
 }
 
 /// <summary>
+/// A second stream claiming a natural key another stream already has: the request conflicts with the
+/// state of the store, as a concurrency failure does. <see cref="JasperFx.Events.DuplicateNaturalKeyException"/>
+/// derives from <see cref="Exception"/> rather than <see cref="ConcurrencyException"/>, so the handler
+/// above does not see it. It is store-agnostic, which is why it is mapped here rather than per store.
+/// </summary>
+public static class DuplicateNaturalKeyMiddleware
+{
+    public static ProblemDetails OnException(JasperFx.Events.DuplicateNaturalKeyException ex)
+    {
+        return ConflictMapping.ToProblemDetails(ex);
+    }
+}
+
+/// <summary>
 /// GH-4512. The one place a conflict ProblemDetails is shaped, so the core middleware and the store-specific
 /// ones registered from Wolverine.Http.Marten / Wolverine.Http.Polecat cannot drift apart.
 /// </summary>

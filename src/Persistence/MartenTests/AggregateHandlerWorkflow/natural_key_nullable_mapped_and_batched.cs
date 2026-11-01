@@ -489,6 +489,8 @@ public class NkShelf
     [MappedNaturalKey<NkProduct>]
     public NkSku Sku { get; set; }
 
+    public int Audits { get; set; }
+
     [NaturalKeySource]
     public static NkShelfCode KeyFor(NkShelfPlaced e) => e.Code;
 
@@ -497,7 +499,11 @@ public class NkShelf
         Code = e.Code;
         Sku = e.Sku;
     }
+
+    public void Apply(NkShelfAudited e) => Audits++;
 }
+
+public record NkShelfAudited;
 
 #region sample_wolverine_marten_nullable_natural_key_command
 // NkSku is a struct, and the command may carry it as NkSku?
