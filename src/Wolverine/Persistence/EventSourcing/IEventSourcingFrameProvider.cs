@@ -82,6 +82,15 @@ public interface IEventSourcingFrameProvider
     Frame BuildFetchLatestFrame(Type aggregateType, Variable identity);
 
     /// <summary>
+    /// The <see cref="BuildFetchLatestFrame"/> counterpart for an aggregate found by one of its natural keys,
+    /// owned or mapped: <paramref name="naturalKey"/> is the key itself, of the key's type or its nullable form,
+    /// never unwrapped. Must create exactly one variable of the aggregate type. Null — the default — for a store
+    /// that cannot fetch the latest state by natural key, in which case <c>[ReadModel]</c> reports that it could
+    /// not determine an identity, as it did before.
+    /// </summary>
+    Frame? BuildFetchLatestByNaturalKeyFrame(Type aggregateType, Variable naturalKey) => null;
+
+    /// <summary>
     /// Build the frame that opens a Dynamic Consistency Boundary for writing — the store's
     /// <c>FetchForWritingByTags&lt;T&gt;</c> call, which reads the <see cref="EventTagQuery"/> the handler's
     /// <c>Load()</c>/<c>Before()</c> method produced. Must create exactly one variable of type

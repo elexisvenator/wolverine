@@ -43,6 +43,9 @@ internal partial class MartenPersistenceFrameProvider : IEventSourcingFrameProvi
     public Frame BuildFetchLatestFrame(Type aggregateType, Variable identity)
         => new FetchLatestAggregateFrame(aggregateType, identity);
 
+    public Frame BuildFetchLatestByNaturalKeyFrame(Type aggregateType, Variable naturalKey)
+        => new FetchLatestAggregateFrame(aggregateType, naturalKey, true);
+
     public Frame BuildLoadBoundaryFrame(Type modelType) => new LoadBoundaryFrame(modelType);
 
     public StreamIdentity DetermineStreamIdentity(IServiceContainer container)

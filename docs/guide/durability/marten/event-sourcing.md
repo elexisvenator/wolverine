@@ -1400,7 +1400,7 @@ aggregate's `TKey` key, and Marten treats both as the same key:
 // NkSku is a struct, and the command may carry it as NkSku?
 public record RestockNkProduct(NkSku? Sku, int Quantity);
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L260-L263' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_nullable_natural_key_command' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L388-L391' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_nullable_natural_key_command' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 A command whose key is `null` finds no aggregate. A required `[WriteAggregate]` then fails the way it does
@@ -1429,7 +1429,7 @@ public class NkProductStock
     public void Apply(NkProductRestocked e) => Stock += e.Quantity;
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L221-L237' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_mapped_natural_key' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L349-L365' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_mapped_natural_key' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 A command carrying the owner's key type then loads the read model through the owner's lookup, at its current
@@ -1445,13 +1445,55 @@ public static NkProductRestocked Handle(RestockNkProductStock command, [WriteAgg
     return new NkProductRestocked(command.Quantity);
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L281-L288' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_mapped_natural_key_handler' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L409-L416' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_mapped_natural_key_handler' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 Wolverine looks for a command member matching the aggregate's own natural key first, then each of its mapped
 keys. Every key of an aggregate has a distinct type, so a command carrying members for more than one of them
 is ambiguous, and Wolverine refuses to generate the handler. Name the member to use with
 `[WriteAggregate("...")]`, or mark it with `[Identity]`.
+
+### Reading by Natural Key
+
+`[ReadAggregate]` and `[ReadModel]` resolve natural keys the same way, owned or mapped, nullable or not. The
+aggregate is loaded with `FetchLatest<TAggregate, TNaturalKey>()`:
+
+<!-- snippet: sample_wolverine_marten_read_aggregate_by_natural_key -->
+<a id='snippet-sample_wolverine_marten_read_aggregate_by_natural_key'></a>
+```cs
+public static class NkProductViewHandler
+{
+    public static NkProduct? LastProduct;
+    public static NkProductStock? LastStock;
+    public static int LastCatalogCount;
+
+    public static void Reset()
+    {
+        LastProduct = null;
+        LastStock = null;
+        LastCatalogCount = 0;
+    }
+
+    // Read-only access by the product's natural key
+    public static void Handle(ViewNkProduct query, [ReadAggregate] NkProduct product) => LastProduct = product;
+
+    public static void Handle(ViewNkProductMaybe query, [ReadAggregate] NkProduct product) => LastProduct = product;
+
+    // An async read model, through the product's lookup
+    public static void Handle(ViewNkProductStock query, [ReadAggregate] NkProductStock stock) => LastStock = stock;
+
+    public static void Handle(ViewNkProductWithCatalog query, [ReadAggregate] NkProduct product,
+        [Wolverine.Persistence.All] IReadOnlyList<NkProduct> catalog)
+    {
+        LastProduct = product;
+        LastCatalogCount = catalog.Count;
+    }
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L438-L467' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_read_aggregate_by_natural_key' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+A required read whose key matches no stream stops the handler, as it does for a stream id.
 
 ### Exclusive Loads and Batching
 

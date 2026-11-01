@@ -147,7 +147,11 @@ public class WriteModelAttribute : WolverineParameterAttribute, IDataRequirement
         // If standard identity resolution failed, check for natural key support
         if (identity == null)
         {
-            identity = findNaturalKeyIdentity(provider, aggregateType, chain, container);
+            // A copy for the lambda: capturing aggregateType itself would hoist it into a closure, which the
+            // trim analysis cannot follow through to its earlier uses
+            var keyedAggregateType = aggregateType;
+            identity = NaturalKeyIdentity.Find(provider, aggregateType, chain, container,
+                keyType => FindIdentity(keyedAggregateType, keyType, chain));
             isNaturalKey = identity != null;
         }
 
@@ -240,55 +244,6 @@ public class WriteModelAttribute : WolverineParameterAttribute, IDataRequirement
     protected virtual bool DefaultRequired(ParameterInfo parameter)
     {
         return !ParameterNullability.IsNullableAnnotated(parameter);
-    }
-
-    /// <summary>
-    ///     The command member that carries one of the aggregate's natural keys: its owned key, or any key it
-    ///     maps to another projection's lookup. A struct key also matches a <c>TKey?</c> member.
-    /// </summary>
-    /// <remarks>
-    ///     GH-4439: the chain goes over the seam because natural keys are registered per store. Without it
-    ///     the store side can only ask the default store, and an aggregate registered on an ancillary store
-    ///     never takes this branch.
-    /// </remarks>
-    private Variable? findNaturalKeyIdentity(IEventSourcingFrameProvider provider, Type aggregateType, IChain chain,
-        IServiceContainer container)
-    {
-        var keyTypes = new List<Type>();
-        if (provider.TryDetermineNaturalKeyType(aggregateType, chain, container) is { } owned)
-        {
-            keyTypes.Add(owned);
-        }
-
-        keyTypes.AddRange(provider.DetermineMappedNaturalKeyTypes(aggregateType, chain, container));
-
-        var matches = keyTypes
-            .Select(keyType => findNaturalKeyMember(aggregateType, keyType, chain))
-            .OfType<Variable>()
-            .DistinctBy(x => x.Usage)
-            .ToArray();
-
-        // Each key of an aggregate has its own type, so a command carrying two of them names two different
-        // streams' worth of lookup, and silently taking the first would load by the wrong one.
-        if (matches.Length > 1)
-        {
-            throw new InvalidOperationException(
-                $"The command for parameter of type {aggregateType.FullNameInCode()} on {chain.HandlerCalls().First()} carries more than one natural key of the aggregate ({matches.Select(x => x.Usage).Join(", ")}), so which one identifies it is ambiguous. Name the member to use with [WriteAggregate(\"...\")], or mark it with [Identity].");
-        }
-
-        return matches.SingleOrDefault();
-    }
-
-    [UnconditionalSuppressMessage("AOT", "IL3050",
-        Justification = "Closes Nullable<T> over a natural key struct at codegen time only, which an AOT-published app pre-generates. See docs/guide/aot.md.")]
-    private Variable? findNaturalKeyMember(Type aggregateType, Type keyType, IChain chain)
-    {
-        if (FindIdentity(aggregateType, keyType, chain) is { } exact) return exact;
-
-        // The key is fetched as TKey?, which the event store treats as the same key
-        return keyType.IsValueType && Nullable.GetUnderlyingType(keyType) == null
-            ? FindIdentity(aggregateType, typeof(Nullable<>).MakeGenericType(keyType), chain)
-            : null;
     }
 
     [UnconditionalSuppressMessage("Trimming", "IL2075",

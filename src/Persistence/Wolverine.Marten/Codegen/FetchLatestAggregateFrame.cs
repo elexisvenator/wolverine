@@ -15,14 +15,23 @@ namespace Wolverine.Marten.Codegen;
 internal class FetchLatestAggregateFrame : AsyncFrame, IBatchableFrame
 {
     private readonly Variable _identity;
+    private readonly string _typeArguments;
     private Variable _session = null!;
     private Variable _token = null!;
     private Variable _batchQuery = null!;
     private Variable _batchQueryItem = null!;
 
-    public FetchLatestAggregateFrame(Type aggregateType, Variable identity)
+    public FetchLatestAggregateFrame(Type aggregateType, Variable identity) : this(aggregateType, identity, false)
     {
-        if (identity.VariableType == typeof(Guid) || identity.VariableType == typeof(string))
+    }
+
+    /// <param name="isNaturalKey">
+    /// The identity is one of the aggregate's natural keys, fetched as is with <c>FetchLatest&lt;T, TKey&gt;</c>
+    /// rather than unwrapped to a stream id.
+    /// </param>
+    public FetchLatestAggregateFrame(Type aggregateType, Variable identity, bool isNaturalKey)
+    {
+        if (isNaturalKey || identity.VariableType == typeof(Guid) || identity.VariableType == typeof(string))
         {
             _identity = identity;
         }
@@ -31,6 +40,10 @@ internal class FetchLatestAggregateFrame : AsyncFrame, IBatchableFrame
             var valueType = ValueTypeInfo.ForType(identity.VariableType);
             _identity = new MemberAccessVariable(identity, valueType.ValueProperty);
         }
+
+        _typeArguments = isNaturalKey
+            ? $"{aggregateType.FullNameInCode()}, {identity.VariableType.FullNameInCode()}"
+            : aggregateType.FullNameInCode();
 
         Aggregate = new Variable(aggregateType, this);
     }
@@ -43,7 +56,7 @@ internal class FetchLatestAggregateFrame : AsyncFrame, IBatchableFrame
             throw new InvalidOperationException("This frame has not been enlisted in a MartenBatchFrame");
 
         writer.Write(
-            $"var {_batchQueryItem.Usage} = {_batchQuery!.Usage}.Events.{nameof(IBatchEvents.FetchLatest)}<{Aggregate.VariableType.FullNameInCode()}>({_identity.Usage});");
+            $"var {_batchQueryItem.Usage} = {_batchQuery!.Usage}.Events.{nameof(IBatchEvents.FetchLatest)}<{_typeArguments}>({_identity.Usage});");
     }
 
     public void EnlistInBatchQuery(Variable batchQuery)
@@ -73,7 +86,7 @@ internal class FetchLatestAggregateFrame : AsyncFrame, IBatchableFrame
     {
         if (_batchQueryItem == null)
         {
-            writer.Write($"var {Aggregate.Usage} = await {_session.Usage}.Events.{nameof(IEventStoreOperations.FetchLatest)}<{Aggregate.VariableType.FullNameInCode()}>({_identity.Usage}, {_token.Usage});");
+            writer.Write($"var {Aggregate.Usage} = await {_session.Usage}.Events.{nameof(IEventStoreOperations.FetchLatest)}<{_typeArguments}>({_identity.Usage}, {_token.Usage});");
         }
         else
         {

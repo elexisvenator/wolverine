@@ -150,6 +150,134 @@ public class natural_key_nullable_mapped_and_batched : PostgresqlContext, IAsync
     }
 }
 
+public class natural_key_read_aggregate : PostgresqlContext, IAsyncLifetime
+{
+    private readonly ITestOutputHelper _output;
+    private IHost _host = null!;
+    private IDocumentStore _store = null!;
+
+    public natural_key_read_aggregate(ITestOutputHelper output)
+    {
+        _output = output;
+    }
+
+    public async ValueTask InitializeAsync()
+    {
+        _host = await WolverineHost.ForAsync(opts =>
+        {
+            opts.Services.AddMarten(m =>
+                {
+                    m.Connection(Servers.PostgresConnectionString);
+                    m.DatabaseSchemaName = "nk_read_aggregate";
+                    m.Projections.Snapshot<NkProduct>(SnapshotLifecycle.Inline);
+                    m.Projections.Snapshot<NkProductStock>(SnapshotLifecycle.Async);
+                })
+                .UseLightweightSessions()
+                .IntegrateWithWolverine();
+
+            opts.Discovery.DisableConventionalDiscovery()
+                .IncludeType(typeof(NkProductViewHandler));
+            opts.Durability.Mode = DurabilityMode.Solo;
+
+            opts.Services.AddResourceSetupOnStartup();
+            opts.CodeGeneration.TypeLoadMode = TypeLoadMode.Auto;
+        });
+
+        _store = _host.Services.GetRequiredService<IDocumentStore>();
+        await _store.Advanced.Clean.DeleteAllEventDataAsync();
+        NkProductViewHandler.Reset();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await _host.StopAsync();
+        _host.Dispose();
+    }
+
+    private async Task<Guid> listProduct(NkSku sku, int stock)
+    {
+        var streamId = Guid.NewGuid();
+        await using var session = _store.LightweightSession();
+        session.Events.StartStream<NkProduct>(streamId, new NkProductListed(sku, "Widget"),
+            new NkProductRestocked(stock));
+        await session.SaveChangesAsync();
+        return streamId;
+    }
+
+    private string sourceFor<T>()
+    {
+        _host.GetRuntime().Handlers.HandlerFor<T>();
+        var chain = _host.GetRuntime().Handlers.ChainFor<T>();
+        chain.ShouldNotBeNull();
+        chain.SourceCode.ShouldNotBeNull();
+        _output.WriteLine(chain.SourceCode);
+        return chain.SourceCode;
+    }
+
+    [Fact]
+    public async Task reads_an_aggregate_by_its_natural_key()
+    {
+        var sku = new NkSku("READ-1");
+        var streamId = await listProduct(sku, 3);
+
+        sourceFor<ViewNkProduct>().ShouldContain(
+            $"FetchLatest<{typeof(NkProduct).FullNameInCode()}, {typeof(NkSku).FullNameInCode()}>");
+
+        await _host.InvokeMessageAndWaitAsync(new ViewNkProduct(sku));
+
+        NkProductViewHandler.LastProduct!.Id.ShouldBe(streamId);
+        NkProductViewHandler.LastProduct.Stock.ShouldBe(3);
+    }
+
+    [Fact]
+    public async Task reads_an_aggregate_by_a_nullable_natural_key_member()
+    {
+        var sku = new NkSku("READ-NULLABLE");
+        var streamId = await listProduct(sku, 1);
+
+        await _host.InvokeMessageAndWaitAsync(new ViewNkProductMaybe(sku));
+
+        NkProductViewHandler.LastProduct!.Id.ShouldBe(streamId);
+    }
+
+    [Fact]
+    public async Task reads_an_async_read_model_by_its_mapped_natural_key()
+    {
+        var sku = new NkSku("READ-MAPPED");
+        var streamId = await listProduct(sku, 4);
+
+        await _host.InvokeMessageAndWaitAsync(new ViewNkProductStock(sku));
+
+        // Current state with no daemon running: the owner's lookup, then the events folded in
+        NkProductViewHandler.LastStock!.Id.ShouldBe(streamId);
+        NkProductViewHandler.LastStock.Stock.ShouldBe(4);
+    }
+
+    [Fact]
+    public async Task an_unknown_natural_key_stops_a_required_read()
+    {
+        await _host.InvokeMessageAndWaitAsync(new ViewNkProduct(new NkSku("READ-NONE")));
+
+        NkProductViewHandler.LastProduct.ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task a_natural_key_read_joins_the_batched_query()
+    {
+        var sku = new NkSku("READ-BATCHED");
+        await listProduct(sku, 2);
+
+        var code = sourceFor<ViewNkProductWithCatalog>();
+        code.ShouldContain(
+            $"batchedQuery.Events.FetchLatest<{typeof(NkProduct).FullNameInCode()}, {typeof(NkSku).FullNameInCode()}>");
+
+        await _host.InvokeMessageAndWaitAsync(new ViewNkProductWithCatalog(sku));
+
+        NkProductViewHandler.LastProduct!.Stock.ShouldBe(2);
+        NkProductViewHandler.LastCatalogCount.ShouldBeGreaterThanOrEqualTo(1);
+    }
+}
+
 /// <summary>
 /// A command that carries both an owned and a mapped key of the aggregate cannot say which one it means.
 /// </summary>
@@ -298,6 +426,45 @@ public static class NkProductHandler
         return new NkProductRestocked(1);
     }
 }
+
+public record ViewNkProduct(NkSku Sku);
+
+public record ViewNkProductMaybe(NkSku? Sku);
+
+public record ViewNkProductStock(NkSku Sku);
+
+public record ViewNkProductWithCatalog(NkSku Sku);
+
+#region sample_wolverine_marten_read_aggregate_by_natural_key
+public static class NkProductViewHandler
+{
+    public static NkProduct? LastProduct;
+    public static NkProductStock? LastStock;
+    public static int LastCatalogCount;
+
+    public static void Reset()
+    {
+        LastProduct = null;
+        LastStock = null;
+        LastCatalogCount = 0;
+    }
+
+    // Read-only access by the product's natural key
+    public static void Handle(ViewNkProduct query, [ReadAggregate] NkProduct product) => LastProduct = product;
+
+    public static void Handle(ViewNkProductMaybe query, [ReadAggregate] NkProduct product) => LastProduct = product;
+
+    // An async read model, through the product's lookup
+    public static void Handle(ViewNkProductStock query, [ReadAggregate] NkProductStock stock) => LastStock = stock;
+
+    public static void Handle(ViewNkProductWithCatalog query, [ReadAggregate] NkProduct product,
+        [Wolverine.Persistence.All] IReadOnlyList<NkProduct> catalog)
+    {
+        LastProduct = product;
+        LastCatalogCount = catalog.Count;
+    }
+}
+#endregion
 
 public static class NkShelfHandler
 {

@@ -103,19 +103,30 @@ public class ReadModelAttribute : WolverineParameterAttribute, IDataRequirement,
         var idType = ((IPersistenceFrameProvider)provider).DetermineSagaIdType(parameter.ParameterType, chain,
             container);
 
+        Frame? frame = null;
         if (!tryFindIdentityVariable(chain, parameter, idType, out var identity))
         {
             // Fall back to strong typed ID matching
             identity = tryFindStrongTypedIdentityVariable(chain, parameter.ParameterType, idType);
-            if (identity == null)
-            {
-                throw new InvalidEntityLoadUsageException(this, parameter);
-            }
+        }
+
+        if (identity == null)
+        {
+            // Then to one of the aggregate's natural keys, as [WriteModel] does
+            var aggregateType = parameter.ParameterType;
+            identity = NaturalKeyIdentity.Find(provider, aggregateType, chain, container,
+                keyType => tryFindIdentityVariable(chain, parameter, keyType, out var byName)
+                    ? byName
+                    : tryFindStrongTypedIdentityVariable(chain, aggregateType, keyType));
+
+            // A store that cannot fetch by natural key builds no frame, and the load is reported as before
+            if (identity != null) frame = provider.BuildFetchLatestByNaturalKeyFrame(aggregateType, identity);
+            if (frame == null) throw new InvalidEntityLoadUsageException(this, parameter);
         }
 
         // The store builds this frame: core never writes "session.Events.FetchLatest<T>(...)" itself,
         // which is what keeps Marten's batch-query enlistment on Marten's side of the seam. GH-3907.
-        var frame = provider.BuildFetchLatestFrame(parameter.ParameterType, identity);
+        frame ??= provider.BuildFetchLatestFrame(parameter.ParameterType, identity!);
         var aggregate = FindAggregateVariable(frame, parameter.ParameterType, provider);
         aggregate.OverrideName(parameter.Name!);
 
