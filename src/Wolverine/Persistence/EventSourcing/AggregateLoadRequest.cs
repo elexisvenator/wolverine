@@ -4,7 +4,7 @@ namespace Wolverine.Persistence.EventSourcing;
 
 /// <summary>
 ///     Everything a store needs in order to build the frame that loads an aggregate's event stream for
-///     writing. Handed to <see cref="IEventSourcingFrameProvider.BuildLoadAggregateFrame"/>.
+///     writing. Handed to <see cref="IEventSourcingFrameProvider.BuildLoadAggregateFrame(AggregateLoadRequest, Wolverine.Configuration.IChain, JasperFx.IServiceContainer)"/>.
 /// </summary>
 /// <remarks>
 ///     This exists so that the seam is expressed entirely in public types. The shared workflow's own

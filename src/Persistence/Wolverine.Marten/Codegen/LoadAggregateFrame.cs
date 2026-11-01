@@ -54,6 +54,12 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
     public Variable Stream { get; }
     public bool IsNaturalKey => _att.IsNaturalKey;
 
+    /// <inheritdoc />
+    public bool BracketsItsReads { get; init; }
+
+    /// <inheritdoc />
+    public bool HoldsLock => _att.LoadStyle == CoreConcurrencyStyle.Exclusive;
+
     /// <summary>
     /// <c>FetchForWriting&lt;T, TNaturalKey&gt;</c>, or <c>FetchForExclusiveWriting&lt;T, TNaturalKey&gt;</c> for
     /// an exclusive load, which used to be silently loaded non-exclusively. The same call on a session and on

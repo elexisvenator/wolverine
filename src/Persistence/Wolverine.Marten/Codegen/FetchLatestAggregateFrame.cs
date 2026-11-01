@@ -59,6 +59,9 @@ internal class FetchLatestAggregateFrame : AsyncFrame, IBatchableFrame
 
     public Variable Aggregate { get; }
 
+    /// <inheritdoc />
+    public bool BracketsItsReads { get; init; }
+
     public void WriteCodeToEnlistInBatchQuery(GeneratedMethod method, ISourceWriter writer)
     {
         if (_batchQueryItem == null)

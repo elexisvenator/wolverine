@@ -1015,6 +1015,26 @@ public static void Handle(
 }
 ```
 
+### Batching Async Aggregates and Exclusive Loads
+
+When a handler loads more than one thing from Marten, Wolverine fetches them all in one batched query. Two
+kinds of load change how that batch is built:
+
+- A non-exclusive load of an aggregate projected with `ProjectionLifecycle.Async`, through `[WriteAggregate]`
+  or `[ReadAggregate]`, by stream id or natural key. Marten reads its snapshot and the events after it inside a
+  `repeatable read` transaction, which PostgreSQL only accepts first. Wolverine always puts these loads first in
+  the batch, whatever order the parameters are declared in.
+- An exclusive load, `LoadStyle = ConcurrencyStyle.Exclusive`, whose row lock has to last until the handler's
+  changes are saved.
+
+The two cannot share a batch, because the `repeatable read` transaction's `end` would release the lock. So a
+handler with both makes two round trips: first the Async loads together with everything else, then the
+exclusive loads. Running the Async loads before any transaction is open gives them one consistent snapshot,
+and the lock is held for as short a time as possible.
+
+An exclusive load of an Async aggregate counts as an exclusive load. The order loads are fetched in never
+changes what the handler receives.
+
 ## Enforcing Consistency Without New Events <Badge type="tip" text="5.17" />
 
 In some cases, your command handler may decide not to emit any new events after evaluating the current aggregate state.
@@ -1561,7 +1581,8 @@ A required read whose key matches no stream stops the handler, as it does for a 
 `FetchForExclusiveWriting<TAggregate, TNaturalKey>()`, locking the stream as it does for a stream id.
 
 A natural key load also joins Wolverine's batched query when the handler loads more than one thing from
-Marten. Marten resolves the key inside the batch, so the handler still makes a single round trip.
+Marten. Marten resolves the key inside the batch, so the handler still makes a single round trip, except
+as described in [Batching Async Aggregates and Exclusive Loads](#batching-async-aggregates-and-exclusive-loads).
 
 ### Expected Version
 

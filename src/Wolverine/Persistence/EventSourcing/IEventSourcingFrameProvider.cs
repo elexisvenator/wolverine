@@ -76,19 +76,36 @@ public interface IEventSourcingFrameProvider
     Frame BuildLoadAggregateFrame(AggregateLoadRequest request);
 
     /// <summary>
+    /// <see cref="BuildLoadAggregateFrame(AggregateLoadRequest)"/> with the chain the load belongs to, for a store
+    /// whose frame depends on how the aggregate is registered in the store that chain is routed to. Marten uses
+    /// it to order a batched query. The default ignores the chain.
+    /// </summary>
+    Frame BuildLoadAggregateFrame(AggregateLoadRequest request, IChain chain, IServiceContainer container)
+        => BuildLoadAggregateFrame(request);
+
+    /// <summary>
     /// Build the frame that reads the current state of an aggregate without opening it for writing —
     /// the store's <c>FetchLatest</c> call. Must create exactly one variable of the aggregate type.
     /// </summary>
     Frame BuildFetchLatestFrame(Type aggregateType, Variable identity);
 
     /// <summary>
-    /// The <see cref="BuildFetchLatestFrame"/> counterpart for an aggregate found by one of its natural keys,
+    /// <see cref="BuildFetchLatestFrame(Type, Variable)"/> with the chain the read belongs to, as for
+    /// <see cref="BuildLoadAggregateFrame(AggregateLoadRequest, IChain, IServiceContainer)"/>. The default ignores
+    /// the chain.
+    /// </summary>
+    Frame BuildFetchLatestFrame(Type aggregateType, Variable identity, IChain chain, IServiceContainer container)
+        => BuildFetchLatestFrame(aggregateType, identity);
+
+    /// <summary>
+    /// The <see cref="BuildFetchLatestFrame(Type, Variable, IChain, IServiceContainer)"/> counterpart for an aggregate found by one of its natural keys,
     /// owned or mapped: <paramref name="naturalKey"/> is the key itself, of the key's type or its nullable form,
     /// never unwrapped. Must create exactly one variable of the aggregate type. Null — the default — for a store
     /// that cannot fetch the latest state by natural key, in which case <c>[ReadModel]</c> reports that it could
     /// not determine an identity, as it did before.
     /// </summary>
-    Frame? BuildFetchLatestByNaturalKeyFrame(Type aggregateType, Variable naturalKey) => null;
+    Frame? BuildFetchLatestByNaturalKeyFrame(Type aggregateType, Variable naturalKey, IChain chain,
+        IServiceContainer container) => null;
 
     /// <summary>
     /// Build the frame that opens a Dynamic Consistency Boundary for writing — the store's

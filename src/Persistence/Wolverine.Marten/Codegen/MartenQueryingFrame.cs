@@ -12,6 +12,19 @@ internal interface IBatchableFrame
 {
     void WriteCodeToEnlistInBatchQuery(GeneratedMethod method, ISourceWriter writer);
     void EnlistInBatchQuery(Variable batchQuery);
+
+    /// <summary>
+    ///     A non-exclusive fetch of an aggregate Marten fetches with its Async plan, which brackets its reads in
+    ///     <c>begin transaction isolation level repeatable read read only</c> … <c>end</c>. Marten only accepts
+    ///     those before everything else in a batch, where they share one bracket.
+    /// </summary>
+    bool BracketsItsReads => false;
+
+    /// <summary>
+    ///     An exclusive fetch, whose row lock has to survive the batch. It cannot share a batch with a frame that
+    ///     <see cref="BracketsItsReads" />, because that bracket's <c>end</c> commits the transaction holding it.
+    /// </summary>
+    bool HoldsLock => false;
 }
 
 internal class MartenBatchingPolicy : IMethodPreCompilationPolicy
@@ -20,13 +33,46 @@ internal class MartenBatchingPolicy : IMethodPreCompilationPolicy
     {
         var (i, frames) = sortThroughFrames(method);
         if (frames.Count <= 1) return;
-        
-        var batchFrame = new MartenBatchFrame();
-        method.Frames.Insert(i, batchFrame);
 
-        foreach (var frame in frames)
+        // Marten only accepts bracketing fetches before everything else in a batch, so they go first. The rest
+        // keep the order they were declared in, which never changes what the handler sees: every result is
+        // resolved through its own variable after the batch has executed.
+        var bracketing = frames.Where(x => x.BracketsItsReads).ToArray();
+        var locking = frames.Where(x => x.HoldsLock).ToArray();
+        var others = frames.Except(bracketing).Except(locking).ToArray();
+
+        if (bracketing.Length == 0 || locking.Length == 0)
         {
-            batchFrame.Enlist(frame);
+            var batchFrame = new MartenBatchFrame();
+            method.Frames.Insert(i, batchFrame);
+
+            foreach (var frame in bracketing.Concat(frames.Except(bracketing)))
+            {
+                batchFrame.Enlist(frame);
+            }
+
+            return;
+        }
+
+        // A bracket's `end` commits the session's transaction, which would release an exclusive fetch's row
+        // lock, so the two cannot share a batch. The bracketing fetches go first, with everything else, while
+        // the session has no transaction yet: an exclusive fetch starts one, and inside it a bracketing fetch
+        // gets no bracket at all (#5611). The exclusive fetches follow in a second batch of their own, which
+        // also holds their locks for as short a time as possible. Both batches are batch frames, even with one
+        // item, so the second always runs after the first.
+        var snapshotBatch = new MartenBatchFrame();
+        var lockingBatch = new MartenBatchFrame("lockingBatchedQuery");
+        method.Frames.Insert(i, lockingBatch);
+        method.Frames.Insert(i, snapshotBatch);
+
+        foreach (var frame in bracketing.Concat(others))
+        {
+            snapshotBatch.Enlist(frame);
+        }
+
+        foreach (var frame in locking)
+        {
+            lockingBatch.Enlist(frame);
         }
     }
 
@@ -86,7 +132,13 @@ internal class MartenBatchFrame : AsyncFrame
     public MartenBatchFrame()
     {
         BatchQuery = new Variable(typeof(IBatchedQuery), this);
-    }   
+    }
+
+    /// <param name="batchQueryName">For a second batch in the same method, which needs its own variable name.</param>
+    public MartenBatchFrame(string batchQueryName)
+    {
+        BatchQuery = new Variable(typeof(IBatchedQuery), batchQueryName, this);
+    }
 
     public override void GenerateCode(GeneratedMethod method, ISourceWriter writer)
     {

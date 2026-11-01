@@ -4,8 +4,10 @@ using JasperFx.CodeGeneration.Frames;
 using JasperFx.CodeGeneration.Model;
 using JasperFx.Core.Reflection;
 using JasperFx.Events;
+using JasperFx.Events.Projections;
 using Marten;
 using Marten.Events;
+using Marten.Schema;
 using Wolverine.Configuration;
 using Wolverine.Marten.Codegen;
 using Wolverine.Persistence;
@@ -34,6 +36,14 @@ internal partial class MartenPersistenceFrameProvider : IEventSourcingFrameProvi
     // Polecat has no equivalent of - entirely on this side of the seam.
     public Frame BuildLoadAggregateFrame(AggregateLoadRequest request) => new LoadAggregateFrame(request);
 
+    // The chain's store decides whether the load brackets its reads, which MartenBatchingPolicy orders by
+    public Frame BuildLoadAggregateFrame(AggregateLoadRequest request, IChain chain, IServiceContainer container)
+        => new LoadAggregateFrame(request)
+        {
+            BracketsItsReads = request.LoadStyle != ModelConcurrencyStyle.Exclusive &&
+                               usesAsyncFetchPlan(request.AggregateType, chain, container)
+        };
+
     // GH-3627. Marten's spelling of the raw stream reads. The batch-query enlistment lives inside these
     // frames, which is the whole reason the seam hands back a Frame rather than letting core write the call.
     public Frame BuildFetchStreamStateFrame(Variable identity) => new FetchStreamStateFrame(identity);
@@ -43,8 +53,19 @@ internal partial class MartenPersistenceFrameProvider : IEventSourcingFrameProvi
     public Frame BuildFetchLatestFrame(Type aggregateType, Variable identity)
         => new FetchLatestAggregateFrame(aggregateType, identity);
 
-    public Frame BuildFetchLatestByNaturalKeyFrame(Type aggregateType, Variable naturalKey)
-        => new FetchLatestAggregateFrame(aggregateType, naturalKey, true);
+    public Frame BuildFetchLatestFrame(Type aggregateType, Variable identity, IChain chain,
+        IServiceContainer container)
+        => new FetchLatestAggregateFrame(aggregateType, identity)
+        {
+            BracketsItsReads = usesAsyncFetchPlan(aggregateType, chain, container)
+        };
+
+    public Frame BuildFetchLatestByNaturalKeyFrame(Type aggregateType, Variable naturalKey, IChain chain,
+        IServiceContainer container)
+        => new FetchLatestAggregateFrame(aggregateType, naturalKey, true)
+        {
+            BracketsItsReads = usesAsyncFetchPlan(aggregateType, chain, container)
+        };
 
     public Frame BuildLoadBoundaryFrame(Type modelType) => new LoadBoundaryFrame(modelType);
 
@@ -70,6 +91,27 @@ internal partial class MartenPersistenceFrameProvider : IEventSourcingFrameProvi
         return storeOptions.Projections.TryFindAggregate(aggregateType, out var projection)
             ? projection.MappedNaturalKeyDefinitions.Select(x => x.OuterType).ToArray()
             : [];
+    }
+
+    /// <summary>
+    /// Whether Marten fetches this aggregate with its Async plan, whose non-exclusive fetches bracket their reads
+    /// in <c>begin transaction isolation level repeatable read read only</c> … <c>end</c>. Those have to come
+    /// before everything else in a batched query, and cannot share one with an exclusive fetch. The same choice
+    /// Marten's <c>AsyncFetchPlanner</c> and <c>NaturalKeyFetchPlanner</c> make: an Async lifecycle and a
+    /// document with revisions enabled; otherwise Marten uses its Live plan, which does not bracket.
+    /// </summary>
+    [UnconditionalSuppressMessage("Trimming", "IL2072",
+        Justification = "The aggregate type comes from handler discovery, which already roots it. Codegen-time only. See docs/guide/aot.md.")]
+    private static bool usesAsyncFetchPlan(Type aggregateType, IChain chain, IServiceContainer container)
+    {
+        if (resolveStoreOptions(chain, container) is not { } storeOptions) return false;
+
+        return storeOptions.Projections.TryFindAggregate(aggregateType, out var projection) &&
+               projection.Lifecycle == ProjectionLifecycle.Async &&
+               ((IReadOnlyStoreOptions)storeOptions).FindOrResolveDocumentType(aggregateType) is DocumentMapping
+               {
+                   Metadata.Revision.Enabled: true
+               };
     }
 
     /// <summary>

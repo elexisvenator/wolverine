@@ -69,7 +69,7 @@ internal record AggregateHandling(IDataRequirement Requirement)
             LoadStyle,
             LoadStyle == ModelConcurrencyStyle.Optimistic ? Version : null,
             AlwaysEnforceConsistency,
-            IsNaturalKey));
+            IsNaturalKey), chain, container);
 
         chain.Middleware.Add(loader);
 
