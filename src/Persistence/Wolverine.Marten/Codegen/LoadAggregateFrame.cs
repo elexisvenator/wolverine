@@ -22,6 +22,7 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
     private readonly Variable? _version;
     private readonly Type _eventStreamType;
     private readonly Variable _rawIdentity;
+    private readonly NaturalKeyArgument? _naturalKey;
 
 
     public LoadAggregateFrame(AggregateLoadRequest att)
@@ -39,7 +40,11 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
 
         _rawIdentity = _identity;
         // For natural keys, keep the full natural key object (don't unwrap)
-        if (!_att.IsNaturalKey && _rawIdentity.VariableType != typeof(Guid) && _rawIdentity.VariableType != typeof(string))
+        if (_att.IsNaturalKey)
+        {
+            _naturalKey = new NaturalKeyArgument(_identity);
+        }
+        else if (_rawIdentity.VariableType != typeof(Guid) && _rawIdentity.VariableType != typeof(string))
         {
             var valueType = ValueTypeInfo.ForType(_rawIdentity.VariableType);
             _rawIdentity = new MemberAccessVariable(_identity, valueType.ValueProperty);
@@ -53,13 +58,14 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
     /// <c>FetchForWriting&lt;T, TNaturalKey&gt;</c>, or <c>FetchForExclusiveWriting&lt;T, TNaturalKey&gt;</c> for
     /// an exclusive load, which used to be silently loaded non-exclusively. The same call on a session and on
     /// a batch query: both have the natural key overloads. An optimistic load with a version passes it, as a
-    /// stream id load does, so a stale version fails on load instead of being ignored.
+    /// stream id load does, so a stale version fails on load instead of being ignored. Always by
+    /// <c>TKey</c>: a member that can be null is checked first, see <see cref="writeNullKeyCheck"/>.
     /// </summary>
     private string NaturalKeyFetchForWriting(string targetUsage, string? cancellationTokenUsage = null)
     {
         var aggType = _att.AggregateType.FullNameInCode();
-        var nkType = _identity.VariableType.FullNameInCode();
-        var args = _version != null ? $"{_identity.Usage}, {_version.Usage}" : _identity.Usage;
+        var nkType = _naturalKey!.KeyType.FullNameInCode();
+        var args = _version != null ? $"{_naturalKey.Usage}, {_version.Usage}" : _naturalKey.Usage;
         if (cancellationTokenUsage != null)
         {
             args += $", {cancellationTokenUsage}";
@@ -76,6 +82,7 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
         // a natural key load is one more item in the same round trip.
         if (_att.IsNaturalKey)
         {
+            writeNullKeyCheck(writer);
             writer.WriteLine($"var {_batchQueryItem!.Usage} = {NaturalKeyFetchForWriting(_batchQuery!.Usage)};");
             return;
         }
@@ -160,6 +167,7 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
         {
             if (_att.IsNaturalKey)
             {
+                writeNullKeyCheck(writer);
                 writer.WriteLine($"var {Stream.Usage} = await {NaturalKeyFetchForWriting(_session!.Usage, _token!.Usage)};");
             }
             else if (_att.LoadStyle == CoreConcurrencyStyle.Exclusive)
@@ -189,15 +197,27 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
         Next?.GenerateCode(method, writer);
     }
 
+    /// <summary>
+    /// A null key is refused the way Marten refuses a null string stream id: there is no aggregate to load,
+    /// and no key for a new stream to claim.
+    /// </summary>
+    private void writeNullKeyCheck(ISourceWriter writer)
+    {
+        if (_naturalKey!.CanBeNull)
+        {
+            writer.WriteLine(_naturalKey.ThrowIfNull(_att.AggregateType));
+        }
+    }
+
     private string NaturalKeyFetchForWritingFSharp(string targetUsage, string cancellationTokenUsage)
     {
         var aggType = _att.AggregateType.FSharpName();
-        var nkType = _identity.VariableType.FSharpName();
+        var nkType = _naturalKey!.KeyType.FSharpName();
         var method = _att.LoadStyle == CoreConcurrencyStyle.Exclusive
             ? "FetchForExclusiveWriting"
             : "FetchForWriting";
         var version = _version != null ? $", {_version.FSharpUsage}" : "";
-        return $"{targetUsage}.Events.{method}<{aggType}, {nkType}>({_identity.FSharpUsage}{version}, {cancellationTokenUsage})";
+        return $"{targetUsage}.Events.{method}<{aggType}, {nkType}>({_naturalKey.FSharpUsage}{version}, {cancellationTokenUsage})";
     }
 
     public override void GenerateFSharpCode(GeneratedMethod method, ISourceWriter writer)
@@ -214,6 +234,11 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
             // `var x = await ...` -> F# `let! x = ...` inside the task { } CE (drop ConfigureAwait).
             if (_att.IsNaturalKey)
             {
+                if (_naturalKey!.CanBeNull)
+                {
+                    writer.WriteLine(_naturalKey.FSharpThrowIfNull(_att.AggregateType));
+                }
+
                 writer.WriteLine($"let! {Stream.Usage} = {NaturalKeyFetchForWritingFSharp(_session!.FSharpUsage, _token!.FSharpUsage)}");
             }
             else if (_att.LoadStyle == CoreConcurrencyStyle.Exclusive)

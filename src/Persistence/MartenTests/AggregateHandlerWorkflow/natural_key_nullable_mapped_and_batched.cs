@@ -46,12 +46,14 @@ public class natural_key_nullable_mapped_and_batched : PostgresqlContext, IAsync
                     m.DatabaseSchemaName = "nk_nullable_mapped";
                     m.Projections.Snapshot<NkProduct>(SnapshotLifecycle.Inline);
                     m.Projections.Snapshot<NkProductStock>(SnapshotLifecycle.Async);
+                    m.Projections.Snapshot<NkShelf>(SnapshotLifecycle.Inline);
                 })
                 .UseLightweightSessions()
                 .IntegrateWithWolverine();
 
             opts.Discovery.DisableConventionalDiscovery()
-                .IncludeType(typeof(NkProductHandler));
+                .IncludeType(typeof(NkProductHandler))
+                .IncludeType(typeof(NkShelfRecodeHandler));
             opts.Durability.Mode = DurabilityMode.Solo;
 
             opts.Services.AddResourceSetupOnStartup();
@@ -106,6 +108,34 @@ public class natural_key_nullable_mapped_and_batched : PostgresqlContext, IAsync
         await _host.InvokeMessageAndWaitAsync(new RestockNkProduct(sku, 4));
 
         (await loadProduct(streamId))!.Stock.ShouldBe(4);
+    }
+
+    [Fact]
+    public void a_nullable_command_member_is_fetched_by_the_key_type()
+    {
+        var code = sourceFor<RestockNkProduct>();
+
+        // Fetched by NkSku after a null check, never by NkSku?
+        code.ShouldContain($"FetchForWriting<{typeof(NkProduct).FullNameInCode()}, {typeof(NkSku).FullNameInCode()}>(");
+        code.ShouldContain(".Sku.Value");
+        code.ShouldNotContain($"{typeof(NkSku).FullNameInCode()}?>");
+    }
+
+    [Fact]
+    public async Task a_null_natural_key_is_refused_on_a_write()
+    {
+        // As Marten refuses a null string stream id: nothing to load, and no key to claim
+        var ex = await Should.ThrowAsync<InvalidOperationException>(() =>
+            _host.InvokeMessageAndWaitAsync(new RestockNkProduct(null, 4)));
+        ex.Message.ShouldContain("natural key on this message is null");
+    }
+
+    [Fact]
+    public async Task a_null_reference_type_natural_key_is_refused_on_a_write()
+    {
+        var ex = await Should.ThrowAsync<InvalidOperationException>(() =>
+            _host.InvokeMessageAndWaitAsync(new RecodeNkShelf(null!)));
+        ex.Message.ShouldContain("natural key on this message is null");
     }
 
     [Fact]
@@ -217,7 +247,8 @@ public class natural_key_read_aggregate : PostgresqlContext, IAsyncLifetime
                 .IntegrateWithWolverine();
 
             opts.Discovery.DisableConventionalDiscovery()
-                .IncludeType(typeof(NkProductViewHandler));
+                .IncludeType(typeof(NkProductViewHandler))
+                .IncludeType(typeof(NkProductNullableReadHandler));
             opts.Durability.Mode = DurabilityMode.Solo;
 
             opts.Services.AddResourceSetupOnStartup();
@@ -292,6 +323,48 @@ public class natural_key_read_aggregate : PostgresqlContext, IAsyncLifetime
         // Current state with no daemon running: the owner's lookup, then the events folded in
         NkProductViewHandler.LastStock!.Id.ShouldBe(streamId);
         NkProductViewHandler.LastStock.Stock.ShouldBe(4);
+    }
+
+    [Fact]
+    public async Task a_null_natural_key_stops_a_required_read()
+    {
+        // Left in place unless the handler runs, which it must not
+        var sentinel = new NkProduct();
+        NkProductViewHandler.LastProduct = sentinel;
+
+        await _host.InvokeMessageAndWaitAsync(new ViewNkProductMaybe(null));
+
+        NkProductViewHandler.LastProduct.ShouldBeSameAs(sentinel);
+    }
+
+    [Fact]
+    public async Task a_null_natural_key_reads_nothing_into_an_optional_read()
+    {
+        NkProductNullableReadHandler.Called = false;
+        await _host.InvokeMessageAndWaitAsync(new PeekNkProduct(null));
+
+        NkProductNullableReadHandler.Called.ShouldBeTrue();
+        NkProductNullableReadHandler.LastProduct.ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task a_null_natural_key_reads_nothing_inside_a_batch()
+    {
+        await listProduct(new NkSku("PEEK-BATCHED"), 1);
+
+        var code = sourceFor<PeekNkProductWithCatalog>();
+        code.ShouldContain("CreateBatchQuery");
+        code.ShouldContain("Task.FromResult<");
+
+        NkProductNullableReadHandler.Called = false;
+        await _host.InvokeMessageAndWaitAsync(new PeekNkProductWithCatalog(null));
+
+        NkProductNullableReadHandler.Called.ShouldBeTrue();
+        NkProductNullableReadHandler.LastProduct.ShouldBeNull();
+
+        // And a key that is present still reads through the batch
+        await _host.InvokeMessageAndWaitAsync(new PeekNkProductWithCatalog(new NkSku("PEEK-BATCHED")));
+        NkProductNullableReadHandler.LastProduct!.Stock.ShouldBe(1);
     }
 
     [Fact]
@@ -528,4 +601,36 @@ public static class NkShelfHandler
 {
     public static NkShelfPlaced Handle(StockNkShelf command, [WriteAggregate] NkShelf shelf)
         => new(command.Code, command.Sku);
+}
+
+// A reference-type key, which can be null without being declared TKey?
+public record RecodeNkShelf(NkShelfCode Code);
+
+public static class NkShelfRecodeHandler
+{
+    public static NkShelfPlaced Handle(RecodeNkShelf command, [WriteAggregate] NkShelf shelf)
+        => new(command.Code, shelf.Sku);
+}
+
+public record PeekNkProduct(NkSku? Sku);
+
+public record PeekNkProductWithCatalog(NkSku? Sku);
+
+public static class NkProductNullableReadHandler
+{
+    public static bool Called;
+    public static NkProduct? LastProduct;
+
+    public static void Handle(PeekNkProduct query, [ReadAggregate(Required = false)] NkProduct? product)
+    {
+        Called = true;
+        LastProduct = product;
+    }
+
+    public static void Handle(PeekNkProductWithCatalog query, [ReadAggregate(Required = false)] NkProduct? product,
+        [Wolverine.Persistence.All] IReadOnlyList<NkProduct> catalog)
+    {
+        Called = true;
+        LastProduct = product;
+    }
 }

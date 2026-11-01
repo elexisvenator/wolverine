@@ -16,6 +16,8 @@ internal class FetchLatestAggregateFrame : AsyncFrame, IBatchableFrame
 {
     private readonly Variable _identity;
     private readonly string _typeArguments;
+    private readonly NaturalKeyArgument? _naturalKey;
+    private readonly Type _aggregateType;
     private Variable _session = null!;
     private Variable _token = null!;
     private Variable _batchQuery = null!;
@@ -27,11 +29,18 @@ internal class FetchLatestAggregateFrame : AsyncFrame, IBatchableFrame
 
     /// <param name="isNaturalKey">
     /// The identity is one of the aggregate's natural keys, fetched as is with <c>FetchLatest&lt;T, TKey&gt;</c>
-    /// rather than unwrapped to a stream id.
+    /// rather than unwrapped to a stream id. A null key finds nothing, as a null string stream id does.
     /// </param>
     public FetchLatestAggregateFrame(Type aggregateType, Variable identity, bool isNaturalKey)
     {
-        if (isNaturalKey || identity.VariableType == typeof(Guid) || identity.VariableType == typeof(string))
+        _aggregateType = aggregateType;
+
+        if (isNaturalKey)
+        {
+            _identity = identity;
+            _naturalKey = new NaturalKeyArgument(identity);
+        }
+        else if (identity.VariableType == typeof(Guid) || identity.VariableType == typeof(string))
         {
             _identity = identity;
         }
@@ -42,7 +51,7 @@ internal class FetchLatestAggregateFrame : AsyncFrame, IBatchableFrame
         }
 
         _typeArguments = isNaturalKey
-            ? $"{aggregateType.FullNameInCode()}, {identity.VariableType.FullNameInCode()}"
+            ? $"{aggregateType.FullNameInCode()}, {_naturalKey!.KeyType.FullNameInCode()}"
             : aggregateType.FullNameInCode();
 
         Aggregate = new Variable(aggregateType, this);
@@ -55,9 +64,13 @@ internal class FetchLatestAggregateFrame : AsyncFrame, IBatchableFrame
         if (_batchQueryItem == null)
             throw new InvalidOperationException("This frame has not been enlisted in a MartenBatchFrame");
 
-        writer.Write(
-            $"var {_batchQueryItem.Usage} = {_batchQuery!.Usage}.Events.{nameof(IBatchEvents.FetchLatest)}<{_typeArguments}>({_identity.Usage});");
+        var fetch = $"{_batchQuery!.Usage}.Events.{nameof(IBatchEvents.FetchLatest)}<{_typeArguments}>({argumentUsage})";
+        writer.Write(_naturalKey is { CanBeNull: true }
+            ? $"var {_batchQueryItem.Usage} = {_naturalKey.IsNullCheck} ? System.Threading.Tasks.Task.FromResult<{_aggregateType.FullNameInCode()}>(null) : {fetch};"
+            : $"var {_batchQueryItem.Usage} = {fetch};");
     }
+
+    private string argumentUsage => _naturalKey?.Usage ?? _identity.Usage;
 
     public void EnlistInBatchQuery(Variable batchQuery)
     {
@@ -86,7 +99,10 @@ internal class FetchLatestAggregateFrame : AsyncFrame, IBatchableFrame
     {
         if (_batchQueryItem == null)
         {
-            writer.Write($"var {Aggregate.Usage} = await {_session.Usage}.Events.{nameof(IEventStoreOperations.FetchLatest)}<{_typeArguments}>({_identity.Usage}, {_token.Usage});");
+            var fetch = $"await {_session.Usage}.Events.{nameof(IEventStoreOperations.FetchLatest)}<{_typeArguments}>({argumentUsage}, {_token.Usage})";
+            writer.Write(_naturalKey is { CanBeNull: true }
+                ? $"var {Aggregate.Usage} = {_naturalKey.IsNullCheck} ? null : {fetch};"
+                : $"var {Aggregate.Usage} = {fetch};");
         }
         else
         {
