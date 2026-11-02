@@ -117,7 +117,7 @@ public class ReadModelAttribute : WolverineParameterAttribute, IDataRequirement,
             // Named explicitly, so the stream id is never considered
             identity = NaturalKeyIdentity.FindByKeyType(provider, parameter.ParameterType, NaturalKey, chain,
                 container, ArgumentName, ValueSource);
-            frame = provider.BuildFetchLatestByNaturalKeyFrame(parameter.ParameterType, identity, chain, container)
+            frame = provider.BuildFetchLatestByNaturalKeyFrame(parameter.ParameterType, identity)
                     ?? throw new InvalidOperationException(
                         $"The {provider.StoreName} integration cannot read {parameter.ParameterType.FullNameInCode()} by its natural key on {chain.HandlerCalls().First()}.");
         }
@@ -137,13 +137,13 @@ public class ReadModelAttribute : WolverineParameterAttribute, IDataRequirement,
                     : tryFindStrongTypedIdentityVariable(chain, aggregateType, keyType));
 
             // A store that cannot fetch by natural key builds no frame, and the load is reported as before
-            if (identity != null) frame = provider.BuildFetchLatestByNaturalKeyFrame(aggregateType, identity, chain, container);
+            if (identity != null) frame = provider.BuildFetchLatestByNaturalKeyFrame(aggregateType, identity);
             if (frame == null) throw new InvalidEntityLoadUsageException(this, parameter);
         }
 
         // The store builds this frame: core never writes "session.Events.FetchLatest<T>(...)" itself,
         // which is what keeps Marten's batch-query enlistment on Marten's side of the seam. GH-3907.
-        frame ??= provider.BuildFetchLatestFrame(parameter.ParameterType, identity!, chain, container);
+        frame ??= provider.BuildFetchLatestFrame(parameter.ParameterType, identity!);
         var aggregate = FindAggregateVariable(frame, parameter.ParameterType, provider);
         aggregate.OverrideName(parameter.Name!);
 

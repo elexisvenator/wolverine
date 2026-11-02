@@ -19,10 +19,8 @@ using Wolverine.Tracking;
 namespace MartenTests.AggregateHandlerWorkflow;
 
 /// <summary>
-/// Marten brackets an Async aggregate fetch in a snapshot transaction of its own, and only accepts that before
-/// everything else in a batch. Wolverine enlists those fetches first, whatever order the handler declares its
-/// parameters in. An exclusive fetch cannot share their batch, because the bracket's <c>end</c> would release its
-/// row lock, so it gets a second batch after the first.
+/// Loads of an Async aggregate share Wolverine's batched query with other loads, in any order and beside an
+/// exclusive load.
 /// </summary>
 public class async_aggregate_load_in_a_batch : PostgresqlContext, IAsyncLifetime
 {
@@ -99,22 +97,13 @@ public class async_aggregate_load_in_a_batch : PostgresqlContext, IAsyncLifetime
         return (await query.Events.FetchLatest<AsyncTally>(tallyId, TestContext.Current.CancellationToken))!.Count;
     }
 
-    private static int positionOf(string code, string text)
-    {
-        var index = code.IndexOf(text, StringComparison.Ordinal);
-        index.ShouldBeGreaterThanOrEqualTo(0, $"'{text}' is not in the generated code");
-        return index;
-    }
-
     [Fact]
     public async Task an_async_aggregate_by_stream_id_after_another_batched_load()
     {
         var tallyId = await startTally();
 
-        // Declared second, enlisted first
-        var code = sourceFor<BumpAsyncTally>();
-        positionOf(code, $"FetchForWriting<{typeof(AsyncTally).FullNameInCode()}>(")
-            .ShouldBeLessThan(positionOf(code, $"Query<{typeof(NkProduct).FullNameInCode()}>()"));
+        sourceFor<BumpAsyncTally>()
+            .ShouldContain($"batchedQuery.Events.FetchForWriting<{typeof(AsyncTally).FullNameInCode()}>(");
 
         await _host.InvokeMessageAndWaitAsync(new BumpAsyncTally(tallyId));
 
@@ -145,22 +134,15 @@ public class async_aggregate_load_in_a_batch : PostgresqlContext, IAsyncLifetime
     }
 
     [Fact]
-    public async Task an_exclusive_load_gets_a_second_batch_after_the_async_one()
+    public async Task an_async_aggregate_beside_an_exclusive_load()
     {
         var tallyId = await startTally();
         var sku = new NkSku("ASYNC-AND-EXCLUSIVE");
         var productId = await listProduct(sku, 1);
 
         var code = sourceFor<BumpTallyAndRestockExclusively>();
-
-        // The async fetch and the other load share the first batch; the exclusive fetch has the second
-        code.ShouldContain("lockingBatchedQuery");
-        var firstExecute = positionOf(code, "await batchedQuery.Execute(");
-        positionOf(code, $"batchedQuery.Events.FetchForWriting<{typeof(AsyncTally).FullNameInCode()}>(")
-            .ShouldBeLessThan(firstExecute);
-        positionOf(code, $"batchedQuery.Query<{typeof(NkProduct).FullNameInCode()}>()").ShouldBeLessThan(firstExecute);
-        positionOf(code, "lockingBatchedQuery.Events.FetchForExclusiveWriting<")
-            .ShouldBeGreaterThan(firstExecute);
+        code.ShouldContain($"batchedQuery.Events.FetchForWriting<{typeof(AsyncTally).FullNameInCode()}>(");
+        code.ShouldContain("batchedQuery.Events.FetchForExclusiveWriting<");
 
         await _host.InvokeMessageAndWaitAsync(new BumpTallyAndRestockExclusively(tallyId, sku, 4));
 
@@ -170,14 +152,11 @@ public class async_aggregate_load_in_a_batch : PostgresqlContext, IAsyncLifetime
     }
 
     [Fact]
-    public async Task an_exclusive_load_of_an_async_aggregate_stays_in_one_batch()
+    public async Task an_exclusive_load_of_an_async_aggregate()
     {
-        // It never brackets: it already owns the session's transaction, so it counts as exclusive
         var tallyId = await startTally();
 
-        var code = sourceFor<BumpAsyncTallyExclusively>();
-        code.ShouldNotContain("lockingBatchedQuery");
-        code.ShouldContain("batchedQuery.Events.FetchForExclusiveWriting<");
+        sourceFor<BumpAsyncTallyExclusively>().ShouldContain("batchedQuery.Events.FetchForExclusiveWriting<");
 
         await _host.InvokeMessageAndWaitAsync(new BumpAsyncTallyExclusively(tallyId));
 
@@ -211,7 +190,7 @@ public static class AsyncInBatchHandler
 {
     public static AsyncTally? LastTally;
 
-    // [All] is declared first, the Async aggregate load second
+    // The Async aggregate load comes after another batched load
     public static TallyBumped Handle(BumpAsyncTally command, [All] IReadOnlyList<NkProduct> products,
         [WriteAggregate] AsyncTally tally) => new();
 
@@ -224,7 +203,6 @@ public static class AsyncInBatchHandler
     public static TallyBumped Handle(BumpAsyncTallyExclusively command, [All] IReadOnlyList<NkProduct> products,
         [WriteAggregate(LoadStyle = Wolverine.Marten.ConcurrencyStyle.Exclusive)] AsyncTally tally) => new();
 
-    // The exclusive load is declared first, the Async one last
     public static void Handle(BumpTallyAndRestockExclusively command,
         [WriteAggregate<NkSku>(LoadStyle = Wolverine.Marten.ConcurrencyStyle.Exclusive)] IEventStream<NkProduct> product,
         [All] IReadOnlyList<NkProduct> products,
