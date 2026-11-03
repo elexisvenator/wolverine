@@ -4,6 +4,7 @@ using JasperFx;
 using JasperFx.CodeGeneration;
 using JasperFx.CodeGeneration.Frames;
 using JasperFx.CodeGeneration.Model;
+using JasperFx.Core;
 using JasperFx.Core.Reflection;
 using JasperFx.Events.Aggregation;
 using Wolverine.Attributes;
@@ -103,7 +104,7 @@ public class ReadModelAttribute : WolverineParameterAttribute, IDataRequirement,
         var idType = ((IPersistenceFrameProvider)provider).DetermineSagaIdType(parameter.ParameterType, chain,
             container);
 
-        if (!tryFindIdentityVariable(chain, parameter, idType, out var identity))
+        if (!tryFindModelIdentity(chain, parameter, idType, out var identity))
         {
             // Fall back to strong typed ID matching
             identity = tryFindStrongTypedIdentityVariable(chain, parameter.ParameterType, idType);
@@ -178,6 +179,23 @@ public class ReadModelAttribute : WolverineParameterAttribute, IDataRequirement,
         return aggregate;
     }
 
+    /// <summary>
+    ///     The base identity lookup, except that a member marked [JasperFxIgnore] is not matched by convention.
+    /// </summary>
+    private bool tryFindModelIdentity(IChain chain, ParameterInfo parameter, Type idType,
+        [NotNullWhen(true)] out Variable? variable)
+    {
+        if (ArgumentName.IsNotEmpty() && chain.TryFindVariable(ArgumentName, ValueSource, idType, out var named))
+        {
+            variable = named;
+            return true;
+        }
+
+        return AggregateHandling.TryFindByConvention(chain, parameter.ParameterType.Name + "Id", ValueSource, idType,
+                   out variable)
+               || AggregateHandling.TryFindByConvention(chain, "Id", ValueSource, idType, out variable);
+    }
+
     [UnconditionalSuppressMessage("Trimming", "IL2075",
         Justification = "Handler/command/model types come from handler discovery, which already roots them; this is the dynamic codegen path. See docs/guide/aot.md.")]
     private Variable? tryFindStrongTypedIdentityVariable(IChain chain, Type aggregateType, Type idType)
@@ -195,7 +213,7 @@ public class ReadModelAttribute : WolverineParameterAttribute, IDataRequirement,
         if (inputType == null) return null;
 
         var matchingProps = inputType.GetProperties()
-            .Where(x => x.PropertyType == strongTypedIdType && x.CanRead)
+            .Where(x => x.PropertyType == strongTypedIdType && x.CanRead && !AggregateHandling.IsIgnored(x))
             .ToArray();
 
         if (matchingProps.Length == 1)

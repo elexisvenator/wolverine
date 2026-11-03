@@ -214,21 +214,15 @@ public class WriteModelAttribute : WolverineParameterAttribute, IDataRequirement
             return null;
         }
 
-        var name = VersionSource ?? "version";
-
-        if (chain.TryFindVariable(name, ValueSource.Anything, typeof(long), out var variable))
+        foreach (var versionType in new[] { typeof(long), typeof(int), typeof(uint) })
         {
-            return variable;
-        }
+            // A member marked [JasperFxIgnore] is only the version when VersionSource names it
+            var found = VersionSource != null
+                ? chain.TryFindVariable(VersionSource, ValueSource.Anything, versionType, out var named)
+                : AggregateHandling.TryFindByConvention(chain, "version", ValueSource.Anything, versionType,
+                    out named);
 
-        if (chain.TryFindVariable(name, ValueSource.Anything, typeof(int), out var v2))
-        {
-            return v2;
-        }
-
-        if (chain.TryFindVariable(name, ValueSource.Anything, typeof(uint), out var v3))
-        {
-            return v3;
+            if (found) return named;
         }
 
         return null;
@@ -271,12 +265,13 @@ public class WriteModelAttribute : WolverineParameterAttribute, IDataRequirement
             return marked;
         }
 
-        if (chain.TryFindVariable($"{aggregateType.Name.ToCamelCase()}Id", ValueSource.Anything, idType, out var v2))
+        if (AggregateHandling.TryFindByConvention(chain, $"{aggregateType.Name.ToCamelCase()}Id",
+                ValueSource.Anything, idType, out var v2))
         {
             return v2;
         }
 
-        if (chain.TryFindVariable("id", ValueSource.Anything, idType, out var v3))
+        if (AggregateHandling.TryFindByConvention(chain, "id", ValueSource.Anything, idType, out var v3))
         {
             return v3;
         }
@@ -298,7 +293,7 @@ public class WriteModelAttribute : WolverineParameterAttribute, IDataRequirement
             if (inputType != null)
             {
                 var matchingProps = inputType.GetProperties()
-                    .Where(x => x.PropertyType == strongTypedIdType && x.CanRead)
+                    .Where(x => x.PropertyType == strongTypedIdType && x.CanRead && !AggregateHandling.IsIgnored(x))
                     .ToArray();
 
                 if (matchingProps.Length == 1)

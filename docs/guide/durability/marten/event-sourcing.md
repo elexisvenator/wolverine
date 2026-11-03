@@ -576,6 +576,29 @@ public class MarkItemReady
 <sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/OrderEventSourcingSample/Alternatives/Signatures.cs#L11-L21' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_markitemready_with_explicit_identity' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
+### Members Wolverine Skips
+
+A command member marked with `[JasperFxIgnore]`, or Marten's `[MartenIgnore]`, is never matched by convention.
+Wolverine doesn't take it as the aggregate identity (`{aggregate}Id` or `Id`), as the only member of a strong typed
+identifier's type, or as the `Version` to check. Use it for a member that has one of those names or types but
+means something else on the command:
+
+<!-- snippet: sample_wolverine_marten_ignored_command_members -->
+<a id='snippet-sample_wolverine_marten_ignored_command_members'></a>
+```cs
+// Version is not the stream's expected version, so it is not checked
+public record BumpWithIgnoredVersion(Guid IgnoredMemberCounterId, [property: MartenIgnore] long Version);
+
+// IgnoredMemberCounterId is the caller's own reference, so the stream id is Id
+public record BumpWithIgnoredAggregateId([property: JasperFxIgnore] Guid IgnoredMemberCounterId, Guid Id);
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/ignored_command_members.cs#L180-L186' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_ignored_command_members' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+This holds for `[AggregateHandler]`, `[WriteAggregate]`, `[ReadAggregate]`, `[WriteModel]` and `[ReadModel]`, and
+for the members of an HTTP request body. An ignored member is still used when the attribute names it, through its
+argument name or `VersionSource`, or when the member is marked with `[Identity]`.
+
 ## Validation <Badge type="tip" text="4.8" />
 
 Every possible attribute for triggering the "aggregate handler workflow" includes support for data requirements as
@@ -1088,7 +1111,7 @@ public static class MyHandler
 ## Overriding Version Discovery <Badge type="tip" text="5.17" />
 
 By default, Wolverine discovers a version member on your command type by looking for a property or field named `Version`
-of type `int` or `long`. In multi-stream operations where each stream needs its own version source, this convention
+of type `int` or `long`, and not marked with `[JasperFxIgnore]` (see [Members Wolverine Skips](#members-wolverine-skips)). In multi-stream operations where each stream needs its own version source, this convention
 breaks down because you can't have multiple properties all named "Version".
 
 The `VersionSource` property lets you explicitly specify which member supplies the expected stream version for

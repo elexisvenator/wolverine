@@ -3,11 +3,13 @@ using System.Reflection;
 using JasperFx;
 using JasperFx.CodeGeneration.Frames;
 using JasperFx.CodeGeneration.Model;
+using JasperFx.CodeGeneration.Services;
 using JasperFx.Core;
 using JasperFx.Core.Reflection;
 using JasperFx.Events;
 using JasperFx.Events.Aggregation;
 using JasperFx.Events.Daemon;
+using Wolverine.Attributes;
 using Wolverine.Configuration;
 using Wolverine.Runtime;
 using Wolverine.Runtime.Handlers;
@@ -329,7 +331,8 @@ internal record AggregateHandling(IDataRequirement Requirement)
 
         var member = commandType.GetMembers().FirstOrDefault(IsMarkedAsIdentity)
                      ?? commandType.GetMembers().FirstOrDefault(x =>
-                         x.Name.EqualsIgnoreCase(conventionalMemberName) || x.Name.EqualsIgnoreCase("Id"));
+                         (x.Name.EqualsIgnoreCase(conventionalMemberName) || x.Name.EqualsIgnoreCase("Id"))
+                         && !IsIgnored(x));
 
         if (member == null)
         {
@@ -362,6 +365,37 @@ internal record AggregateHandling(IDataRequirement Requirement)
     internal static bool IsMarkedAsIdentity(MemberInfo member)
         => member.GetCustomAttributes().Any(x => x.GetType().Name == nameof(IdentityAttribute));
 
+    /// <summary>
+    ///     Is this command or request member marked with <see cref="JasperFxIgnoreAttribute" /> (or its Marten
+    ///     subclass <c>[MartenIgnore]</c>)? An ignored member is never matched by convention, by name or as the
+    ///     single member of a type, as the identity or the version. A name given in the attribute, or
+    ///     <c>[Identity]</c> on the member, still selects it.
+    /// </summary>
+    internal static bool IsIgnored(MemberInfo member) => member.HasAttribute<JasperFxIgnoreAttribute>();
+
+    internal static bool IsIgnored(Variable variable) => variable switch
+    {
+        MessageMemberVariable message => IsIgnored(message.Member),
+        MemberAccessVariable access => IsIgnored(access.Member),
+        _ => false
+    };
+
+    /// <summary>
+    ///     <see cref="IChain.TryFindVariable" /> for a conventional name, which never matches an ignored member.
+    /// </summary>
+    internal static bool TryFindByConvention(IChain chain, string name, ValueSource source, Type type,
+        [NotNullWhen(true)] out Variable? variable)
+    {
+        if (chain.TryFindVariable(name, source, type, out var found) && !IsIgnored(found))
+        {
+            variable = found;
+            return true;
+        }
+
+        variable = null;
+        return false;
+    }
+
     [UnconditionalSuppressMessage("Trimming", "IL2070",
         Justification = "Handler/command/model types come from handler discovery, which already roots them; this is the dynamic codegen path. See docs/guide/aot.md.")]
     internal static MemberInfo? TryFindStrongTypedIdMember(Type aggregateType, Type commandType)
@@ -383,7 +417,7 @@ internal record AggregateHandling(IDataRequirement Requirement)
 
         // Look for a single property of the strong typed ID type on the command
         var matchingProps = commandType.GetProperties()
-            .Where(x => x.PropertyType == strongTypedIdType && x.CanRead)
+            .Where(x => x.PropertyType == strongTypedIdType && x.CanRead && !IsIgnored(x))
             .ToArray();
 
         return matchingProps.Length == 1 ? matchingProps[0] : null;
