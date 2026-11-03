@@ -1,3 +1,4 @@
+using JasperFx.Core;
 using Wolverine.Http;
 using Wolverine.Http.Marten;
 using Wolverine.Marten;
@@ -6,6 +7,9 @@ using WolverineWebApi.Marten;
 namespace WolverineWebApi.Marten;
 
 public record ShipOrderWithExpectedVersion(Guid OrderId, long ExpectedVersion);
+
+// Version is not the expected version of the stream, so it is never taken as one
+public record ShipOrderWithIgnoredVersion(Guid OrderId, [property: JasperFxIgnore] long Version);
 
 public static class VersionSourceEndpoints
 {
@@ -25,6 +29,16 @@ public static class VersionSourceEndpoints
     public static OrderShipped ShipWithBodyVersion(
         ShipOrderWithExpectedVersion command,
         [Aggregate(VersionSource = nameof(ShipOrderWithExpectedVersion.ExpectedVersion))] Order order)
+    {
+        return new OrderShipped();
+    }
+
+    // A Version member marked [JasperFxIgnore] is not the expected version
+    [WolverinePost("/orders/ship-with-ignored-version")]
+    [EmptyResponse]
+    public static OrderShipped ShipWithIgnoredVersion(
+        ShipOrderWithIgnoredVersion command,
+        [Aggregate] Order order)
     {
         return new OrderShipped();
     }

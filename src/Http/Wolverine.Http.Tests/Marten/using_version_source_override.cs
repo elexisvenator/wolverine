@@ -81,4 +81,23 @@ public class using_version_source_override(AppFixture fixture) : IntegrationCont
             x.StatusCodeShouldBe(500);
         });
     }
+
+    [Fact]
+    public async Task a_body_version_marked_ignore_is_not_checked()
+    {
+        var orderId = await CreateOrder();
+
+        // The stream is at version 1, so 99 would fail if it were taken as the expected version
+        await Scenario(x =>
+        {
+            x.Post.Json(new ShipOrderWithIgnoredVersion(orderId, 99))
+                .ToUrl("/orders/ship-with-ignored-version");
+            x.StatusCodeShouldBe(204);
+        });
+
+        await using var session = Store.LightweightSession();
+        var order = await session.Events.AggregateStreamAsync<Order>(orderId, token: TestContext.Current.CancellationToken);
+        order.ShouldNotBeNull();
+        order.Shipped.HasValue.ShouldBeTrue();
+    }
 }
