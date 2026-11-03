@@ -414,6 +414,22 @@ public class natural_key_aggregate_on_ancillary_store : IAsyncLifetime
         (await loadGadget(streamId))!.Name.ShouldBe("By nullable query");
     }
 
+    [Theory]
+    [InlineData("/nkgadgets-by-stream-id-query/rename")]
+    [InlineData("/nkstring-gadgets-by-stream-key-query/rename")]
+    [InlineData("/nkgadgets-by-query/rename")]
+    [InlineData("/nkgadgets-by-nullable-query/rename")]
+    public async Task a_write_with_the_query_string_value_missing_is_refused_as_for_a_stream_id(string url)
+    {
+        // The first two are a stream id and a stream key, which Marten refuses when empty or null. A natural
+        // key is refused the same way: as a TKey? by the generated code, and as a struct wrapping a null
+        // string, which is what a missing value binds to, by Marten.
+        await Should.ThrowAsync<ArgumentOutOfRangeException>(() => theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkGadget("Nobody")).ToUrl(url);
+        }));
+    }
+
     private async Task<NkStringGadget?> loadStringGadget(string streamKey)
     {
         var store = theHost.Services.GetRequiredService<INkStringStore>();

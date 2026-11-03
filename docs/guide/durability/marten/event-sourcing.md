@@ -1403,10 +1403,11 @@ public record RestockNkProduct(NkSku? Sku, int Quantity);
 <sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L508-L511' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_nullable_natural_key_command' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
-A null key is treated the way Marten treats a null `string` stream id:
+A null key is treated the way Marten treats an empty `Guid` or a null `string` stream id:
 
-- `[WriteAggregate]` throws an `InvalidOperationException` before anything is loaded, whether or not the
-  aggregate parameter is nullable. There is no aggregate to load, and no key for a new stream to claim.
+- `[WriteAggregate]` throws an `ArgumentOutOfRangeException` before anything is loaded, whether or not the
+  aggregate parameter is nullable. There is no aggregate to load, and no key for a new stream to claim. Over
+  HTTP, a missing route or query string value is refused the same way as a missing stream id.
 - `[ReadAggregate]` gets no aggregate, without a query. A required read stops the handler, as it does for a
   key that matches nothing.
 

@@ -55,11 +55,12 @@ internal class NaturalKeyArgument
         $"The {KeyType.FullNameInCode()} natural key on this message is null, so there is no {aggregateType.FullNameInCode()} to load";
 
     /// <summary>
-    /// A write has no aggregate to load and no key to claim, as Marten refuses a null string stream id.
+    /// A write has no aggregate to load and no key to claim. The same exception Marten throws for a null key,
+    /// and for an empty Guid or a null string stream id.
     /// </summary>
     public string ThrowIfNull(Type aggregateType) =>
-        $"if ({IsNullCheck}) throw new System.InvalidOperationException(\"{NullKeyMessage(aggregateType)}\");";
+        $"if ({IsNullCheck}) throw new System.ArgumentOutOfRangeException(\"{_member.Usage}\", \"{NullKeyMessage(aggregateType)}\");";
 
     public string FSharpThrowIfNull(Type aggregateType) =>
-        $"if {FSharpIsNullCheck} then raise (System.InvalidOperationException(\"{NullKeyMessage(aggregateType)}\"))";
+        $"if {FSharpIsNullCheck} then raise (System.ArgumentOutOfRangeException(\"{_member.FSharpUsage}\", \"{NullKeyMessage(aggregateType)}\"))";
 }

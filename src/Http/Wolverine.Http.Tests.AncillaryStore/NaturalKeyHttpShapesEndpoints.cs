@@ -123,4 +123,20 @@ public static class NkHttpShapeEndpoints
     public static NkGadgetRenamed RenameByNullableQuery(RenameNkGadget command, GadgetCode? code,
         [WriteAggregate<GadgetCode>("code")] NkGadget gadget)
         => new(command.Name);
+
+    // A stream id from the query string, to compare a missing natural key with a missing stream id
+    [WolverinePost("/nkgadgets-by-stream-id-query/rename")]
+    [EmptyResponse]
+    public static NkGadgetRenamed RenameByStreamIdQuery(RenameNkGadget command, Guid id, [WriteAggregate("id")] NkGadget gadget)
+        => new(command.Name);
+
+}
+
+[MartenStore(typeof(INkStringStore))]
+public static class NkStringStreamKeyQueryEndpoints
+{
+    [WolverinePost("/nkstring-gadgets-by-stream-key-query/rename")]
+    [EmptyResponse]
+    public static NkStringGadgetRenamed RenameByStreamKeyQuery(RenameNkStringGadget command, string id, [WriteAggregate("id")] NkStringGadget gadget)
+        => new(command.Name);
 }

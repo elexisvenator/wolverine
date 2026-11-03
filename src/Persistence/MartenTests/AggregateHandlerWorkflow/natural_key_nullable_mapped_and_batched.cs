@@ -125,7 +125,7 @@ public class natural_key_nullable_mapped_and_batched : PostgresqlContext, IAsync
     public async Task a_null_natural_key_is_refused_on_a_write()
     {
         // As Marten refuses a null string stream id: nothing to load, and no key to claim
-        var ex = await Should.ThrowAsync<InvalidOperationException>(() =>
+        var ex = await Should.ThrowAsync<ArgumentOutOfRangeException>(() =>
             _host.InvokeMessageAndWaitAsync(new RestockNkProduct(null, 4)));
         ex.Message.ShouldContain("natural key on this message is null");
     }
@@ -133,7 +133,7 @@ public class natural_key_nullable_mapped_and_batched : PostgresqlContext, IAsync
     [Fact]
     public async Task a_null_reference_type_natural_key_is_refused_on_a_write()
     {
-        var ex = await Should.ThrowAsync<InvalidOperationException>(() =>
+        var ex = await Should.ThrowAsync<ArgumentOutOfRangeException>(() =>
             _host.InvokeMessageAndWaitAsync(new RecodeNkShelf(null!)));
         ex.Message.ShouldContain("natural key on this message is null");
     }
