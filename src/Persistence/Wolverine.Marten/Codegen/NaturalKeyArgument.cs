@@ -1,3 +1,4 @@
+using System.Reflection;
 using JasperFx.CodeGeneration.Model;
 using JasperFx.Core.Reflection;
 
@@ -17,11 +18,23 @@ internal class NaturalKeyArgument
     {
         _member = member;
 
-        var underlying = Nullable.GetUnderlyingType(member.VariableType);
+        var memberType = declaredTypeOf(member);
+        var underlying = Nullable.GetUnderlyingType(memberType);
         _isNullableStruct = underlying != null;
-        KeyType = underlying ?? member.VariableType;
-        CanBeNull = _isNullableStruct || !member.VariableType.IsValueType;
+        KeyType = underlying ?? memberType;
+        CanBeNull = _isNullableStruct || !memberType.IsValueType;
     }
+
+    /// <summary>
+    /// A <see cref="MemberAccessVariable"/>, such as a member of an HTTP request body, takes its type from
+    /// <c>GetMemberType()</c>, which strips <c>Nullable&lt;T&gt;</c>. The member's declared type keeps it.
+    /// </summary>
+    private static Type declaredTypeOf(Variable member) => member switch
+    {
+        MemberAccessVariable { Member: PropertyInfo property } => property.PropertyType,
+        MemberAccessVariable { Member: FieldInfo field } => field.FieldType,
+        _ => member.VariableType
+    };
 
     /// <summary>
     /// <c>TKey</c>, the type argument for <c>FetchForWriting&lt;T, TKey&gt;</c> and the other fetch APIs.

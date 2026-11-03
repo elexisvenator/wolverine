@@ -70,6 +70,8 @@ public class natural_key_aggregate_on_ancillary_store : IAsyncLifetime
             opts.Projections.Snapshot<NkThing>(SnapshotLifecycle.Inline);
             // Every host scanning the endpoint assembly builds the NkGadget endpoints too
             opts.Projections.Snapshot<NkGadget>(SnapshotLifecycle.Inline);
+            opts.Projections.Snapshot<NkBin>(SnapshotLifecycle.Inline);
+            opts.Projections.Snapshot<NkPart>(SnapshotLifecycle.Inline);
         }).IntegrateWithWolverine();
 
         // The string-identity natural-key endpoints in the endpoint assembly need this store
@@ -243,6 +245,173 @@ public class natural_key_aggregate_on_ancillary_store : IAsyncLifetime
             s.Post.Json(new CreateNkGadget(code.Value, "Second")).ToUrl("/nkgadgets");
             s.StatusCodeShouldBe(409);
         });
+    }
+
+    private async Task<Guid> seed<T>(object @event) where T : class
+    {
+        var streamId = Guid.NewGuid();
+
+        var store = theHost.Services.GetRequiredService<INkThingStore>();
+        await using var session = store.LightweightSession();
+        session.Events.StartStream<T>(streamId, @event);
+        await session.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        return streamId;
+    }
+
+    private async Task<T?> load<T>(Guid streamId) where T : class
+    {
+        var store = theHost.Services.GetRequiredService<INkThingStore>();
+        await using var session = store.LightweightSession();
+        return await session.LoadAsync<T>(streamId, TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task write_and_read_by_a_key_wrapping_an_int_in_the_route()
+    {
+        var number = new BinNumber(Random.Shared.Next(1, int.MaxValue));
+        var streamId = await seed<NkBin>(new NkBinCreated(number, "Original"));
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RelabelNkBin("Relabelled")).ToUrl($"/nkbins/{number.Value}/relabel");
+            s.StatusCodeShouldBe(204);
+        });
+
+        (await load<NkBin>(streamId))!.Label.ShouldBe("Relabelled");
+
+        var bin = await theHost.GetAsJson<NkBin>($"/nkbins/{number.Value}");
+        bin!.Id.ShouldBe(streamId);
+
+        await theHost.Scenario(s =>
+        {
+            s.Get.Url("/nkbins/not-a-number");
+            s.StatusCodeShouldBe(404);
+        });
+    }
+
+    [Fact]
+    public async Task without_the_key_type_a_route_value_is_the_stream_id()
+    {
+        var (streamId, code) = await seedGadget("Original");
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkGadget("Nobody")).ToUrl($"/nkgadgets-untyped/{code.Value}/rename");
+            s.StatusCodeShouldBe(404);
+        });
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkGadget("By stream id")).ToUrl($"/nkgadgets-untyped/{streamId}/rename");
+            s.StatusCodeShouldBe(204);
+        });
+
+        (await loadGadget(streamId))!.Name.ShouldBe("By stream id");
+    }
+
+    [Fact]
+    public async Task read_by_a_class_key_with_its_own_try_parse_in_the_route()
+    {
+        var code = new PartCode("P-" + Guid.NewGuid().ToString("N"));
+        var streamId = await seed<NkPart>(new NkPartAdded(code, "Bolt"));
+
+        var part = await theHost.GetAsJson<NkPart>($"/nkparts/{code.Value}");
+        part!.Id.ShouldBe(streamId);
+        part.Description.ShouldBe("Bolt");
+
+        await theHost.Scenario(s =>
+        {
+            s.Get.Url("/nkparts/P-NONE");
+            s.StatusCodeShouldBe(404);
+        });
+    }
+
+    [Fact]
+    public async Task write_by_a_class_key_in_the_request_body()
+    {
+        var code = new PartCode("P-" + Guid.NewGuid().ToString("N"));
+        var streamId = await seed<NkPart>(new NkPartAdded(code, "Bolt"));
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new DescribeNkPart(code, "Hex bolt")).ToUrl("/nkparts/describe");
+            s.StatusCodeShouldBe(204);
+        });
+
+        (await load<NkPart>(streamId))!.Description.ShouldBe("Hex bolt");
+    }
+
+    [Fact]
+    public async Task write_by_a_nullable_key_in_the_request_body()
+    {
+        var (streamId, code) = await seedGadget("Original");
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkGadgetByBody(code, "By body")).ToUrl("/nkgadgets-by-body/rename");
+            s.StatusCodeShouldBe(204);
+        });
+
+        (await loadGadget(streamId))!.Name.ShouldBe("By body");
+    }
+
+    [Fact]
+    public async Task write_by_a_query_string_value_without_the_key_type()
+    {
+        var (streamId, code) = await seedGadget("Original");
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkGadget("Untyped")).ToUrl("/nkgadgets-by-query-untyped/rename").QueryString("code", code.Value);
+            s.StatusCodeShouldBe(204);
+        });
+
+        (await loadGadget(streamId))!.Name.ShouldBe("Untyped");
+    }
+
+    [Fact]
+    public async Task an_optional_read_by_a_query_string_value()
+    {
+        var (_, code) = await seedGadget("Optional");
+
+        var found = await theHost.GetAsJson<GadgetLookup>($"/nkgadgets-by-optional-query?code={code.Value}");
+        found.ShouldBe(new GadgetLookup(true, "Optional"));
+
+        var unknown = await theHost.GetAsJson<GadgetLookup>("/nkgadgets-by-optional-query?code=G-NONE");
+        unknown.ShouldBe(new GadgetLookup(false, null));
+
+        var missing = await theHost.GetAsJson<GadgetLookup>("/nkgadgets-by-optional-query");
+        missing.ShouldBe(new GadgetLookup(false, null));
+    }
+
+    [Fact]
+    public async Task a_required_read_by_a_nullable_query_string_value()
+    {
+        var (streamId, code) = await seedGadget("Required");
+
+        var gadget = await theHost.GetAsJson<NkGadget>($"/nkgadgets-by-nullable-query?code={code.Value}");
+        gadget!.Id.ShouldBe(streamId);
+
+        await theHost.Scenario(s =>
+        {
+            s.Get.Url("/nkgadgets-by-nullable-query");
+            s.StatusCodeShouldBe(404);
+        });
+    }
+
+    [Fact]
+    public async Task a_write_by_a_nullable_query_string_value()
+    {
+        var (streamId, code) = await seedGadget("Original");
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkGadget("By nullable query")).ToUrl("/nkgadgets-by-nullable-query/rename").QueryString("code", code.Value);
+            s.StatusCodeShouldBe(204);
+        });
+
+        (await loadGadget(streamId))!.Name.ShouldBe("By nullable query");
     }
 
     private async Task<NkStringGadget?> loadStringGadget(string streamKey)
