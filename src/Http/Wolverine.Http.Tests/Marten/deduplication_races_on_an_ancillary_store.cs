@@ -64,6 +64,7 @@ public class deduplication_races_on_an_ancillary_store : IAsyncLifetime
             m.Projections.Snapshot<NkGadget>(SnapshotLifecycle.Inline);
             m.Projections.Snapshot<NkBin>(SnapshotLifecycle.Inline);
             m.Projections.Snapshot<NkPart>(SnapshotLifecycle.Inline);
+            m.Projections.Snapshot<NkGadgetView>(SnapshotLifecycle.Async);
         }).IntegrateWithWolverine().UseLightweightSessions();
 
         // The string-identity natural-key endpoints in the endpoint assembly need this store

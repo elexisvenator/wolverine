@@ -72,6 +72,7 @@ public class natural_key_aggregate_on_ancillary_store : IAsyncLifetime
             opts.Projections.Snapshot<NkGadget>(SnapshotLifecycle.Inline);
             opts.Projections.Snapshot<NkBin>(SnapshotLifecycle.Inline);
             opts.Projections.Snapshot<NkPart>(SnapshotLifecycle.Inline);
+            opts.Projections.Snapshot<NkGadgetView>(SnapshotLifecycle.Async);
         }).IntegrateWithWolverine();
 
         // The string-identity natural-key endpoints in the endpoint assembly need this store
@@ -428,6 +429,123 @@ public class natural_key_aggregate_on_ancillary_store : IAsyncLifetime
         {
             s.Post.Json(new RenameNkGadget("Nobody")).ToUrl(url);
         }));
+    }
+
+    // ---------- every attribute over HTTP (NkHttpAttributeEndpoints) ----------
+
+    [Theory]
+    [InlineData("/nkhttp/write-model/{0}")]
+    [InlineData("/nkhttp/aggregate/{0}")]
+    [InlineData("/nkhttp/consistent/{0}")]
+    [InlineData("/nkhttp/as-parameters/{0}/rename")]
+    [InlineData("/nkhttp/exclusive/{0}/rename")]
+    public async Task a_write_by_a_natural_key_in_the_route(string route)
+    {
+        var (streamId, code) = await seedGadget("Original");
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkGadget("By route")).ToUrl(string.Format(route, code.Value));
+            s.StatusCodeShouldBe(204);
+        });
+
+        (await loadGadget(streamId))!.Name.ShouldBe("By route");
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkGadget("Nobody")).ToUrl(string.Format(route, "G-NONE"));
+            s.StatusCodeShouldBe(404);
+        });
+    }
+
+    [Theory]
+    [InlineData("/nkhttp/write-model-by-body")]
+    [InlineData("/nkhttp/aggregate-by-body")]
+    public async Task a_write_by_a_natural_key_in_the_request_body(string url)
+    {
+        var (streamId, code) = await seedGadget("Original");
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkGadgetByCode(code, "By body")).ToUrl(url);
+            s.StatusCodeShouldBe(204);
+        });
+
+        (await loadGadget(streamId))!.Name.ShouldBe("By body");
+    }
+
+    [Theory]
+    [InlineData("/nkhttp/read-model/{0}")]
+    [InlineData("/nkhttp/read-model-by-query?code={0}")]
+    [InlineData("/nkhttp/read-aggregate-by-query?code={0}")]
+    public async Task a_read_by_a_natural_key(string url)
+    {
+        var (streamId, code) = await seedGadget("Readable");
+
+        var gadget = await theHost.GetAsJson<NkGadget>(string.Format(url, code.Value));
+        gadget!.Id.ShouldBe(streamId);
+        gadget.Name.ShouldBe("Readable");
+
+        await theHost.Scenario(s =>
+        {
+            s.Get.Url(string.Format(url, "G-NONE"));
+            s.StatusCodeShouldBe(404);
+        });
+    }
+
+    [Fact]
+    public async Task an_async_view_by_its_mapped_key()
+    {
+        var (streamId, code) = await seedGadget("Original");
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkGadget("Viewed")).ToUrl($"/nkhttp/view/{code.Value}/rename");
+            s.StatusCodeShouldBe(204);
+        });
+
+        // The view is Async with no daemon running: read at its current state through the gadget's lookup
+        var view = await theHost.GetAsJson<NkGadgetView>($"/nkhttp/view/{code.Value}");
+        view!.Id.ShouldBe(streamId);
+        view.Name.ShouldBe("Viewed");
+
+        await theHost.Scenario(s =>
+        {
+            s.Get.Url("/nkhttp/view/G-NONE");
+            s.StatusCodeShouldBe(404);
+        });
+    }
+
+    [Fact]
+    public async Task a_write_by_a_natural_key_checks_the_version()
+    {
+        var (streamId, code) = await seedGadget("Original");
+
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkGadgetAtVersion("At 1", 1)).ToUrl($"/nkhttp/versioned/{code.Value}/rename");
+            s.StatusCodeShouldBe(204);
+        });
+
+        // Now at version 2, so 1 is stale: a concurrency failure, which this host maps to a 409
+        await theHost.Scenario(s =>
+        {
+            s.Post.Json(new RenameNkGadgetAtVersion("Stale", 1)).ToUrl($"/nkhttp/versioned/{code.Value}/rename");
+            s.StatusCodeShouldBe(409);
+        });
+
+        (await loadGadget(streamId))!.Name.ShouldBe("At 1");
+    }
+
+    [Fact]
+    public async Task two_loads_by_natural_key_in_one_endpoint()
+    {
+        var (_, code) = await seedGadget("Paired");
+        var number = new BinNumber(Random.Shared.Next(1, int.MaxValue));
+        await seed<NkBin>(new NkBinCreated(number, "Shelf"));
+
+        var both = await theHost.GetAsJson<GadgetAndBin>($"/nkhttp/gadget/{code.Value}/bin/{number.Value}");
+        both.ShouldBe(new GadgetAndBin("Paired", number.Value));
     }
 
     private async Task<NkStringGadget?> loadStringGadget(string streamKey)
