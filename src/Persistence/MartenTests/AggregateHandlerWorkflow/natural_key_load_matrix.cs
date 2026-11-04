@@ -144,6 +144,7 @@ public class natural_key_load_matrix : PostgresqlContext, IAsyncLifetime
         _store = _host.Services.GetRequiredService<IDocumentStore>();
         MxLoadMatrixHandlers.LastRead = null;
         MxLoadContextHandlers.LastBin = null;
+        MxLoadContextHandlers.LastView = null;
     }
 
     public async ValueTask DisposeAsync()
@@ -303,6 +304,30 @@ public class natural_key_load_matrix : PostgresqlContext, IAsyncLifetime
 
         await _host.InvokeMessageAndWaitAsync(message);
         (await eventsOf(orderId))[1].Data.ShouldBe(new MxRenamed("Exclusive"));
+    }
+
+    [Fact]
+    public async Task an_async_aggregate_by_key_joins_a_batch_beside_an_exclusive_load()
+    {
+        var bin = (MxBin)keyFor(typeof(MxBinOrder));
+        var sku = (MxSku)keyFor(typeof(MxSkuOrder));
+        var binId = await placeAsync(typeof(MxBinOrder), bin);
+        var orderId = await placeAsync(typeof(MxSkuOrder), sku);
+
+        var message = new MxExclusiveBesideAsyncView(bin, sku, "Beside");
+        var code = sourceFor(message);
+        code.ShouldContain(
+            $"batchedQuery.Events.FetchForExclusiveWriting<{typeof(MxBinOrder).FullNameInCode()}, {typeof(MxBin).FullNameInCode()}>");
+        code.ShouldContain(
+            $"batchedQuery.Events.FetchLatest<{typeof(MxSkuView).FullNameInCode()}, {typeof(MxSku).FullNameInCode()}>");
+
+        await _host.InvokeMessageAndWaitAsync(message);
+
+        (await eventsOf(binId))[1].Data.ShouldBe(new MxRenamed("Beside"));
+
+        // No daemon has run, so the view is the owner's stream folded through its lookup
+        MxLoadContextHandlers.LastView!.Id.ShouldBe(orderId);
+        MxLoadContextHandlers.LastView.Key.ShouldBe(sku);
     }
 
     // ---------- the decider-function form ----------
@@ -534,9 +559,21 @@ public record MxExclusiveWriteModel(MxSku Key, string Name);
 public record MxExclusiveWriteModelOfKey(MxSku Key, string Name);
 public record MxExclusiveConsistentAggregate(MxSku Key, string Name);
 
+public record MxExclusiveBesideAsyncView(MxBin Bin, MxSku Sku, string Name);
+
 public static class MxLoadContextHandlers
 {
     public static MxBinOrder? LastBin;
+    public static MxSkuView? LastView;
+
+    public static MxRenamed Handle(MxExclusiveBesideAsyncView c,
+        [WriteAggregate<MxBin>(nameof(MxExclusiveBesideAsyncView.Bin), LoadStyle = Wolverine.Marten.ConcurrencyStyle.Exclusive)]
+        MxBinOrder bin,
+        [ReadAggregate<MxSku>(nameof(MxExclusiveBesideAsyncView.Sku))] MxSkuView view)
+    {
+        LastView = view;
+        return new MxRenamed(c.Name);
+    }
 
     public static object Batched(string attribute, MxSku key, MxBin bin) => attribute switch
     {

@@ -100,28 +100,6 @@ public class natural_key_nullable_mapped_and_batched : PostgresqlContext, IAsync
     }
 
     [Fact]
-    public async Task a_nullable_command_member_resolves_the_natural_key()
-    {
-        var sku = new NkSku("NULLABLE-1");
-        var streamId = await listProduct(sku);
-
-        await _host.InvokeMessageAndWaitAsync(new RestockNkProduct(sku, 4));
-
-        (await loadProduct(streamId))!.Stock.ShouldBe(4);
-    }
-
-    [Fact]
-    public void a_nullable_command_member_is_fetched_by_the_key_type()
-    {
-        var code = sourceFor<RestockNkProduct>();
-
-        // Fetched by NkSku after a null check, never by NkSku?
-        code.ShouldContain($"FetchForWriting<{typeof(NkProduct).FullNameInCode()}, {typeof(NkSku).FullNameInCode()}>(");
-        code.ShouldContain(".Sku.Value");
-        code.ShouldNotContain($"{typeof(NkSku).FullNameInCode()}?>");
-    }
-
-    [Fact]
     public async Task a_null_natural_key_is_refused_on_a_write()
     {
         // As Marten refuses a null string stream id: nothing to load, and no key to claim
@@ -149,18 +127,6 @@ public class natural_key_nullable_mapped_and_batched : PostgresqlContext, IAsync
         // The handler appended through the read model's stream, which is the owner's stream too
         (await loadProduct(streamId))!.Stock.ShouldBe(5);
         NkProductHandler.LastStockSeen.ShouldBe(2);
-    }
-
-    [Fact]
-    public async Task an_exclusive_natural_key_load_locks_the_stream()
-    {
-        var sku = new NkSku("EXCLUSIVE-1");
-        var streamId = await listProduct(sku);
-
-        sourceFor<LockAndRestockNkProduct>().ShouldContain("FetchForExclusiveWriting<");
-
-        await _host.InvokeMessageAndWaitAsync(new LockAndRestockNkProduct(sku, 7));
-        (await loadProduct(streamId))!.Stock.ShouldBe(7);
     }
 
     [Fact]
@@ -287,32 +253,6 @@ public class natural_key_read_aggregate : PostgresqlContext, IAsyncLifetime
     }
 
     [Fact]
-    public async Task reads_an_aggregate_by_its_natural_key()
-    {
-        var sku = new NkSku("READ-1");
-        var streamId = await listProduct(sku, 3);
-
-        sourceFor<ViewNkProduct>().ShouldContain(
-            $"FetchLatest<{typeof(NkProduct).FullNameInCode()}, {typeof(NkSku).FullNameInCode()}>");
-
-        await _host.InvokeMessageAndWaitAsync(new ViewNkProduct(sku));
-
-        NkProductViewHandler.LastProduct!.Id.ShouldBe(streamId);
-        NkProductViewHandler.LastProduct.Stock.ShouldBe(3);
-    }
-
-    [Fact]
-    public async Task reads_an_aggregate_by_a_nullable_natural_key_member()
-    {
-        var sku = new NkSku("READ-NULLABLE");
-        var streamId = await listProduct(sku, 1);
-
-        await _host.InvokeMessageAndWaitAsync(new ViewNkProductMaybe(sku));
-
-        NkProductViewHandler.LastProduct!.Id.ShouldBe(streamId);
-    }
-
-    [Fact]
     public async Task reads_an_async_read_model_by_its_mapped_natural_key()
     {
         var sku = new NkSku("READ-MAPPED");
@@ -365,14 +305,6 @@ public class natural_key_read_aggregate : PostgresqlContext, IAsyncLifetime
         // And a key that is present still reads through the batch
         await _host.InvokeMessageAndWaitAsync(new PeekNkProductWithCatalog(new NkSku("PEEK-BATCHED")));
         NkProductNullableReadHandler.LastProduct!.Stock.ShouldBe(1);
-    }
-
-    [Fact]
-    public async Task an_unknown_natural_key_stops_a_required_read()
-    {
-        await _host.InvokeMessageAndWaitAsync(new ViewNkProduct(new NkSku("READ-NONE")));
-
-        NkProductViewHandler.LastProduct.ShouldBeNull();
     }
 
     [Fact]
@@ -512,8 +444,6 @@ public record RestockNkProduct(NkSku? Sku, int Quantity);
 
 public record RestockNkProductStock(NkSku Sku, int Quantity);
 
-public record LockAndRestockNkProduct(NkSku Sku, int Quantity);
-
 public record AuditNkProduct(NkSku Sku);
 
 #region sample_wolverine_marten_natural_key_command_with_version
@@ -541,10 +471,6 @@ public static class NkProductHandler
         return new NkProductRestocked(command.Quantity);
     }
     #endregion
-
-    public static NkProductRestocked Handle(LockAndRestockNkProduct command,
-        [WriteAggregate(LoadStyle = Wolverine.Marten.ConcurrencyStyle.Exclusive)] NkProduct product)
-        => new(command.Quantity);
 
     public static NkProductRestocked Handle(AuditNkProduct command, [WriteAggregate] NkProduct product,
         [Wolverine.Persistence.All] IReadOnlyList<NkProduct> all)
