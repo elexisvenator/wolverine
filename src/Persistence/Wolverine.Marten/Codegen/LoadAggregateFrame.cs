@@ -56,9 +56,9 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
 
     /// <summary>
     /// <c>FetchForWriting&lt;T, TNaturalKey&gt;</c>, or <c>FetchForExclusiveWriting&lt;T, TNaturalKey&gt;</c> for
-    /// an exclusive load, which used to be silently loaded non-exclusively. The same call on a session and on
-    /// a batch query: both have the natural key overloads. An optimistic load with a version passes it, as a
-    /// stream id load does, so a stale version fails on load instead of being ignored. Always by
+    /// an exclusive load. The same call on a session and on a batch query: both have the natural key overloads.
+    /// An optimistic load with a version passes it, as a stream id load does, so a stale version fails on load
+    /// instead of being ignored. Always by
     /// <c>TKey</c>: a member that can be null is checked first, see <see cref="writeNullKeyCheck"/>.
     /// </summary>
     private string NaturalKeyFetchForWriting(string targetUsage, string? cancellationTokenUsage = null)
@@ -78,7 +78,7 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
 
     public void WriteCodeToEnlistInBatchQuery(GeneratedMethod method, ISourceWriter writer)
     {
-        // GH-4567: IBatchedQuery now has the natural key overloads, and resolves the key inside the batch, so
+        // GH-4567: IBatchedQuery has the natural key overloads, and resolves the key inside the batch, so
         // a natural key load is one more item in the same round trip.
         if (_att.IsNaturalKey)
         {

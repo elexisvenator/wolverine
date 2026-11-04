@@ -86,7 +86,7 @@ public interface IEventSourcingFrameProvider
     /// owned or mapped: <paramref name="naturalKey"/> is the key itself, of the key's type or its nullable form,
     /// never unwrapped. Must create exactly one variable of the aggregate type. Null — the default — for a store
     /// that cannot fetch the latest state by natural key, in which case <c>[ReadModel]</c> reports that it could
-    /// not determine an identity, as it did before.
+    /// not determine an identity.
     /// </summary>
     Frame? BuildFetchLatestByNaturalKeyFrame(Type aggregateType, Variable naturalKey) => null;
 

@@ -1580,8 +1580,8 @@ public record RestockNkProductAtVersion(NkSku Sku, long Version, int Quantity);
 <sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/MartenTests/AggregateHandlerWorkflow/natural_key_nullable_mapped_and_batched.cs#L519-L522' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_wolverine_marten_natural_key_command_with_version' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
-An exclusive load ignores the version, as it does for a stream id. This check is Marten-only for now: on
-Polecat a natural-key load still ignores the version.
+An exclusive load ignores the version, as it does for a stream id. On Polecat, a natural-key load ignores
+the version.
 
 For more details on how natural keys work at the Marten level, see the [Marten natural keys documentation](https://martendb.io/events/natural-keys).
 

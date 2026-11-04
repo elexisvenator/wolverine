@@ -169,7 +169,7 @@ public class natural_key_explicit_key_type : PostgresqlContext, IAsyncLifetime
     [Fact]
     public void identity_on_a_natural_key_member_needs_the_key_type()
     {
-        // Without the key type, [Identity] used to be taken as the stream id
+        // Without the key type, [Identity] would be taken as the stream id
         var refusal = refusalFor<AuditNkShelfIdentityOnly>();
         refusal.ShouldContain("marked with [Identity]");
         refusal.ShouldContain("[WriteAggregate<NkShelfCode>]");
