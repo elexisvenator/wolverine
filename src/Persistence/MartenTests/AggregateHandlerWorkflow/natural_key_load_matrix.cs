@@ -6,6 +6,7 @@ using JasperFx.Core.Reflection;
 using JasperFx.Events;
 using JasperFx.Events.Aggregation;
 using JasperFx.Events.Projections;
+using JasperFx.MultiTenancy;
 using JasperFx.Resources;
 using Marten;
 using Microsoft.Extensions.DependencyInjection;
@@ -102,16 +103,30 @@ public class MxSkuView
 /// Every attribute that loads an aggregate, for every shape of natural key: a struct wrapping a string, a
 /// struct wrapping an int, a class key, a <c>TKey?</c> member, and a mapped key of an Async view. Then each
 /// write attribute batched with another load, at a version, and exclusively.
+/// <see cref="natural_key_load_matrix_with_conjoined_tenancy" /> runs it all again in one tenant of a conjoined
+/// store, with a stream for the same key in another tenant.
 /// </summary>
 public class natural_key_load_matrix : PostgresqlContext, IAsyncLifetime
 {
+    private const string OtherTenant = "tenant-b";
+
     private readonly ITestOutputHelper _output;
+    private readonly string? _tenant;
+
+    // The other tenant's stream for the same key, by the stream a test placed
+    private readonly Dictionary<Guid, Guid> _twins = new();
+
     private IHost _host = null!;
     private IDocumentStore _store = null!;
 
-    public natural_key_load_matrix(ITestOutputHelper output)
+    public natural_key_load_matrix(ITestOutputHelper output) : this(output, null)
+    {
+    }
+
+    protected natural_key_load_matrix(ITestOutputHelper output, string? tenant)
     {
         _output = output;
+        _tenant = tenant;
     }
 
     public async ValueTask InitializeAsync()
@@ -121,7 +136,13 @@ public class natural_key_load_matrix : PostgresqlContext, IAsyncLifetime
             opts.Services.AddMarten(m =>
                 {
                     m.Connection(Servers.PostgresConnectionString);
-                    m.DatabaseSchemaName = "nk_load_matrix";
+                    m.DatabaseSchemaName = _tenant == null ? "nk_load_matrix" : "nk_load_matrix_conjoined";
+                    if (_tenant != null)
+                    {
+                        m.Policies.AllDocumentsAreMultiTenanted();
+                        m.Events.TenancyStyle = TenancyStyle.Conjoined;
+                    }
+
                     m.Projections.Snapshot<MxSkuOrder>(SnapshotLifecycle.Inline);
                     m.Projections.Snapshot<MxBinOrder>(SnapshotLifecycle.Inline);
                     m.Projections.Snapshot<MxCodeOrder>(SnapshotLifecycle.Inline);
@@ -168,18 +189,46 @@ public class natural_key_load_matrix : PostgresqlContext, IAsyncLifetime
         _ => throw new ArgumentOutOfRangeException(nameof(key))
     };
 
+    private IDocumentSession sessionFor(string? tenant) =>
+        tenant == null ? _store.LightweightSession() : _store.LightweightSession(tenant);
+
     private async Task<Guid> placeAsync(Type owner, object key)
     {
         var streamId = Guid.NewGuid();
-        await using var session = _store.LightweightSession();
-        session.Events.StartStream(owner, streamId, placedFor(key));
-        await session.SaveChangesAsync();
+        await using (var session = sessionFor(_tenant))
+        {
+            session.Events.StartStream(owner, streamId, placedFor(key));
+            await session.SaveChangesAsync();
+        }
+
+        if (_tenant != null)
+        {
+            var twin = Guid.NewGuid();
+            await using var other = sessionFor(OtherTenant);
+            other.Events.StartStream(owner, twin, placedFor(key));
+            await other.SaveChangesAsync();
+            _twins[streamId] = twin;
+        }
+
         return streamId;
     }
 
+    // The other tenant's stream for the same key still has only the event that placed it
+    private async Task twinIsUntouchedAsync(Guid streamId)
+    {
+        if (_tenant == null) return;
+
+        await using var query = _store.QuerySession(OtherTenant);
+        (await query.Events.FetchStreamAsync(_twins[streamId])).Count.ShouldBe(1);
+    }
+
+    private Task invokeAsync(object message) => _tenant == null
+        ? _host.InvokeMessageAndWaitAsync(message)
+        : _host.InvokeMessageAndWaitAsync(message, _tenant);
+
     private async Task<IReadOnlyList<IEvent>> eventsOf(Guid streamId)
     {
-        await using var query = _store.QuerySession();
+        await using var query = _tenant == null ? _store.QuerySession() : _store.QuerySession(_tenant);
         return await query.Events.FetchStreamAsync(streamId);
     }
 
@@ -210,11 +259,12 @@ public class natural_key_load_matrix : PostgresqlContext, IAsyncLifetime
         sourceFor(message).ShouldContain(
             $"FetchForWriting<{@case.Aggregate.FullNameInCode()}, {key.GetType().FullNameInCode()}>");
 
-        await _host.InvokeMessageAndWaitAsync(message);
+        await invokeAsync(message);
 
         var events = await eventsOf(streamId);
         events.Count.ShouldBe(2);
         events[1].Data.ShouldBe(new MxRenamed("Renamed"));
+        await twinIsUntouchedAsync(streamId);
     }
 
     [Theory]
@@ -229,7 +279,7 @@ public class natural_key_load_matrix : PostgresqlContext, IAsyncLifetime
         sourceFor(message).ShouldContain(
             $"FetchLatest<{@case.Aggregate.FullNameInCode()}, {key.GetType().FullNameInCode()}>");
 
-        await _host.InvokeMessageAndWaitAsync(message);
+        await invokeAsync(message);
 
         MxLoadMatrixHandlers.LastRead.ShouldNotBeNull();
         MxLoadMatrixHandlers.LastRead.GetType().ShouldBe(@case.Aggregate);
@@ -242,7 +292,7 @@ public class natural_key_load_matrix : PostgresqlContext, IAsyncLifetime
     {
         var @case = MxLoadMatrixCases.Reads.Single(x => x.Attribute == attribute && x.Shape == shape);
 
-        await _host.InvokeMessageAndWaitAsync(@case.Message(keyFor(@case.Owner)));
+        await invokeAsync(@case.Message(keyFor(@case.Owner)));
 
         MxLoadMatrixHandlers.LastRead.ShouldBeNull();
     }
@@ -269,7 +319,7 @@ public class natural_key_load_matrix : PostgresqlContext, IAsyncLifetime
         code.ShouldContain(
             $"batchedQuery.Events.FetchLatest<{typeof(MxBinOrder).FullNameInCode()}, {typeof(MxBin).FullNameInCode()}>");
 
-        await _host.InvokeMessageAndWaitAsync(message);
+        await invokeAsync(message);
 
         (await eventsOf(orderId))[1].Data.ShouldBe(new MxRenamed("Batched"));
         MxLoadContextHandlers.LastBin!.Id.ShouldBe(binId);
@@ -282,13 +332,36 @@ public class natural_key_load_matrix : PostgresqlContext, IAsyncLifetime
         var sku = (MxSku)keyFor(typeof(MxSkuOrder));
         var orderId = await placeAsync(typeof(MxSkuOrder), sku);
 
-        await _host.InvokeMessageAndWaitAsync(MxLoadContextHandlers.Versioned(attribute, sku, 1));
+        await invokeAsync(MxLoadContextHandlers.Versioned(attribute, sku, 1));
         (await eventsOf(orderId)).Count.ShouldBe(2);
 
         // Now at version 2, so 1 is stale and nothing is appended
         await Should.ThrowAsync<ConcurrencyException>(() =>
-            _host.InvokeMessageAndWaitAsync(MxLoadContextHandlers.Versioned(attribute, sku, 1)));
+            invokeAsync(MxLoadContextHandlers.Versioned(attribute, sku, 1)));
         (await eventsOf(orderId)).Count.ShouldBe(2);
+    }
+
+    [Theory]
+    [MemberData(nameof(ContextAttributes))]
+    public async Task a_batched_write_by_key_checks_the_version(string attribute)
+    {
+        var sku = (MxSku)keyFor(typeof(MxSkuOrder));
+        var bin = (MxBin)keyFor(typeof(MxBinOrder));
+        var orderId = await placeAsync(typeof(MxSkuOrder), sku);
+        await placeAsync(typeof(MxBinOrder), bin);
+
+        var message = MxLoadContextHandlers.BatchedVersioned(attribute, sku, bin, 1);
+        sourceFor(message).ShouldContain(
+            $"batchedQuery.Events.FetchForWriting<{typeof(MxSkuOrder).FullNameInCode()}, {typeof(MxSku).FullNameInCode()}>");
+
+        await invokeAsync(message);
+        (await eventsOf(orderId)).Count.ShouldBe(2);
+
+        // Now at version 2, so 1 is stale and nothing is appended
+        await Should.ThrowAsync<ConcurrencyException>(() =>
+            invokeAsync(MxLoadContextHandlers.BatchedVersioned(attribute, sku, bin, 1)));
+        (await eventsOf(orderId)).Count.ShouldBe(2);
+        await twinIsUntouchedAsync(orderId);
     }
 
     [Theory]
@@ -302,7 +375,7 @@ public class natural_key_load_matrix : PostgresqlContext, IAsyncLifetime
         sourceFor(message).ShouldContain(
             $"FetchForExclusiveWriting<{typeof(MxSkuOrder).FullNameInCode()}, {typeof(MxSku).FullNameInCode()}>");
 
-        await _host.InvokeMessageAndWaitAsync(message);
+        await invokeAsync(message);
         (await eventsOf(orderId))[1].Data.ShouldBe(new MxRenamed("Exclusive"));
     }
 
@@ -321,7 +394,7 @@ public class natural_key_load_matrix : PostgresqlContext, IAsyncLifetime
         code.ShouldContain(
             $"batchedQuery.Events.FetchLatest<{typeof(MxSkuView).FullNameInCode()}, {typeof(MxSku).FullNameInCode()}>");
 
-        await _host.InvokeMessageAndWaitAsync(message);
+        await invokeAsync(message);
 
         (await eventsOf(binId))[1].Data.ShouldBe(new MxRenamed("Beside"));
 
@@ -341,6 +414,9 @@ public class natural_key_load_matrix : PostgresqlContext, IAsyncLifetime
         ex.Message.ShouldContain("Unable to determine the aggregate id for aggregate type");
     }
 }
+
+public class natural_key_load_matrix_with_conjoined_tenancy(ITestOutputHelper output)
+    : natural_key_load_matrix(output, "tenant-a");
 
 // One message and handler per attribute and key shape.
 
@@ -553,6 +629,12 @@ public record MxVersionedWriteModel(MxSku Key, long Version, string Name);
 public record MxVersionedWriteModelOfKey(MxSku Key, long Version, string Name);
 public record MxVersionedConsistentAggregate(MxSku Key, long Version, string Name);
 
+public record MxBatchedVersionedWriteAggregate(MxSku Key, MxBin Bin, long Version, string Name);
+public record MxBatchedVersionedWriteAggregateOfKey(MxSku Key, MxBin Bin, long Version, string Name);
+public record MxBatchedVersionedWriteModel(MxSku Key, MxBin Bin, long Version, string Name);
+public record MxBatchedVersionedWriteModelOfKey(MxSku Key, MxBin Bin, long Version, string Name);
+public record MxBatchedVersionedConsistentAggregate(MxSku Key, MxBin Bin, long Version, string Name);
+
 public record MxExclusiveWriteAggregate(MxSku Key, string Name);
 public record MxExclusiveWriteAggregateOfKey(MxSku Key, string Name);
 public record MxExclusiveWriteModel(MxSku Key, string Name);
@@ -582,6 +664,16 @@ public static class MxLoadContextHandlers
         "WriteModel" => new MxBatchedWriteModel(key, bin, "Batched"),
         "WriteModelOfKey" => new MxBatchedWriteModelOfKey(key, bin, "Batched"),
         "ConsistentAggregate" => new MxBatchedConsistentAggregate(key, bin, "Batched"),
+        _ => throw new ArgumentOutOfRangeException(nameof(attribute))
+    };
+
+    public static object BatchedVersioned(string attribute, MxSku key, MxBin bin, long version) => attribute switch
+    {
+        "WriteAggregate" => new MxBatchedVersionedWriteAggregate(key, bin, version, "BatchedVersioned"),
+        "WriteAggregateOfKey" => new MxBatchedVersionedWriteAggregateOfKey(key, bin, version, "BatchedVersioned"),
+        "WriteModel" => new MxBatchedVersionedWriteModel(key, bin, version, "BatchedVersioned"),
+        "WriteModelOfKey" => new MxBatchedVersionedWriteModelOfKey(key, bin, version, "BatchedVersioned"),
+        "ConsistentAggregate" => new MxBatchedVersionedConsistentAggregate(key, bin, version, "BatchedVersioned"),
         _ => throw new ArgumentOutOfRangeException(nameof(attribute))
     };
 
@@ -639,6 +731,21 @@ public static class MxLoadContextHandlers
         LastBin = bin;
         return new MxRenamed(c.Name);
     }
+
+    public static MxRenamed Handle(MxBatchedVersionedWriteAggregate c, [WriteAggregate] MxSkuOrder order,
+        [ReadAggregate<MxBin>(nameof(MxBatchedVersionedWriteAggregate.Bin))] MxBinOrder bin) => new(c.Name);
+
+    public static MxRenamed Handle(MxBatchedVersionedWriteAggregateOfKey c, [WriteAggregate<MxSku>] MxSkuOrder order,
+        [ReadAggregate<MxBin>(nameof(MxBatchedVersionedWriteAggregateOfKey.Bin))] MxBinOrder bin) => new(c.Name);
+
+    public static MxRenamed Handle(MxBatchedVersionedWriteModel c, [WriteModel] MxSkuOrder order,
+        [ReadAggregate<MxBin>(nameof(MxBatchedVersionedWriteModel.Bin))] MxBinOrder bin) => new(c.Name);
+
+    public static MxRenamed Handle(MxBatchedVersionedWriteModelOfKey c, [WriteModel<MxSku>] MxSkuOrder order,
+        [ReadAggregate<MxBin>(nameof(MxBatchedVersionedWriteModelOfKey.Bin))] MxBinOrder bin) => new(c.Name);
+
+    public static MxRenamed Handle(MxBatchedVersionedConsistentAggregate c, [ConsistentAggregate] MxSkuOrder order,
+        [ReadAggregate<MxBin>(nameof(MxBatchedVersionedConsistentAggregate.Bin))] MxBinOrder bin) => new(c.Name);
 
     public static MxRenamed Handle(MxVersionedWriteAggregate c, [WriteAggregate] MxSkuOrder order) => new(c.Name);
     public static MxRenamed Handle(MxVersionedWriteAggregateOfKey c, [WriteAggregate<MxSku>] MxSkuOrder order) => new(c.Name);
