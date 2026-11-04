@@ -627,8 +627,11 @@ public static class MxLoadContextHandlers
 
 public record MxDeciderBySku(MxSku Key, string Name);
 
-[AggregateHandler]
+// [AggregateHandler] marks the method rather than the class: IntegrateWithWolverine() includes every class marked
+// with it, conventional discovery or not, and inferring this refused shape's message identity throws, so any host
+// here using UseInferredMessageGrouping() would fail to start.
 public static class MxDeciderHandlers
 {
+    [AggregateHandler]
     public static MxRenamed Handle(MxDeciderBySku c, MxSkuOrder order) => new(c.Name);
 }
