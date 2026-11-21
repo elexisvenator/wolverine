@@ -675,12 +675,29 @@ internal partial class SqliteMessageStore : MessageDatabase<SqliteConnection>, I
         return descriptor;
     }
 
+    // GH-5665: recorded_at is sortable UTC text, like the saga tables' timestamps
+    private const string SagaHistoryTimestampFormat = "yyyy-MM-dd HH:mm:ss.fffffff";
+
+    public override object SagaHistoryTimestamp(DateTimeOffset value)
+        => value.UtcDateTime.ToString(SagaHistoryTimestampFormat, System.Globalization.CultureInfo.InvariantCulture);
+
+    protected override DateTimeOffset readSagaHistoryTimestamp(System.Data.Common.DbDataReader reader, int ordinal)
+        => new(DateTime.SpecifyKind(DateTime.ParseExact(reader.GetString(ordinal), SagaHistoryTimestampFormat,
+            System.Globalization.CultureInfo.InvariantCulture), DateTimeKind.Utc));
+
     public override IEnumerable<ISchemaObject> AllObjects()
     {
         yield return new OutgoingEnvelopeTable(Durability, SchemaName);
         yield return new IncomingEnvelopeTable(Durability, SchemaName);
         yield return new DeadLettersTable(Durability, SchemaName);
         yield return new DeadLetterHistoryTable(SchemaName);
+
+        // GH-5665. Every store role, since a saga's history is written to the store its saga's transaction is in, but
+        // only once some saga records its history
+        if (Durability.ProvisionsSagaHistory)
+        {
+            yield return new SagaHistoryTable(SchemaName);
+        }
 
         // GH-4180. Every store role, not just Main -- see the PostgreSQL twin.
         // GH-4757: exactly one of the two, never both. The hash mode's key is a binary column, which
@@ -723,11 +740,11 @@ internal partial class SqliteMessageStore : MessageDatabase<SqliteConnection>, I
             nodeTable.AddColumn("version", "TEXT");
             nodeTable.AddColumn("capabilities", "TEXT");
 
-            // GH-4593, mirroring the PostgreSQL gate from GH-3959: provisioned only behind the opt-in so
-            // an upgrade migrates nothing, and SqliteNodePersistence gates every statement naming it on
-            // the same flag. REAL rather than TEXT -- unlike the timestamps around it, this value is only
+            // GH-4593, mirroring the PostgreSQL gate from GH-3959: always provisioned since 7.0 (GH-5193) unless
+            // AlwaysProvisionOptionalSchemaObjects is off, and SqliteNodePersistence gates every statement naming it on
+            // CapacityAwareAssignment, so the behaviour stays opt-in. REAL rather than TEXT -- unlike the timestamps around it, this value is only
             // ever compared numerically and never round-tripped through a format.
-            if (Durability.CapacityAwareAssignment)
+            if (Durability.ProvisionsNodeLoadFactor)
             {
                 nodeTable.AddColumn(DatabaseConstants.LoadFactor, "REAL");
             }

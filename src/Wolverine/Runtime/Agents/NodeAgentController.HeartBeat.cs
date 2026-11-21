@@ -211,7 +211,7 @@ public partial class NodeAgentController
         var selfRowIsPersisted = nodes.Any(x => x.NodeId == selfNodeId);
         if (!selfRowIsPersisted)
         {
-            nodes = nodes.Concat(new[] { WolverineNode.For(_runtime.Options) }).ToList();
+            nodes = nodes.Concat(new[] { syntheticSelf() }).ToList();
         }
 
         // The node list is final for this tick, so record the membership now -- on every node, whatever its
@@ -222,6 +222,10 @@ public partial class NodeAgentController
 
         // Do it no matter what
         await ejectStaleNodes(staleNodes);
+
+        // GH-5601: only a Messaging node can lead, so with none alive there is no leader to notice that nothing
+        // consumes the queues. Every node says it instead.
+        await WarnIfNoNodeRunsMessagingAsync(nodes);
 
         // GH-3987: node-side assigned-vs-running reconciliation, follower-capable by design — the
         // divergences it heals live on the node that has them, and the leader structurally cannot see
@@ -257,7 +261,9 @@ public partial class NodeAgentController
             {
                 await stepDownAsync(_runtime.Options.Durability.NodeRole == NodeRole.Warmup
                     ? "this node is a warm-up node (Durability.NodeRole is Warmup)"
-                    : "this node is not eligible for leadership (Durability.LeadershipEligible is false)");
+                    : !_runtime.Options.Durability.Runs(NodeWorkloads.Messaging)
+                        ? "this node does not run the Messaging workload (Durability.Workloads)"
+                        : "this node is not eligible for leadership (Durability.LeadershipEligible is false)");
             }
 
             return AgentCommands.Empty;
@@ -271,7 +277,7 @@ public partial class NodeAgentController
         // Step down cleanly here, then fall through to the normal election
         // path so this same tick either re-attains the lock (if no one else
         // has taken it) or peacefully becomes a follower.
-        if (IsLeader && !_persistence.HasLeadershipLock())
+        if (IsLeader && !await _persistence.HasLeadershipLockAsync(_cancellation.Token))
         {
             await stepDownAsync("the leadership advisory lock was released server-side");
         }
@@ -600,7 +606,7 @@ public partial class NodeAgentController
         // wipe it — the freed advisory lock lets a follower attain leadership through the normal election
         // path, and that confirmed new leader ejects the old row on a later tick. This prevents a transient
         // blip from destroying a live leader's row, ownership, and assignments.
-        var holdsLeadership = _persistence.HasLeadershipLock();
+        var holdsLeadership = await _persistence.HasLeadershipLockAsync(_cancellation.Token);
 
         // GH-3698: only the nodes actually deleted below get a DormantNodeEjected record. Reporting the whole
         // stale list wrote one for every node the checks here deliberately SPARE -- this node itself, a

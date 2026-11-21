@@ -41,6 +41,9 @@ internal class InMemoryPersistenceFrameProvider : IPersistenceFrameProvider, IEv
     // they actually map, whatever order the integrations were registered in
     public bool IsCatchAll => true;
 
+    // GH-5572
+    public SagaRetentionSupport SagaRetentionSupportFor(Type sagaType, IServiceContainer container) => SagaRetentionSupport.Ignored;
+
     public bool CanPersist(Type entityType, IServiceContainer container, out Type persistenceService)
     {
         persistenceService = typeof(IInMemoryDocumentSession);
@@ -162,6 +165,12 @@ internal class InMemoryPersistenceFrameProvider : IPersistenceFrameProvider, IEv
 
     public Frame BuildFetchLatestFrame(Type aggregateType, Variable identity)
         => new FetchLatestAggregateFrame(aggregateType, identity);
+
+    // The in-memory store has no natural key lookups, so there is no natural key read and no mapped key
+    public Frame? BuildFetchLatestByNaturalKeyFrame(Type aggregateType, Variable naturalKey) => null;
+
+    public IReadOnlyList<Type> DetermineMappedNaturalKeyTypes(Type aggregateType, IChain chain,
+        IServiceContainer container) => [];
 
     public StreamIdentity DetermineStreamIdentity(IServiceContainer container)
         => container.Services.GetRequiredService<InMemoryDocumentStore>().Events.StreamIdentity;

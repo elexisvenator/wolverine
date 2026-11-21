@@ -3,6 +3,7 @@ using Wolverine.Persistence.Durability;
 using Wolverine.Persistence.Durability.DeadLetterManagement;
 using Wolverine.Runtime;
 using Wolverine.Runtime.Serialization;
+using Wolverine.Transports;
 
 namespace Wolverine.RavenDb.Internals;
 
@@ -23,6 +24,8 @@ public class DeadLetterMessage
         FailureGroup = fingerprint.Group;
         FailureTitle = fingerprint.Title;
         FailedAt = DateTimeOffset.UtcNow;
+        SagaId = envelope.SagaId;
+        Tag = DeadLetterQueueConstants.DeadLetterTagOf(envelope);
 
         Id = "dlq/" + envelope.Id.ToString();
         EnvelopeId = envelope.Id;
@@ -59,6 +62,12 @@ public class DeadLetterMessage
     public DateTimeOffset? FailedAt { get; set; }
     public DateTimeOffset? ArchivedAt { get; set; }
 
+    // GH-5557
+    public string? SagaId { get; set; }
+
+    // GH-5556
+    public string? Tag { get; set; }
+
     public DeadLetterEnvelope ToEnvelope()
     {
         return new DeadLetterEnvelope(EnvelopeId, ScheduledTime, readBody(), MessageType,
@@ -69,7 +78,9 @@ public class DeadLetterMessage
             FailureTitle = FailureTitle,
             FailedAt = FailedAt,
             FirstFailedAt = FailedAt,
-            ArchivedAt = ArchivedAt
+            ArchivedAt = ArchivedAt,
+            SagaId = SagaId,
+            Tag = Tag
         };
     }
 

@@ -203,6 +203,102 @@ yourself:
 acknowledgement APIs depend on them.
 :::
 
+### Messages fanned out by the broker
+
+A tracked session follows each message by its envelope id. When a broker fans one message out to several
+queues, as a RabbitMQ exchange with several bound queues does, every copy arrives with the **same** envelope
+id. That is the usual shape for a message type with several handler types and conventional routing by handler type,
+where each handler gets its own queue. The session cannot see the broker's bindings, so it does not know how
+many copies to expect. With `IncludeExternalTransports()` it can report `Completed` as soon as the first copy
+is handled, while another queue's handler is still running.
+
+Tell the session what to wait for with a custom `ITrackedCondition`. This one holds the session open until the
+message has been handled at a given number of queues:
+
+<!-- snippet: sample_tracked_condition_for_a_message_fanned_out_by_the_broker -->
+<a id='snippet-sample_tracked_condition_for_a_message_fanned_out_by_the_broker'></a>
+```cs
+/// <summary>
+/// Holds a tracked session open until a message of type T has been handled successfully at
+/// the expected number of distinct receiving endpoints
+/// </summary>
+public class MessageSucceededAtEveryQueue<T> : ITrackedCondition
+{
+    private readonly int _expected;
+    private readonly HashSet<Uri> _queues = new();
+    private readonly object _lock = new();
+
+    public MessageSucceededAtEveryQueue(int expected)
+    {
+        _expected = expected;
+    }
+
+    public void Record(EnvelopeRecord record)
+    {
+        if (record.MessageEventType != MessageEventType.MessageSucceeded) return;
+        if (record.Message is not T) return;
+        if (record.Envelope?.Destination is not { } queue) return;
+
+        lock (_lock)
+        {
+            _queues.Add(queue);
+        }
+    }
+
+    public bool IsCompleted()
+    {
+        lock (_lock)
+        {
+            return _queues.Count >= _expected;
+        }
+    }
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Transports/RabbitMQ/Wolverine.RabbitMQ.Tests/Bugs/Bug_5416_tracked_session_waits_for_every_fanned_out_copy.cs#L62-L100' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_tracked_condition_for_a_message_fanned_out_by_the_broker' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+Then add it to the session with `WaitForCondition()`:
+
+<!-- snippet: sample_waiting_for_a_message_fanned_out_by_the_broker -->
+<a id='snippet-sample_waiting_for_a_message_fanned_out_by_the_broker'></a>
+```cs
+var message = new FanOut5416(Guid.NewGuid());
+
+var tracked = await host.TrackActivity()
+    .IncludeExternalTransports()
+    .Timeout(30.Seconds())
+
+    // RabbitMQ delivers one copy of the message to each queue bound to the exchange, and
+    // the tracked session has no way to know how many queues that is. Tell it instead:
+    // keep waiting until the message has been handled successfully at both queues
+    .WaitForCondition(new MessageSucceededAtEveryQueue<FanOut5416>(2))
+    .SendMessageAndWaitAsync(message);
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Transports/RabbitMQ/Wolverine.RabbitMQ.Tests/Bugs/Bug_5416_tracked_session_waits_for_every_fanned_out_copy.cs#L41-L55' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_waiting_for_a_message_fanned_out_by_the_broker' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+`WaitForExecutionOf<T>(count)` is a simpler option when you only need a count of executions of the message
+type across every queue.
+
+
+### Messages that are expected to dead letter or be retried later
+
+`WaitForMessageToBeReceivedAt<T>()` completes when the message succeeds or fails, but deliberately not when it is
+moved to the dead letter queue, because a dead letter can be replayed and a test usually wants that second pass.
+For a message that only ever dead-letters it can therefore do nothing but time out. Wait for the dead letter itself
+instead:
+
+```csharp
+var session = await host.TrackActivity()
+    .DoNotAssertOnExceptionsDetected()
+    .WaitForMessageToBeDeadLettered<PlaceOrder>()
+    .SendMessageAndWaitAsync(new PlaceOrder());
+```
+
+To prove that a failure is retried later (`ScheduleRetry()`, `Requeue()`) rather than dead-lettered, use
+`WaitForMessageToBeRequeued<T>()`. The tracked session ends when the message is requeued, so it does not have to
+wait for the retry delay. Deferring or rescheduling a message also counts as a requeue.
+
 ### Scoping a session by envelope
 
 `IgnoreMessageType<T>()` and `IgnoreMessagesMatchingType()` can only separate traffic by *message type*,
@@ -359,6 +455,35 @@ foreach (var chain in handlers.Chains)
 HTTP endpoints compile on their first request in the same way; `WarmUpRoutes = RouteWarmup.Eager` (see
 [the HTTP docs](/guide/http/#eager-warmup)) builds them at startup instead. Pre-generated code
 (`TypeLoadMode.Static`) does no compilation at runtime at all.
+
+### Reusing compiled assemblies across hosts
+
+In `Dynamic` mode every host compiles its own generated code as it starts, so a process that starts many hosts of one
+application (a test suite on Alba 9's host pools, say) compiles identical source once per host. Opt in to a
+process-wide cache of the compiled assemblies:
+
+```csharp
+builder.UseWolverine(opts =>
+{
+    // A host whose generated source and referenced assemblies match an
+    // earlier compilation in this process is handed that assembly
+    opts.CodeGeneration.ReuseCompiledAssemblies = true;
+});
+```
+
+It is off by default and only matters when something compiles: `Dynamic` mode, or `Auto` when it falls back to
+compiling. `Static` mode never compiles. The cached assemblies live for the life of the process, as compiled assemblies
+already do.
+
+The flag is proven by tests for message handler chains in `Dynamic` and `Auto` modes, for HTTP endpoint chains in
+`Dynamic` and `Auto` modes, and for hosts started after the `codegen test` and `codegen write` commands have run with
+the flag on: in each case, hosts in one process share one compiled assembly per chain and the chains still behave
+correctly.
+
+It helps most when you start many hosts, or compile chains at startup (the warm-up above, or eager HTTP route
+warm-up). JasperFx measured a 585-test suite on three pooled hosts going from 513 compilations to 158, and from about
+17-18 s to 11 s. It barely helps when chains compile lazily per test host, which is the case for Wolverine's own test
+suite: there it measured 2-6% of a run's CPU.
 
 ### Forcing projection catch-up outside a tracked session
 
@@ -618,9 +743,9 @@ var session = await host.TrackActivity()
 From there you can query the event store by that correlation id once the async daemons have caught up.
 
 ::: warning
-Correlation ids are **off by default** in Marten, Polecat and Fisher. You'll need
-`opts.Events.MetadataConfig.CorrelationIdEnabled = true` in `AddMarten()`, or
-`opts.Events.EnableCorrelationId = true` in `AddPolecat()` or `AddFisher()`, and the new column in your schema.
+Correlation ids are **on by default** in Marten 10, Polecat 6 and Fisher 2. If you turned them off, or called
+`RestoreV9Defaults()` on Marten, you'll need `opts.Events.MetadataConfig.CorrelationIdEnabled = true` in `AddMarten()`,
+or `opts.Events.EnableCorrelationId = true` in `AddPolecat()` or `AddFisher()`, and the column in your schema.
 :::
 
 The correlation id only reaches an event if every hop carries it. Wolverine's own handlers do that for you, but an
@@ -714,7 +839,8 @@ A few things to know:
   say yet, it just waits on every database before reading through the tenant. An act that carried no tenant at all is
   looked for in every database. That's still exact, because a correlation id only ever belongs to one act.
 * For an HTTP act, `WhenPosted()` sends the act's correlation id as the `X-Correlation-ID` header. For the events an
-  endpoint appends to record it, turn on `WolverineHttpOptions.ApplyCorrelationIdHeaderToAllEndpoints` -- see
+  endpoint appends to record it, `WolverineHttpOptions.ApplyCorrelationIdHeaderToAllEndpoints` has to be on, which
+  it is by default from Wolverine 7.0 -- see
   [applying the correlation id to every endpoint](/guide/http/middleware#applying-the-correlation-id-to-every-endpoint).
   If you make your own HTTP call inside `WhenTracked()`, send `ActCorrelationId` as that header yourself.
 
@@ -889,6 +1015,129 @@ replayed.Executed.SingleMessage<ScheduledMessage>().Text.ShouldBe("Broncos");
 ```
 <sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Testing/SlowTests/tracked_session_mechanics.cs#L97-L127' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_handling_scheduled_delivery_to_external_transport' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
+
+### Letting time pass {#letting-time-pass} <Badge type="tip" text="7.0" />
+
+`PlayScheduledMessagesAsync(timeout)` plays **everything** that was scheduled, all at once. That doesn't work for a saga
+that schedules an overall deadline at the start and a poll every few minutes, because the deadline would fire together
+with the first poll. For that, let time pass instead:
+
+```cs
+session = await session.PlayScheduledMessagesAsync(advanceBy: 1.Hours());
+```
+
+::: tip A played message goes through its queue in 7.0
+A played message for a local queue goes through that queue as if its time had come: the endpoint's retries,
+dead-lettering and a saga's `Compensate` methods all apply, and the session waits for them instead of throwing the
+first exception at your test. So "time passes, the poll fails, the saga compensates" is something you can test. The
+message runs in your test's own async flow rather than on the queue's worker, though, so the queue's ordering and
+parallelism settings don't apply to it. To run local messages inline as Wolverine 6.x did, pass `playInline: true` to
+either overload.
+:::
+
+That plays only the scheduled messages that come due within the hour, in the order they come due. A message
+scheduled *while* the window plays, such as the saga's next poll, is played too when it comes due before the hour is
+up. Everything due later stays scheduled, and calling `PlayScheduledMessagesAsync(advanceBy:)` again on the session it
+returned continues from where the last call stopped. Pass `advanceBy:` by name, since a single positional `TimeSpan`
+is the timeout of the overload that plays everything. An optional second argument is the new session's timeout.
+
+The tracked session keeps a virtual "now" as a `TimeProvider`, exposed as `ITrackedSession.Clock`. Each message is
+played at the instant it came due, so if the application reads the same clock, a saga sees the time its timeout was
+meant to fire. The session uses:
+
+1. the clock you give it with `TrackActivity().UseClock(clock)`, or
+2. the host's registered `TimeProvider`, when the session can move it, or
+3. a clock of its own, frozen at the instant the first session started. The application doesn't read that one, but
+   the windows and the order still work.
+
+A clock the session can move is one with a public `Advance(TimeSpan)` method, such as `FakeTimeProvider` from
+`Microsoft.Extensions.TimeProvider.Testing`. Delays (`TimeoutMessage`, `DelayedFor()`, `ScheduleAsync(message, delay)`)
+always count from the virtual "now" at the moment they were scheduled. An absolute time (`ScheduledAt()`) is read as a
+time on the session's clock when the application shares it, and otherwise as a time on the real clock. This is
+testing support only: nothing in Wolverine's runtime reads the session's clock.
+
+Here's a saga that polls every five minutes under an overall deadline of an hour:
+
+<!-- snippet: sample_polling_saga_with_a_deadline -->
+<a id='snippet-sample_polling_saga_with_a_deadline'></a>
+```cs
+public record WatchExportJob(Guid Id, int ReadyAfterPolls);
+
+// The recurring poll and the overall deadline are both saga timeouts
+public record PollExportJob(Guid Id) : TimeoutMessage(5.Minutes());
+
+public record ExportJobDeadline(Guid Id) : TimeoutMessage(1.Hours());
+
+public record ExportJobFinished(Guid Id, int Polls, DateTimeOffset At);
+
+public record ExportJobGaveUp(Guid Id, int Polls, DateTimeOffset At);
+
+public class ExportWatchSaga : Saga
+{
+    public Guid Id { get; set; }
+    public int ReadyAfterPolls { get; set; }
+    public int Polls { get; set; }
+    public DateTimeOffset? LastPolledAt { get; set; }
+
+    public static (ExportWatchSaga, PollExportJob, ExportJobDeadline) Start(WatchExportJob command)
+        => (new ExportWatchSaga { Id = command.Id, ReadyAfterPolls = command.ReadyAfterPolls },
+            new PollExportJob(command.Id),
+            new ExportJobDeadline(command.Id));
+
+    // The application reads time through TimeProvider, so a test can share its clock with the tracked session
+    public object Handle(PollExportJob poll, TimeProvider time)
+    {
+        Polls++;
+        LastPolledAt = time.GetUtcNow();
+
+        if (Polls >= ReadyAfterPolls)
+        {
+            MarkCompleted();
+            return new ExportJobFinished(Id, Polls, time.GetUtcNow());
+        }
+
+        return new PollExportJob(Id);
+    }
+
+    public ExportJobGaveUp Handle(ExportJobDeadline deadline, TimeProvider time)
+    {
+        MarkCompleted();
+        return new ExportJobGaveUp(Id, Polls, time.GetUtcNow());
+    }
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Testing/CoreTests/Tracking/advancing_time_through_scheduled_messages_5664.cs#L298-L345' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_polling_saga_with_a_deadline' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+And a test that walks it through the hour, with the host's `TimeProvider` registered as a clock the session can move:
+
+<!-- snippet: sample_advancing_time_through_scheduled_messages -->
+<a id='snippet-sample_advancing_time_through_scheduled_messages'></a>
+```cs
+// The host registers a TimeProvider the session can move (FakeTimeProvider, or anything with a public
+// Advance(TimeSpan)), so the saga reads the same "now" the session advances
+var session = await _host.InvokeMessageAndWaitAsync(new WatchExportJob(id, ReadyAfterPolls: 100));
+
+session = await session.PlayScheduledMessagesAsync(advanceBy: 30.Minutes());
+session.Executed.MessagesOf<ExportJobGaveUp>().ShouldBeEmpty();
+session.Executed.MessagesOf<PollExportJob>().Count().ShouldBe(6);
+
+session = await session.PlayScheduledMessagesAsync(advanceBy: 29.Minutes());
+session.Executed.MessagesOf<ExportJobGaveUp>().ShouldBeEmpty();
+(await loadSaga(id))!.Polls.ShouldBe(11);
+
+session = await session.PlayScheduledMessagesAsync(advanceBy: 1.Minutes());
+
+// The deadline was scheduled at the start, so it plays before the poll due at the same instant, and that
+// poll then finds no saga and is dropped like any timeout for a completed saga
+var gaveUp = session.Executed.SingleMessage<ExportJobGaveUp>();
+gaveUp.Polls.ShouldBe(11);
+gaveUp.At.ShouldBe(_start.Add(1.Hours()));
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Testing/CoreTests/Tracking/advancing_time_through_scheduled_messages_5664.cs#L129-L151' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_advancing_time_through_scheduled_messages' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+With [WolverineFx.Bobcat](/guide/testing-with-bobcat#letting-time-pass), the same step is `await WhenTimePasses(1.Hours());`.
 
 ## Extension Methods for Outgoing Messages
 
@@ -1282,6 +1531,42 @@ tables registered on the message store — SQL Server's rate-limit table, for ex
 It is safe to call on a host with no message store and no database-backed queues, so you can put it in a
 shared test fixture base class without breaking your storeless tests.
 
+## Circuit Breakers and Error Policies in Tests
+
+A [circuit breaker](/guide/handlers/error-handling#circuit-breaker) belongs to its listener, so its failure counts
+belong to the host, not to one test. A failure stays counted for the breaker's `TrackingPeriod` (10 minutes by
+default), and a pause clears the counts. When tests share a host, failures that one test scripts on purpose count toward the next
+test's breaker. The breaker can then pause the queue part way through a test that did nothing wrong. A pause from
+an error policy such as `AndPauseProcessing()` carries over the same way.
+
+::: tip
+Give each test that trips a breaker, or relies on one not tripping, a host of its own, with a short `PauseTime` and
+`TrackingPeriod`. Wolverine's own circuit breaker tests do this: see `CircuitBreakerIntegrationContext` in
+[src/Transports/RabbitMQ/CircuitBreakingTests](https://github.com/JasperFx/wolverine/tree/main/src/Transports/RabbitMQ/CircuitBreakingTests).
+:::
+
+To assert on a trip or a resume, wait on `IWolverineRuntime.Tracker` for the listener's status rather than sleeping
+for the `PauseTime`. In this sample every `ProcessOrder` fails. A breaker doesn't trip until it has seen
+`MinimumThreshold` messages (10 by default), so the test sends that many:
+
+```cs
+// Start waiting before the messages go out, so a trip that happens
+// quickly is not missed
+var tripped = runtime.Tracker.WaitForListenerStatusAsync(
+    queueUri, ListeningStatus.Paused, 30.Seconds());
+
+for (var i = 0; i < 10; i++)
+{
+    await host.MessageBus().PublishAsync(new ProcessOrder(i));
+}
+
+await tripped;
+```
+
+`WaitForListenerStatusAsync()` also takes an endpoint name. It completes at once if the last status the tracker
+recorded for that listener already matches. The tracker records a change slightly after the listener makes it, so
+that status can trail the listener's own.
+
 ## Running Wolverine in "Solo" Mode <Badge type="tip" text="3.0" />
 
 Wolverine's [leadership election](/guide/durability/leadership-and-troubleshooting.html#troubleshooting-and-leadership-election) process is necessary for distributing several background tasks in real life production,
@@ -1319,7 +1604,7 @@ builder.UseWolverine(opts =>
 using var host = builder.Build();
 await host.StartAsync();
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/DocumentationSamples/DurabilityModes.cs#L53-L79' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_configuring_the_solo_mode' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/DocumentationSamples/DurabilityModes.cs#L54-L80' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_configuring_the_solo_mode' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 Or if you're using something like [WebHostFactory](https://learn.microsoft.com/en-us/aspnet/core/test/integration-tests?view=aspnetcore-8.0) to 

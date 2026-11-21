@@ -58,8 +58,8 @@ public sealed partial class WolverineRuntime : IWolverineRuntime, IWolverineRunt
         return generation switch
         {
             EnvelopeIdGeneration.GuidV7 => Guid.CreateVersion7,
-            EnvelopeIdGeneration.NewIdSqlServerOrder => MassTransit.NewId.NextGuid,
-            _ => MassTransit.NewId.NextSequentialGuid
+            EnvelopeIdGeneration.NewIdSqlServerOrder => EnvelopeIds.NextGuid,
+            _ => EnvelopeIds.NextSequentialGuid
         };
     }
 
@@ -90,14 +90,14 @@ public sealed partial class WolverineRuntime : IWolverineRuntime, IWolverineRunt
         // wired into this host.
         _sagaStorage = new Lazy<ISagaStoreDiagnostics>(() =>
             new AggregateSagaStoreDiagnostics(
-                container.Services.GetServices<ISagaStoreDiagnostics>()));
+                container.Services.GetServices<ISagaStoreDiagnostics>(), this));
 
         LoggerFactory = loggers;
         Logger = loggers.CreateLogger<WolverineRuntime>();
         
         Observer = new PersistenceWolverineObserver(this);
 
-        Meter = new Meter("Wolverine:" + options.ServiceName, GetType().Assembly.GetName().Version?.ToString());
+        Meter = new Meter(MetricsConstants.MeterName, GetType().Assembly.GetName().Version?.ToString());
         Logger.LogInformation("Exporting Open Telemetry metrics from Wolverine with name {Name}, version {Version}",
             Meter.Name, Meter.Version);
 
@@ -152,6 +152,8 @@ public sealed partial class WolverineRuntime : IWolverineRuntime, IWolverineRunt
         // GH-4321: one shared 2s sweep serves every back-pressure-enforcing listener; its loop
         // only starts when the first agent registers and dies with Cancellation
         BackPressureSweeper = new BackPressureSweeper(Logger, Cancellation);
+
+        RecoveryLanes = new RecoveryLanes(loggers.CreateLogger<RecoveryLanes>());
 
         Tracker = new WolverineTracker(Logger);
 
@@ -232,7 +234,22 @@ public sealed partial class WolverineRuntime : IWolverineRuntime, IWolverineRunt
 
     internal BackPressureSweeper BackPressureSweeper { get; }
 
+    /// <summary>
+    /// GH-5587. One durable recovery lane per destination, shared by every message store's durability agent
+    /// </summary>
+    internal RecoveryLanes RecoveryLanes { get; }
+
     public HandlerGraph Handlers { get; }
+
+    /// <summary>
+    /// GH-5556. Test seams for saga compensation
+    /// </summary>
+    internal Wolverine.Persistence.Sagas.SagaCompensationHooks CompensationHooks { get; } = new();
+
+    /// <summary>
+    /// GH-5554. Test seams in the dead-letter move
+    /// </summary>
+    internal Wolverine.Persistence.Durability.DeadLetterMoveHooks DeadLetterHooks { get; } = new();
 
     internal IScheduledJobProcessor ScheduledJobs { get; private set; } = null!;
 

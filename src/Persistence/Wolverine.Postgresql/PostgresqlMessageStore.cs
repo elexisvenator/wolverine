@@ -370,12 +370,13 @@ select {owner} from owners where {owner} is not null";
     /// </summary>
     protected override async Task repairLegacyColumnDefaultsAsync(DbConnection conn)
     {
-        if (Durability.InboxStaleTime.HasValue)
+        // Gated on whether the column is provisioned (GH-5193), not on the stale time that reads it
+        if (Durability.ProvisionsIncomingTimestamp)
         {
             await repairTimestampDefaultAsync(conn, DatabaseConstants.IncomingTable, "now()", false);
         }
 
-        if (Durability.OutboxStaleTime.HasValue)
+        if (Durability.ProvisionsOutgoingTimestamp)
         {
             await repairTimestampDefaultAsync(conn, DatabaseConstants.OutgoingTable, OutgoingEnvelopeTable.TimestampDefault,
                 true);
@@ -1094,6 +1095,13 @@ join pg_catalog.pg_namespace n on n.oid = c.relnamespace and n.nspname = '{Schem
         yield return new DeadLettersTable(Durability, SchemaName);
         yield return new DeadLetterHistoryTable(SchemaName);
 
+        // GH-5665. Every store role, since a saga's history is written to the store its saga's transaction is in, but
+        // only once some saga records its history
+        if (Durability.ProvisionsSagaHistory)
+        {
+            yield return new SagaHistoryTable(SchemaName);
+        }
+
         // GH-4180. Every store role, not just Main: a handler chain with an AncillaryStoreType claims
         // its logical id in that store so the claim and the work land in one transaction.
         // GH-4757: exactly one of the two, never both. The hash mode's key is a binary column, which
@@ -1138,9 +1146,10 @@ join pg_catalog.pg_namespace n on n.oid = c.relnamespace and n.nspname = '{Schem
             nodeTable.AddColumn<string>("version");
             nodeTable.AddColumn("capabilities", "text[]").AllowNulls();
 
-            // GH-3959: provisioned only behind the opt-in so an upgrade migrates nothing.
-            // PostgresqlNodePersistence gates every statement naming it on the same flag.
-            if (Durability.CapacityAwareAssignment)
+            // GH-3959 / GH-5193: always provisioned since 7.0 unless AlwaysProvisionOptionalSchemaObjects is off.
+            // PostgresqlNodePersistence gates every statement naming it on CapacityAwareAssignment, so the
+            // behaviour stays opt-in.
+            if (Durability.ProvisionsNodeLoadFactor)
             {
                 nodeTable.AddColumn(DatabaseConstants.LoadFactor, "double precision").AllowNulls();
             }

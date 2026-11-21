@@ -6,6 +6,7 @@ using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
 using Weasel.Core;
 using Wolverine.Persistence.Durability;
+using Wolverine.Persistence.Sagas;
 using Wolverine.RDBMS;
 using Wolverine.RDBMS.Deduplication;
 using Wolverine.Runtime;
@@ -22,7 +23,7 @@ namespace Wolverine.EntityFrameworkCore.Internals;
     Justification = "EFCore envelope transaction reflects over runtime DbContext for domain-event scraping; AOT consumers preserve DbContext / domain-event types via TrimmerRootDescriptor. See AOT guide.")]
 [UnconditionalSuppressMessage("Trimming", "IL2075",
     Justification = "EFCore envelope transaction reflects over runtime DbContext for domain-event scraping; AOT consumers preserve DbContext / domain-event types via TrimmerRootDescriptor. See AOT guide.")]
-public class EfCoreEnvelopeTransaction : IEnvelopeTransaction
+public class EfCoreEnvelopeTransaction : IEnvelopeTransaction, ISagaHistoryTransaction
 {
     private readonly MessageContext _messaging;
     private readonly IDomainEventScraper[] _scrapers;
@@ -146,6 +147,27 @@ public class EfCoreEnvelopeTransaction : IEnvelopeTransaction
         }
 
         return ValueTask.CompletedTask;
+    }
+
+    // GH-5665: the saga's history row joins the DbContext's open transaction, when there is one. Without one, nothing
+    // here would commit a transaction this class began, so the row is written on its own instead
+
+    public async Task<bool> TryPersistSagaHistoryAsync(SagaHistoryRecord record, CancellationToken token)
+    {
+        if (_database is not ISagaHistoryDatabase history || DbContext.Database.CurrentTransaction == null) return false;
+
+        await history.WriteSagaHistoryAsync(DbContext.Database.CurrentTransaction.GetDbTransaction(), record, token);
+        return true;
+    }
+
+    public async Task<bool> TryDeleteSagaHistoryAsync(string sagaType, string sagaId, string? tenantId,
+        CancellationToken token)
+    {
+        if (_database is not ISagaHistoryDatabase history || DbContext.Database.CurrentTransaction == null) return false;
+
+        await history.DeleteSagaHistoryAsync(DbContext.Database.CurrentTransaction.GetDbTransaction(), sagaType, sagaId,
+            tenantId, token);
+        return true;
     }
 
     public async Task<bool> TryMakeEagerIdempotencyCheckAsync(Envelope envelope, DurabilitySettings settings,
@@ -285,8 +307,14 @@ public class EfCoreEnvelopeTransaction : IEnvelopeTransaction
             var conn = DbContext.Database.GetDbConnection();
             var tx = DbContext.Database.CurrentTransaction?.GetDbTransaction();
             
+            // GH-5423: eager idempotency already wrote this execution's Handled row into the transaction
+            if (_messaging.EagerIdempotencyRowWritten)
+            {
+                markedHandled = true;
+            }
+
             // Are we marking an existing envelope as persisted?
-            if (_messaging.Envelope.WasPersistedInInbox)
+            else if (_messaging.Envelope.WasPersistedInInbox)
             {
                 // GH-5040: only when this DbContext's database holds the row. A durable PostgreSQL queue moves
                 // the row into the MAIN store's inbox on dequeue, while a DbContext enrolled in an ancillary
@@ -336,7 +364,22 @@ public class EfCoreEnvelopeTransaction : IEnvelopeTransaction
 
         if (DbContext.Database.CurrentTransaction != null)
         {
-            await DbContext.Database.CurrentTransaction.CommitAsync(cancellation);
+            try
+            {
+                await DbContext.Database.CurrentTransaction.CommitAsync(cancellation);
+            }
+            catch (Exception e) when (markedHandled)
+            {
+                // GH-5410: a COMMIT can apply on the server and still fail on the client -- a command timeout or a
+                // dropped connection while the reply is on its way. Treated as a failure, the error policy
+                // dead-lettered work that had committed (so a replay ran it twice) and the cascades this
+                // transaction had already persisted were never handed to their queues. The inbox row this
+                // transaction marked Handled says which way the commit went.
+                if (!await theCommitAppliedAsync(e, cancellation))
+                {
+                    throw;
+                }
+            }
         }
 
         // F25: Handled only once the mark has actually committed, as Marten and Polecat do. DurableReceiver skips
@@ -353,6 +396,46 @@ public class EfCoreEnvelopeTransaction : IEnvelopeTransaction
         }
     }
     
+    private async Task<bool> theCommitAppliedAsync(Exception commitFailure, CancellationToken cancellation)
+    {
+        var envelope = _messaging.Envelope!;
+        var logger = _messaging.Runtime.LoggerFactory.CreateLogger<EfCoreEnvelopeTransaction>();
+
+        // Release the transaction first. If the COMMIT never reached the server it is still open and holding the
+        // inbox row, so the probe below would wait on it until the command timed out. If the COMMIT did apply,
+        // rolling back fails harmlessly
+        try
+        {
+            await DbContext.Database.RollbackTransactionAsync(CancellationToken.None);
+        }
+        catch (Exception)
+        {
+            // Nothing to roll back, or no connection left to do it on
+        }
+
+        try
+        {
+            // On a connection of the store's own: the DbContext's may be the one that just broke
+            if (!await _database.Inbox.IsHandledAsync(envelope, CancellationToken.None))
+            {
+                return false;
+            }
+        }
+        catch (Exception probeFailure)
+        {
+            logger.LogError(probeFailure,
+                "The commit of envelope {EnvelopeId} failed, and checking whether it applied failed too. Treating the commit as failed",
+                envelope.Id);
+            return false;
+        }
+
+        logger.LogWarning(commitFailure,
+            "The commit of envelope {EnvelopeId} reported an error, but the inbox shows it applied. Treating the message as handled",
+            envelope.Id);
+
+        return true;
+    }
+
     public static bool IsDisposed(DbContext context)
     {
         var result = true;

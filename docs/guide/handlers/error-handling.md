@@ -89,6 +89,23 @@ using var host = await Host.CreateDefaultBuilder()
 
 You have to explicitly discard a message or it will eventually be sent to a dead letter queue when the message has exhausted its configured retries or requeues.
 
+## Terminal Failures <Badge type="tip" text="7.0" />
+
+Some failures can't be fixed by trying again. Mark the exception type with `[TerminalFailure]`, or have it implement
+`ITerminalFailure`, and Wolverine skips the retries for it, in any handler:
+
+```cs
+[TerminalFailure]
+public class PaymentAmountMismatchException(decimal expected, decimal received)
+    : Exception($"Expected a payment of {expected}, but received {received}");
+
+public class DiscontinuedException(string sku) : Exception($"{sku} is discontinued"), ITerminalFailure;
+```
+
+A retry, scheduled retry, requeue or "do this, then retry" rule that matches a terminal failure becomes a move to the
+error queue, so the message is dead lettered, its `Fault<T>` is published, and a saga compensates it right away. A rule
+that discards the message, or a custom action, still applies. `InvokeAsync()` doesn't retry a terminal failure either.
+
 
 ## Exponential Backoff
 
@@ -312,6 +329,61 @@ public class ErrorHandlingPolicy : IHandlerPolicy
 ```
 <sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Testing/CoreTests/Runtime/Samples/error_handling.cs#L191-L206' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_errorhandlingpolicy' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
+
+## Transient Database Failures <Badge type="tip" text="7.0" />
+
+`OnException<NpgsqlException>()` or `OnException<SqlException>()` catches too much. The same exception type covers
+a dropped connection, which is worth retrying, and a unique constraint violation or a syntax error, which is never
+going to succeed no matter how many times you try. Each database integration has an opt-in rule that only matches
+the transient failures, the ones that are about the moment and not about the message:
+
+| Database | Package | Rule | Classifier |
+|----------|---------|------|------------|
+| PostgreSQL / Marten | `WolverineFx.Marten` | `opts.Policies.OnTransientPostgresFailure()` | `TransientPostgresFailure.Is(Exception)` |
+| SQL Server | `WolverineFx.SqlServer` | `opts.Policies.OnTransientSqlServerFailure()` | `TransientSqlServerFailure.Is(Exception)` |
+| MySQL | `WolverineFx.MySql` | `opts.Policies.OnTransientMySqlFailure()` | `TransientMySqlFailure.Is(Exception)` |
+| SQLite | `WolverineFx.Sqlite` | `opts.Policies.OnTransientSqliteFailure()` | `TransientSqliteFailure.Is(Exception)` |
+| Oracle | `WolverineFx.Oracle` | `opts.Policies.OnTransientOracleFailure()` | `TransientOracleFailure.Is(Exception)` |
+| RavenDB | `WolverineFx.RavenDb` | `opts.Policies.OnTransientRavenDbFailure()` | `TransientRavenDbFailure.Is(Exception)` |
+| Cosmos DB | `WolverineFx.CosmosDb` | `opts.Policies.OnTransientCosmosDbFailure()` | `TransientCosmosDbFailure.Is(Exception)` |
+
+Each one returns the usual `PolicyExpression`, so you pick the schedule, and does nothing until you give it an action:
+
+```csharp
+opts.Policies.OnTransientSqlServerFailure()
+    .ScheduleRetry(1.Seconds(), 5.Seconds(), 30.Seconds())
+    .WithExponentialJitter();
+```
+
+Roughly, "transient" means:
+
+* **PostgreSQL** -- a `NpgsqlException` where `IsTransient` is true (unreachable server, failover, dropped connection,
+  deadlock, serialization failure), a `MartenCommandException` wrapping one, and the `ObjectDisposedException` on
+  `NpgsqlTransaction` a handler sees after its connection broke mid-transaction
+* **SQL Server** -- deadlock victims, lock timeouts, client timeouts, broken or refused connections and the Azure SQL
+  "busy, failing over or throttled" errors (the list is `TransientSqlServerFailure.ErrorNumbers`), and the
+  `ObjectDisposedException` on `SqlTransaction`
+* **MySQL** -- anything MySqlConnector reports as `IsTransient` (deadlocks, lock wait timeouts, connection failures),
+  plus server shutdown, aborted or lost connections, command timeouts and the `ObjectDisposedException` on `MySqlTransaction`
+* **SQLite** -- `SQLITE_BUSY` and `SQLITE_LOCKED`, including their extended codes
+* **Oracle** -- anything ODP.NET reports as transient or recoverable, plus deadlocks (ORA-00060), busy resources
+  (ORA-00054), serialization failures (ORA-08177) and lost or refused connections (ORA-03113, ORA-03114, ORA-12170, ORA-12541 and friends)
+* **RavenDB** -- every node down, a node unavailable, request timeouts, no cluster leader and a database that is still
+  loading. A `ConcurrencyException` is **not** matched, because retrying the same change will not get a different answer
+* **Cosmos DB** -- status 408, 429, 449 and 503, 410 (Gone) with a retryable sub status, and 404 with sub status 1002
+  (read session not available). The Cosmos DB client
+  already retries throttled requests on its own, honoring `RetryAfter`, so a 429 that reaches Wolverine has used those up
+
+All of them except PostgreSQL look through `InnerException` at any depth, so the same failure wrapped by EF Core,
+Polecat or Fisher still matches. Rules are first match wins, so declare these before a broader rule that also matches
+the same exception type. The classifiers are public if you want them in your own predicates.
+
+::: warning
+A retry is at-least-once, not "nothing happened." If the connection is lost while the transaction is being committed,
+your application can't know whether the commit made it to the database before the connection went away. The retried
+message may be running against work that the first attempt already committed, so handlers that write to the database
+need to be idempotent or check for their own earlier work.
+:::
 
 ## Exception Filtering
 
@@ -538,6 +610,9 @@ Likewise, if there are no `Exclude()` calls, the circuit breaker will not throw 
 exceptions. Also note that **it probably makes no sense to define both `Include()` and `Exclude()`
 rules**.
 
+A breaker's failure counts belong to its host, not to one test. They expire after `TrackingPeriod`, and a pause resets them.
+When tests share a host, see [circuit breakers and error policies in tests](/guide/testing#circuit-breakers-and-error-policies-in-tests).
+
 ## Custom Actions for InvokeAsync() <Badge type="tip" text="3.13" />
 
 ::: info
@@ -732,7 +807,7 @@ public record Fault<T>(
 ```
 
 - `Message` — the original failing message, exactly as it was deserialized.
-- `Exception` — `ExceptionInfo` record with `Type`, `Message`, `StackTrace`, `InnerException`. Inner-exception recursion is depth-capped at 10 to bound payload size.
+- `Exception` — `ExceptionInfo` record with `Type`, `Message`, `StackTrace`, `InnerExceptions` and `TypeHierarchy` (see below). Inner-exception recursion is depth-capped at 32 to bound payload size.
 - `Attempts` — how many delivery attempts the failing envelope went through before the terminal decision.
 - `FailedAt` — the timestamp of the terminal decision (UTC).
 - `CorrelationId`, `ConversationId`, `TenantId`, `Source` — propagated from the failing envelope. **`Source` is the original sender's identity, not the fault publisher's.**
@@ -757,6 +832,42 @@ and tests. `OriginalId` and `OriginalType` carry the failing envelope's
 ID and Wolverine message-type name so trace consumers can correlate
 without inspecting the fault body.
 
+### Matching a fault by exception type <Badge type="tip" text="7.0" />
+
+A fault that arrives from another service carries its exception as an `ExceptionInfo`, not as a live
+`Exception`, so you cannot write `fault.Exception is InventoryException`. Starting with Wolverine 7.0,
+`ExceptionInfo.TypeHierarchy` records the full names of the thrown type and its base types (most derived
+first, stopping before `System.Exception`), and `ExceptionInfo.Is<T>()` / `Is(fullTypeName)` matches the
+thrown type or any of its base types:
+
+<!-- snippet: sample_matching_a_remote_exception_by_base_type -->
+<a id='snippet-sample_matching_a_remote_exception_by_base_type'></a>
+```cs
+[Fact]
+public void match_a_fault_by_its_exception_type_or_a_base_type()
+{
+    var info = ExceptionInfo.From(new OutOfStockException("sku-1"));
+
+    // The thrown type, any base type, and System.Exception all match
+    info.Is<OutOfStockException>().ShouldBeTrue();
+    info.Is<InventoryException>().ShouldBeTrue();
+    info.Is<Exception>().ShouldBeTrue();
+
+    // By full type name, for a receiver that cannot reference the sender's exception types
+    info.Is("CoreTests.ErrorHandling.Faults.InventoryException").ShouldBeTrue();
+
+    // Unrelated types do not
+    info.Is<InvalidOperationException>().ShouldBeFalse();
+    info.Is<SomeOtherInventoryException>().ShouldBeFalse();
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Testing/CoreTests/ErrorHandling/Faults/ExceptionInfoTests.cs#L208-L228' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_matching_a_remote_exception_by_base_type' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+A fault published by a Wolverine 6.x sender has an empty `TypeHierarchy`, and `Is()` then matches the
+thrown type alone. The redaction flags below never remove the type hierarchy, because type names carry
+no message payload.
+
 ### Delivery semantics and scope
 
 A fault is published when:
@@ -772,13 +883,24 @@ A fault is **not** published in these bypass paths:
 - **Pre-handler crypto failures** — `EncryptionPolicyViolationException`, `EncryptionMissingHeaderException`, `EncryptionDecryptionException` short-circuit before the handler runs.
 - **Fault-publish recursion** — a failing `Fault<T>` handler will not trigger a `Fault<Fault<T>>`. The recursion guard logs at Debug and emits a `wolverine.fault.recursion_suppressed` activity event.
 
-> **Atomicity caveat.** Fault publish is **best-effort, not transactionally
-> co-committed** with the DLQ insert. The receive-side outbox does not
-> enrol the fault publish in the same transaction as the DLQ row. In the
-> unlikely window where the DLQ commit succeeds but the fault enqueue
-> throws, the fault is dropped (logged at Error and the failure counter
-> is incremented). Subscribers must therefore be resilient to gaps; they
-> cannot use Fault events as a strict audit log.
+#### When the fault is written with its dead letter <Badge type="tip" text="7.0" />
+
+Where a fault goes is worked out before the message is moved to the dead letter queue. When the message came in on a
+**durable** endpoint and its dead letter goes to the message store, every fault for a destination with a **durable**
+sending endpoint (a durable outbox, or a durable local queue) is written in the same transaction as the dead letter,
+then sent. A crash right after the move leaves the fault in the outbox, and it is sent when the outbox is recovered.
+If the move rolls back, the fault goes with it and the message stays in the inbox.
+
+That needs a message store that can write both in one transaction: PostgreSQL (and Marten), SQL Server, MySQL,
+SQLite and RavenDB. Everywhere else the fault is sent right after the move, best-effort, as before 7.0:
+
+- inline and buffered receiving endpoints, which keep no inbox,
+- dead letters kept by the broker (native dead letter queues),
+- destinations without a durable sending endpoint,
+- the Oracle and CosmosDB message stores.
+
+A best-effort fault can be lost in the window between the dead letter commit and the send. It is logged at Error and
+counted when the send itself fails.
 
 ### Subscribing to faults
 
@@ -807,6 +929,50 @@ public static class OrderPlacedFaultHandler
 > requires class names ending in `Handler` or `Consumer` (or
 > `[WolverineHandler]` on the class). A class named
 > `OrderPlacedFaultSink` will not be discovered automatically.
+
+### Sending a fault back to the sender <Badge type="tip" text="7.0" />
+
+Fault events are routed like any other message, so the service that fails a message needs a routing rule to get
+the fault back to whoever cares. Often that's just the service that sent the message in the first place. Starting
+with Wolverine 7.0, the sender can ask for the fault itself when it sends the message:
+
+<!-- snippet: sample_return_fault_to_sender -->
+<a id='snippet-sample_return_fault_to_sender'></a>
+```cs
+// If CheckStock fails for good in inventory, send its Fault<CheckStock> back to this service
+await bus.SendAsync(new CheckStock("widget"), new DeliveryOptions().ReturnFaultToSender());
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/SagaFaults/SagaFaults.Specs/Specs/FaultsGoBackToTheSender.cs#L91-L94' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_return_fault_to_sender' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+or name the address it wants the fault sent to:
+
+<!-- snippet: sample_fault_to_an_address -->
+<a id='snippet-sample_fault_to_an_address'></a>
+```cs
+// If CheckStock fails for good in inventory, send its Fault<CheckStock> to this address
+await bus.SendAsync(new CheckStock("widget"), new DeliveryOptions().FaultTo(TheServices.OrdersUri));
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/SagaFaults/SagaFaults.Specs/Specs/FaultsGoBackToTheSender.cs#L73-L76' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_fault_to_an_address' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+Either one puts a `wolverine.fault.reply-to` header (`FaultHeaders.ReplyTo`) on the outgoing envelope. When the
+message is dead lettered on the receiving side, Wolverine sends its `Fault<T>` to that address:
+
+- The receiver does not need `PublishFaultEvents()`. With fault events off, the fault goes only to the address the
+  sender asked for.
+- With fault events on, the fault goes to both the receiver's routes and the address the sender asked for, but only
+  once to any one address. Two local queues count as the same address, since they reach the same handlers.
+- It only happens when the message is moved to the dead letter queue, not when it's discarded.
+- `ReturnFaultToSender()` uses the envelope's reply address, so the sender needs a listener the receiver can reach,
+  and of course a handler for `Fault<T>`.
+- The redaction settings of the receiver still apply to the exception in the fault.
+- A receiver on an older version of Wolverine ignores the header, and routes the fault (or doesn't) like it always
+  has.
+
+A saga that handles `Fault<T>` asks for the fault of every `T` it sends automatically, unless its service already
+routes `Fault<T>` to itself. An explicit `FaultTo()` or `ReturnFaultToSender()` always asks. See
+[Sagas](/guide/durability/sagas#hearing-about-failed-steps).
 
 ### Per-type fault configuration
 

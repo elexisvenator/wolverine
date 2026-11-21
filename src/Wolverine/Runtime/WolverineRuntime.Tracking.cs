@@ -24,13 +24,19 @@ public sealed partial class WolverineRuntime : IMessageTracker
     public const int UndeliverableEventId = 108;
     public const int RescheduledEventId = 109;
 
-    private static readonly Action<ILogger, Envelope, Exception?> _movedToErrorQueue;
-    private static readonly Action<ILogger, Envelope, Exception?> _rescheduled;
+    // GH-5146: these templates log the envelope's message type name and id, not the Envelope itself, so an
+    // emitted entry no longer pays for Envelope.ToString()'s string concatenation (and a structured log
+    // provider no longer captures the whole Envelope as a property value)
+    private static readonly Action<ILogger, string, Guid, Exception?> _movedToErrorQueue;
+    // A requeue or reschedule is the retry of a failed attempt, so it logs at the chain's FailureLogLevel (GH-5043) like
+    // the failed attempt itself: one template per level
+    private static readonly Action<ILogger, string, Guid, Exception?>[] _rescheduled =
+        new Action<ILogger, string, Guid, Exception?>[(int)LogLevel.Critical + 1];
     private static readonly Action<ILogger, string?, string, Guid, string, Exception?> _noHandler;
-    private static readonly Action<ILogger, Envelope, Exception?> _noRoutes;
+    private static readonly Action<ILogger, string, Guid, Exception?> _noRoutes;
     private static readonly Action<ILogger, string, string, Guid, string, string, Exception?> _received;
     private static readonly Action<ILogger, string, string, Guid, string, Exception?> _sent;
-    private static readonly Action<ILogger, Envelope, Exception?> _undeliverable;
+    private static readonly Action<ILogger, string, Guid, Exception?> _undeliverable;
     private readonly Counter<int> _deadLetterQueueCounter;
     private readonly Histogram<double> _effectiveTime;
     private readonly Histogram<double> _executionCounter;
@@ -50,17 +56,20 @@ public sealed partial class WolverineRuntime : IMessageTracker
         _noHandler = LoggerMessage.Define<string?, string, Guid, string>(LogLevel.Information, NoHandlerEventId,
             "{CorrelationId}: No known handler for {Name}#{Id} from {ReplyUri}");
 
-        _noRoutes = LoggerMessage.Define<Envelope>(LogLevel.Information, NoRoutesEventId,
-            "No routes can be determined for {envelope}");
+        _noRoutes = LoggerMessage.Define<string, Guid>(LogLevel.Information, NoRoutesEventId,
+            "No routes can be determined for {Name}#{Id}");
 
-        _rescheduled = LoggerMessage.Define<Envelope>(LogLevel.Error, RescheduledEventId,
-            "Envelope {envelope} was rescheduled to queue");
+        for (var level = LogLevel.Trace; level <= LogLevel.Critical; level++)
+        {
+            _rescheduled[(int)level] = LoggerMessage.Define<string, Guid>(level, RescheduledEventId,
+                "Envelope {Name}#{Id} was rescheduled to queue");
+        }
 
-        _movedToErrorQueue = LoggerMessage.Define<Envelope>(LogLevel.Error, MovedToErrorQueueId,
-            "Envelope {envelope} was moved to the error queue");
+        _movedToErrorQueue = LoggerMessage.Define<string, Guid>(LogLevel.Error, MovedToErrorQueueId,
+            "Envelope {Name}#{Id} was moved to the error queue");
 
-        _undeliverable = LoggerMessage.Define<Envelope>(LogLevel.Information, UndeliverableEventId,
-            "Discarding {envelope}");
+        _undeliverable = LoggerMessage.Define<string, Guid>(LogLevel.Information, UndeliverableEventId,
+            "Discarding {Name}#{Id}");
     }
 
     internal TrackedSession? ActiveSession { get; set; }
@@ -82,6 +91,27 @@ public sealed partial class WolverineRuntime : IMessageTracker
     }
 
     /// <summary>
+    ///     GH-5385. Record the streams an event-store session committed that Wolverine did not open -- a Razor page's,
+    ///     a Minimal API's or a controller's own injected session -- against the active tracked session, if there is
+    ///     one. No envelope: it is not a message's commit.
+    /// </summary>
+    internal void RecordAppendedEventsOutsideAMessage(IReadOnlyList<StreamAction> streams,
+        JasperFx.Events.EventStoreIdentity? store, string? tenantId)
+    {
+        // GH-5683. Read once: a tracked session on a shared host can end on another thread between a check and a
+        // second read, and this runs inside the application's own SaveChangesAsync()
+        var session = ActiveSession;
+        if (streams.Count == 0 || session is null) return;
+        if (Tracking.ConcurrentAppends.InsideConcurrentAppend.Value) return;
+
+        session.RecordAppendedEvents(new AppendedEvents(null, _serviceName, streams)
+        {
+            Store = store,
+            TenantId = tenantId
+        });
+    }
+
+    /// <summary>
     ///     GH-4940. Record one Dynamic Consistency Boundary load against the active tracked session, if there is
     ///     one, attributed to the message <paramref name="context" /> was handling.
     /// </summary>
@@ -94,6 +124,11 @@ public sealed partial class WolverineRuntime : IMessageTracker
     /// <c>source</c> tag is added to *every* instrument (GH-3221) so a shared metrics backend that scrapes
     /// many services can slice each series per service.
     /// </summary>
+    /// <remarks>
+    /// GH-5146: building the tags allocates (message type, destination string, tenant, custom tags, source
+    /// overflow the TagList's inline slots), so every caller checks the instrument's <c>Enabled</c> first and
+    /// builds the set at most once per tracking call. With no listener attached, no tags are built at all.
+    /// </remarks>
     private TagList metricTags(Envelope envelope)
     {
         var tags = envelope.ToMetricsHeaders();
@@ -103,7 +138,10 @@ public sealed partial class WolverineRuntime : IMessageTracker
 
     public void Sent(Envelope envelope)
     {
-        _sentCounter.Add(1, metricTags(envelope));
+        if (_sentCounter.Enabled)
+        {
+            _sentCounter.Add(1, metricTags(envelope));
+        }
 
         if (Options.Metrics.Mode != WolverineMetricsMode.SystemDiagnosticsMeter
             && envelope.MessageType.IsNotEmpty()
@@ -125,7 +163,7 @@ public sealed partial class WolverineRuntime : IMessageTracker
     {
         var isExternal = IsExternalDestination(envelope.Destination);
 
-        if (isExternal)
+        if (isExternal && _receivedCounter.Enabled)
         {
             _receivedCounter.Add(1, metricTags(envelope));
         }
@@ -153,7 +191,7 @@ public sealed partial class WolverineRuntime : IMessageTracker
     public void ExecutionFinished(Envelope envelope)
     {
         var time = envelope.StopTiming();
-        if (time >= 0)
+        if (time >= 0 && _executionCounter.Enabled)
         {
             _executionCounter.Record(time, metricTags(envelope));
         }
@@ -163,16 +201,37 @@ public sealed partial class WolverineRuntime : IMessageTracker
 
     public void ExecutionFinished(Envelope envelope, Exception exception)
     {
-        ExecutionFinished(envelope);
-        var tags = metricTags(envelope);
-        tags.Add(MetricsConstants.ExceptionType, exception.GetType().Name);
-        _failureCounter.Add(1, tags);
+        var time = envelope.StopTiming();
+        var recordTime = time >= 0 && _executionCounter.Enabled;
+
+        // One tag set serves both instruments; the exception type is only added for the failure counter
+        if (recordTime || _failureCounter.Enabled)
+        {
+            var tags = metricTags(envelope);
+            if (recordTime)
+            {
+                _executionCounter.Record(time, tags);
+            }
+
+            if (_failureCounter.Enabled)
+            {
+                tags.Add(MetricsConstants.ExceptionType, exception.GetType().Name);
+                _failureCounter.Add(1, tags);
+            }
+        }
+
+        ActiveSession?.Record(MessageEventType.ExecutionFinished, envelope, _serviceName, _uniqueNodeId);
     }
 
     public void MessageSucceeded(Envelope envelope)
     {
-        var tags = metricTags(envelope);
-        _successCounter.Add(1, tags);
+        var recordCount = _successCounter.Enabled;
+        var recordEffectiveTime = _effectiveTime.Enabled;
+        var tags = recordCount || recordEffectiveTime ? metricTags(envelope) : default;
+        if (recordCount)
+        {
+            _successCounter.Add(1, tags);
+        }
 
         // An unset SentAt makes now - SentAt a ~56-year garbage figure; skip the effective-time
         // recording rather than publish it (CritterWatch#880's arithmetic half)
@@ -184,7 +243,10 @@ public sealed partial class WolverineRuntime : IMessageTracker
         }
 
         var time = DateTimeOffset.UtcNow.Subtract(envelope.SentAt.ToUniversalTime()).TotalMilliseconds;
-        _effectiveTime.Record(time, tags);
+        if (recordEffectiveTime)
+        {
+            _effectiveTime.Record(time, tags);
+        }
 
         if (Options.Metrics.Mode != WolverineMetricsMode.SystemDiagnosticsMeter
             && envelope.MessageType.IsNotEmpty()
@@ -201,8 +263,13 @@ public sealed partial class WolverineRuntime : IMessageTracker
 
     public void MessageFailed(Envelope envelope, Exception ex)
     {
-        var tags = metricTags(envelope);
-        _deadLetterQueueCounter.Add(1, tags);
+        var recordCount = _deadLetterQueueCounter.Enabled;
+        var recordEffectiveTime = _effectiveTime.Enabled;
+        var tags = recordCount || recordEffectiveTime ? metricTags(envelope) : default;
+        if (recordCount)
+        {
+            _deadLetterQueueCounter.Add(1, tags);
+        }
 
         // Same unset-SentAt guard as MessageSucceeded (CritterWatch#880's arithmetic half)
         if (envelope.SentAt == default)
@@ -213,7 +280,10 @@ public sealed partial class WolverineRuntime : IMessageTracker
         }
 
         var time = DateTimeOffset.UtcNow.Subtract(envelope.SentAt.ToUniversalTime()).TotalMilliseconds;
-        _effectiveTime.Record(time, tags);
+        if (recordEffectiveTime)
+        {
+            _effectiveTime.Record(time, tags);
+        }
 
         if (Options.Metrics.Mode != WolverineMetricsMode.SystemDiagnosticsMeter
             && envelope.MessageType.IsNotEmpty()
@@ -244,7 +314,7 @@ public sealed partial class WolverineRuntime : IMessageTracker
     public void NoRoutesFor(Envelope envelope)
     {
         ActiveSession?.Record(MessageEventType.NoRoutes, envelope, _serviceName, _uniqueNodeId);
-        _noRoutes(Logger, envelope, null);
+        _noRoutes(Logger, envelope.GetMessageTypeName(), envelope.Id, null);
     }
 
     /// <summary>
@@ -261,19 +331,27 @@ public sealed partial class WolverineRuntime : IMessageTracker
     /// </summary>
     public void MovedToErrorQueue(Envelope envelope, Exception ex)
     {
-        var tags = metricTags(envelope);
-        _deadLetterQueueCounter.Add(1, tags);
+        var recordCount = _deadLetterQueueCounter.Enabled;
+        var recordEffectiveTime = _effectiveTime.Enabled;
+        var tags = recordCount || recordEffectiveTime ? metricTags(envelope) : default;
+        if (recordCount)
+        {
+            _deadLetterQueueCounter.Add(1, tags);
+        }
 
         // Same unset-SentAt guard as MessageSucceeded (CritterWatch#880's arithmetic half)
         if (envelope.SentAt != default)
         {
             var time = DateTimeOffset.UtcNow.Subtract(envelope.SentAt.ToUniversalTime()).TotalMilliseconds;
-            _effectiveTime.Record(time, tags);
+            if (recordEffectiveTime)
+            {
+                _effectiveTime.Record(time, tags);
+            }
         }
 
         ActiveSession?.Record(MessageEventType.MovedToErrorQueue, envelope, _serviceName, _uniqueNodeId, ex);
         fireWireTapFailure(envelope, ex);
-        _movedToErrorQueue(Logger, envelope, ex);
+        _movedToErrorQueue(Logger, envelope.GetMessageTypeName(), envelope.Id, ex);
 
         if (Options.Metrics.Mode != WolverineMetricsMode.SystemDiagnosticsMeter
             && envelope.MessageType.IsNotEmpty()
@@ -286,7 +364,7 @@ public sealed partial class WolverineRuntime : IMessageTracker
 
     public void DiscardedEnvelope(Envelope envelope)
     {
-        _undeliverable(Logger, envelope, null);
+        _undeliverable(Logger, envelope.GetMessageTypeName(), envelope.Id, null);
         ActiveSession?.Record(MessageEventType.Discarded, envelope, _serviceName, _uniqueNodeId);
     }
 
@@ -294,7 +372,43 @@ public sealed partial class WolverineRuntime : IMessageTracker
     {
         Logger.LogInformation("Requeue for message {Id} of message type {MessageType}", envelope.Id, envelope.MessageType);
         ActiveSession?.Record(MessageEventType.Requeued, envelope, _serviceName, _uniqueNodeId);
-        _rescheduled(Logger, envelope, null);
+        var level = requeueLogLevelFor(envelope);
+        if (level is >= LogLevel.Trace and <= LogLevel.Critical)
+        {
+            _rescheduled[(int)level](Logger, envelope.GetMessageTypeName(), envelope.Id, null);
+        }
+    }
+
+    // GH-5661. Requeued runs on every requeue, scheduled retry and DeferAsync, so finding the level must never throw.
+    // HandlerGraph.HandlerFor(Type) throws for a message type handled by more than one handler type (separated mode)
+    private LogLevel requeueLogLevelFor(Envelope envelope)
+    {
+        // The level of the handler that actually ran this envelope, stamped by its executor
+        if (envelope.HandlerFailureLogLevel is { } stamped) return stamped;
+
+        // Not executed here (a batch member, a message with no handler): the chains of the message type, when
+        // they agree on one level
+        if (envelope.Message is { } message)
+        {
+            var chains = Handlers.ChainsFor(message.GetType());
+            if (chains.Count > 0)
+            {
+                var level = chains[0].FailureLogLevel;
+                var agree = true;
+                for (var i = 1; i < chains.Count; i++)
+                {
+                    if (chains[i].FailureLogLevel != level)
+                    {
+                        agree = false;
+                        break;
+                    }
+                }
+
+                if (agree) return level;
+            }
+        }
+
+        return Options.MessageFailureLogLevel ?? LogLevel.Error;
     }
 
     public void LogException(Exception ex, object? correlationId = null,

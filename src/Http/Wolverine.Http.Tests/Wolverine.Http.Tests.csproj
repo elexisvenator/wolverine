@@ -4,6 +4,10 @@
         <OutputType>Exe</OutputType>
         <IsPackable>false</IsPackable>
         <TargetFrameworks>net10.0</TargetFrameworks>
+        <!-- WolverineWebApi now takes Microsoft.AspNetCore.OpenApi 10 rather than holding 9.0.5 (GH-5149), and its
+             XML comment source generator flows here through the project reference. It intercepts the
+             AddOpenApi() calls in this project, so the generated namespace has to be opted in. -->
+        <InterceptorsNamespaces>$(InterceptorsNamespaces);Microsoft.AspNetCore.OpenApi.Generated</InterceptorsNamespaces>
     </PropertyGroup>
 
     <ItemGroup>
@@ -30,6 +34,8 @@
              that project. See its csproj for why an endpoint needing an unregistered store cannot live in
              a widely-discovered assembly. -->
         <ProjectReference Include="..\Wolverine.Http.Tests.AncillaryStore\Wolverine.Http.Tests.AncillaryStore.csproj" />
+        <!-- A web application hosted through Alba without naming its application assembly (application_assembly_under_web_application_factory.cs) -->
+        <ProjectReference Include="..\ApplicationAssemblyWebApp\ApplicationAssemblyWebApp.csproj" />
         <ProjectReference Include="..\Wolverine.Http.Tests.DifferentAssembly\Wolverine.Http.Tests.DifferentAssembly.csproj" />
         <ProjectReference Include="..\Wolverine.Http.Tests.EfCoreOnly\Wolverine.Http.Tests.EfCoreOnly.csproj" />
         <ProjectReference Include="..\Wolverine.Http\Wolverine.Http.csproj" />

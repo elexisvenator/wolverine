@@ -93,6 +93,19 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
     private volatile bool _disposed;
 
     public DurableReceiver(Endpoint endpoint, IWolverineRuntime runtime, IHandlerPipeline pipeline)
+        : this(endpoint, runtime, pipeline, endpoint.HostsBatchExecution
+            ? Block<Envelope>.Unbounded
+            : Block<Envelope>.DefaultBoundedCapacity)
+    {
+    }
+
+    /// <summary>
+    /// GH-5586. A durable local queue passes <see cref="Block{T}.Unbounded"/>, so that nothing posting to it ever waits
+    /// for room. It keeps its own limit instead: once it is full, what is published to it waits in the inbox for
+    /// recovery. See <see cref="Transports.Local.DurableLocalQueue" />.
+    /// </summary>
+    internal DurableReceiver(Endpoint endpoint, IWolverineRuntime runtime, IHandlerPipeline pipeline,
+        int boundedCapacity)
     {
         _endpoint = endpoint;
         _runtime = runtime;
@@ -229,13 +242,9 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
             }
         };
         
-        // GH-3867: an endpoint that executes assembled message batches is its own cascade target,
-        // and a bounded block closes a deadlock cycle through the batching channel. See
-        // Endpoint.HostsBatchExecution.
-        var boundedCapacity = endpoint.HostsBatchExecution
-            ? Block<Envelope>.Unbounded
-            : Block<Envelope>.DefaultBoundedCapacity;
-
+        // GH-3867: an endpoint that executes assembled message batches is its own cascade target, and a bounded
+        // block closes a deadlock cycle through the batching channel, so it gets an unbounded one from the public
+        // constructor above. See Endpoint.HostsBatchExecution.
         if (endpoint.GroupShardingSlotNumber == null)
         {
             _receiver = new Block<Envelope>(endpoint.MaxDegreeOfParallelism, boundedCapacity, execute);
@@ -662,8 +671,15 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
 
     public Uri Uri { get; set; }
 
+    // Set on the faulting block's own thread and read by DurableLocalQueue on every enqueue (GH-5358)
+    private volatile bool _hasFaulted;
+
     /// <summary>CritterWatch#942 — set when the execution block faults terminally (jasperfx#506).</summary>
-    public bool HasFaulted { get; private set; }
+    public bool HasFaulted
+    {
+        get => _hasFaulted;
+        private set => _hasFaulted = value;
+    }
 
     public int QueueCount => (int)_receiver.Count;
 
@@ -948,7 +964,13 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
     /// batch that has not finished with them, or simply live and receiving? Used by another receiver at the same
     /// address before it hands that address's rows back. See <see cref="DurableReceiverRegistry" />.
     /// </summary>
-    internal bool HoldsWork => _receiver.Count > 0 || _custody.BatchMemberCount > 0 || (_activated && !_draining);
+    /// <remarks>
+    /// GH-5358. A faulted block's Count freezes at what it held when it faulted, and nothing will ever run those
+    /// envelopes, so it is no measure of work. Counted anyway, a replaced faulted receiver would read as holding
+    /// work for as long as it lived and turn every later blanket release at its address into a release by id.
+    /// </remarks>
+    internal bool HoldsWork => (!HasFaulted && _receiver.Count > 0) || _custody.BatchMemberCount > 0 ||
+                               (_activated && !_draining);
 
     /// <summary>
     /// Drained, and nothing left that another receiver needs to know about
@@ -1265,6 +1287,20 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
                 if (_deadLetterSender != null)
                 {
                     await _deadLetterSender.SendAsync(envelope).ConfigureAwait(false);
+                }
+                else if (envelope.DeadLetterFaults is { } faults)
+                {
+                    // GH-5554: the faults of a durable destination are written in the dead letter's transaction
+                    if (_inbox is IDeadLetterFaultStorage storage)
+                    {
+                        await storage.MoveToDeadLetterStorageAsync(envelope, envelope.Failure, faults)
+                            .ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        faults.AssertCanCommit();
+                        await _inbox.MoveToDeadLetterStorageAsync(envelope, envelope.Failure).ConfigureAwait(false);
+                    }
                 }
                 else
                 {

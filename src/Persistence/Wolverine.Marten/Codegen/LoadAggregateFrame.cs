@@ -1,79 +1,26 @@
-using System.Reflection;
 using JasperFx.CodeGeneration;
 using JasperFx.CodeGeneration.Frames;
 using JasperFx.CodeGeneration.Model;
 using JasperFx.Core.Reflection;
 using Marten;
 using JasperFx.Events;
-using Marten.Events;
 using Wolverine.Persistence.EventSourcing;
 using CoreConcurrencyStyle = Wolverine.Persistence.EventSourcing.ModelConcurrencyStyle;
 
 namespace Wolverine.Marten.Codegen;
 
-internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
+/// <summary>
+///     Marten's batchable variant of Wolverine core's aggregate load (GH-5141). The standalone path, in C# and F#,
+///     is core's; this adds only the enlistment in a Marten batched query that <see cref="MartenBatchingPolicy" />
+///     performs.
+/// </summary>
+internal class LoadAggregateFrame : Wolverine.Persistence.EventSourcing.Codegen.LoadAggregateFrame, IBatchableFrame
 {
-    private readonly AggregateLoadRequest _att;
-    private Variable? _session;
-    private Variable? _token;
     private Variable? _batchQuery;
     private Variable? _batchQueryItem;
-    private readonly Variable _identity;
-    private readonly Variable? _version;
-    private readonly Type _eventStreamType;
-    private readonly Variable _rawIdentity;
-    private readonly NaturalKeyArgument? _naturalKey;
 
-
-    public LoadAggregateFrame(AggregateLoadRequest att)
+    public LoadAggregateFrame(AggregateLoadRequest att) : base(att, typeof(IDocumentSession), "Marten")
     {
-        _att = att;
-        _identity = _att.AggregateId;
-
-        if (_att is { LoadStyle: CoreConcurrencyStyle.Optimistic, Version: not null })
-        {
-            _version = _att.Version;
-        }
-
-        _eventStreamType = typeof(IEventStream<>).MakeGenericType(_att.AggregateType);
-        Stream = new Variable(_eventStreamType, this);
-
-        _rawIdentity = _identity;
-        // For natural keys, keep the full natural key object (don't unwrap)
-        if (_att.IsNaturalKey)
-        {
-            _naturalKey = new NaturalKeyArgument(_identity);
-        }
-        else if (_rawIdentity.VariableType != typeof(Guid) && _rawIdentity.VariableType != typeof(string))
-        {
-            var valueType = ValueTypeInfo.ForType(_rawIdentity.VariableType);
-            _rawIdentity = new MemberAccessVariable(_identity, valueType.ValueProperty);
-        }
-    }
-
-    public Variable Stream { get; }
-    public bool IsNaturalKey => _att.IsNaturalKey;
-
-    /// <summary>
-    /// <c>FetchForWriting&lt;T, TNaturalKey&gt;</c>, or <c>FetchForExclusiveWriting&lt;T, TNaturalKey&gt;</c> for
-    /// an exclusive load. The same call on a session and on a batch query: both have the natural key overloads.
-    /// An optimistic load with a version passes it, as a stream id load does, so a stale version fails on load
-    /// instead of being ignored. Always by
-    /// <c>TKey</c>: a member that can be null is checked first, see <see cref="writeNullKeyCheck"/>.
-    /// </summary>
-    private string NaturalKeyFetchForWriting(string targetUsage, string? cancellationTokenUsage = null)
-    {
-        var aggType = _att.AggregateType.FullNameInCode();
-        var nkType = _naturalKey!.KeyType.FullNameInCode();
-        var args = _version != null ? $"{_naturalKey.Usage}, {_version.Usage}" : _naturalKey.Usage;
-        if (cancellationTokenUsage != null)
-        {
-            args += $", {cancellationTokenUsage}";
-        }
-        var method = _att.LoadStyle == CoreConcurrencyStyle.Exclusive
-            ? "FetchForExclusiveWriting"
-            : "FetchForWriting";
-        return $"{targetUsage}.Events.{method}<{aggType}, {nkType}>({args})";
     }
 
     public void WriteCodeToEnlistInBatchQuery(GeneratedMethod method, ISourceWriter writer)
@@ -83,7 +30,7 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
         if (_att.IsNaturalKey)
         {
             writeNullKeyCheck(writer);
-            writer.WriteLine($"var {_batchQueryItem!.Usage} = {NaturalKeyFetchForWriting(_batchQuery!.Usage)};");
+            writer.WriteLine($"var {_batchQueryItem!.Usage} = {naturalKeyFetchForWriting(_batchQuery!.Usage)};");
             return;
         }
 
@@ -110,14 +57,10 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
 
     public override IEnumerable<Variable> FindVariables(IMethodVariables chain)
     {
-        yield return _identity;
-        if (_version != null) yield return _version;
-
-        _session = chain.FindVariable(typeof(IDocumentSession));
-        yield return _session;
-
-        _token = chain.FindVariable(typeof(CancellationToken));
-        yield return _token;
+        foreach (var variable in base.FindVariables(chain))
+        {
+            yield return variable;
+        }
 
         if (_batchQuery != null)
         {
@@ -141,14 +84,11 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
     {
         if (_batchQueryItem == null) return;
 
-        writer.WriteComment("Loading Marten aggregate as part of the aggregate handler workflow");
+        writer.WriteComment(Comment);
         writer.Write(
             $"var {Stream.Usage} = await {_batchQueryItem.Usage}.ConfigureAwait(false);");
 
-        if (_att.AlwaysEnforceConsistency)
-        {
-            writer.WriteLine($"{Stream.Usage}.{nameof(IEventStream<string>.AlwaysEnforceConsistency)} = true;");
-        }
+        writeConsistency(writer);
 
         BatchResolutionGenerated = true;
     }
@@ -162,62 +102,19 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
             return;
         }
 
-        writer.WriteComment("Loading Marten aggregate as part of the aggregate handler workflow");
         if (_batchQueryItem == null)
         {
-            if (_att.IsNaturalKey)
-            {
-                writeNullKeyCheck(writer);
-                writer.WriteLine($"var {Stream.Usage} = await {NaturalKeyFetchForWriting(_session!.Usage, _token!.Usage)};");
-            }
-            else if (_att.LoadStyle == CoreConcurrencyStyle.Exclusive)
-            {
-                writer.WriteLine($"var {Stream.Usage} = await {_session!.Usage}.Events.FetchForExclusiveWriting<{_att.AggregateType.FullNameInCode()}>({_rawIdentity.Usage}, {_token!.Usage});");
-            }
-            else if (_version == null)
-            {
-                writer.WriteLine($"var {Stream.Usage} = await {_session!.Usage}.Events.FetchForWriting<{_att.AggregateType.FullNameInCode()}>({_rawIdentity.Usage}, {_token!.Usage});");
-            }
-            else
-            {
-                writer.WriteLine($"var {Stream.Usage} = await {_session!.Usage}.Events.FetchForWriting<{_att.AggregateType.FullNameInCode()}>({_rawIdentity.Usage}, {_version.Usage}, {_token!.Usage});");
-            }
-        }
-        else
-        {
-            writer.Write(
-                $"var {Stream.Usage} = await {_batchQueryItem.Usage}.ConfigureAwait(false);");
+            base.GenerateCode(method, writer);
+            return;
         }
 
-        if (_att.AlwaysEnforceConsistency)
-        {
-            writer.WriteLine($"{Stream.Usage}.{nameof(IEventStream<string>.AlwaysEnforceConsistency)} = true;");
-        }
+        writer.WriteComment(Comment);
+        writer.Write(
+            $"var {Stream.Usage} = await {_batchQueryItem.Usage}.ConfigureAwait(false);");
+
+        writeConsistency(writer);
 
         Next?.GenerateCode(method, writer);
-    }
-
-    /// <summary>
-    /// A null key is refused the way Marten refuses a null string stream id: there is no aggregate to load,
-    /// and no key for a new stream to claim.
-    /// </summary>
-    private void writeNullKeyCheck(ISourceWriter writer)
-    {
-        if (_naturalKey!.CanBeNull)
-        {
-            writer.WriteLine(_naturalKey.ThrowIfNull(_att.AggregateType));
-        }
-    }
-
-    private string NaturalKeyFetchForWritingFSharp(string targetUsage, string cancellationTokenUsage)
-    {
-        var aggType = _att.AggregateType.FSharpName();
-        var nkType = _naturalKey!.KeyType.FSharpName();
-        var method = _att.LoadStyle == CoreConcurrencyStyle.Exclusive
-            ? "FetchForExclusiveWriting"
-            : "FetchForWriting";
-        var version = _version != null ? $", {_version.FSharpUsage}" : "";
-        return $"{targetUsage}.Events.{method}<{aggType}, {nkType}>({_naturalKey.FSharpUsage}{version}, {cancellationTokenUsage})";
     }
 
     public override void GenerateFSharpCode(GeneratedMethod method, ISourceWriter writer)
@@ -228,41 +125,16 @@ internal class LoadAggregateFrame : AsyncFrame,  IBatchableFrame
             return;
         }
 
-        writer.WriteComment("Loading Marten aggregate as part of the aggregate handler workflow");
         if (_batchQueryItem == null)
         {
-            // `var x = await ...` -> F# `let! x = ...` inside the task { } CE (drop ConfigureAwait).
-            if (_att.IsNaturalKey)
-            {
-                if (_naturalKey!.CanBeNull)
-                {
-                    writer.WriteLine(_naturalKey.FSharpThrowIfNull(_att.AggregateType));
-                }
-
-                writer.WriteLine($"let! {Stream.Usage} = {NaturalKeyFetchForWritingFSharp(_session!.FSharpUsage, _token!.FSharpUsage)}");
-            }
-            else if (_att.LoadStyle == CoreConcurrencyStyle.Exclusive)
-            {
-                writer.WriteLine($"let! {Stream.Usage} = {_session!.FSharpUsage}.Events.FetchForExclusiveWriting<{_att.AggregateType.FSharpName()}>({_rawIdentity.FSharpUsage}, {_token!.FSharpUsage})");
-            }
-            else if (_version == null)
-            {
-                writer.WriteLine($"let! {Stream.Usage} = {_session!.FSharpUsage}.Events.FetchForWriting<{_att.AggregateType.FSharpName()}>({_rawIdentity.FSharpUsage}, {_token!.FSharpUsage})");
-            }
-            else
-            {
-                writer.WriteLine($"let! {Stream.Usage} = {_session!.FSharpUsage}.Events.FetchForWriting<{_att.AggregateType.FSharpName()}>({_rawIdentity.FSharpUsage}, {_version.FSharpUsage}, {_token!.FSharpUsage})");
-            }
-        }
-        else
-        {
-            writer.WriteLine($"let! {Stream.Usage} = {_batchQueryItem.FSharpUsage}");
+            base.GenerateFSharpCode(method, writer);
+            return;
         }
 
-        if (_att.AlwaysEnforceConsistency)
-        {
-            writer.WriteLine($"{Stream.Usage}.{nameof(IEventStream<string>.AlwaysEnforceConsistency)} <- true");
-        }
+        writer.WriteComment(Comment);
+        writer.WriteLine($"let! {Stream.Usage} = {_batchQueryItem.FSharpUsage}");
+
+        writeFSharpConsistency(writer);
 
         Next?.GenerateFSharpCode(method, writer);
     }

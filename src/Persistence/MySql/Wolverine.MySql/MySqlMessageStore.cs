@@ -133,6 +133,18 @@ internal partial class MySqlMessageStore : MessageDatabase<MySqlConnection>, ISa
         }
     }
 
+    /// <summary>
+    /// GH-5428. Bound the handled-envelope reap, as PostgreSQL, SQL Server and SQLite already do, so each
+    /// statement holds its locks briefly instead of the whole expired range at once. The
+    /// idx_wolverine_incoming_envelopes_keep_until index keeps it from locking rows it will not delete.
+    /// </summary>
+    public override string? BatchedDeleteExpiredHandledEnvelopesSql(int batchSize)
+    {
+        return
+            $"delete from {SchemaName}.{DatabaseConstants.IncomingTable} " +
+            $"where {DatabaseConstants.Status} = '{EnvelopeStatus.Handled}' and {DatabaseConstants.KeepUntil} <= @now limit {batchSize};";
+    }
+
     /// <summary>GH-4742. A bounded reap: response bodies make one unbounded delete a long lock.</summary>
     public override string? BatchedDeleteExpiredDeduplicatedResponsesSql(int batchSize)
     {
@@ -536,6 +548,8 @@ internal partial class MySqlMessageStore : MessageDatabase<MySqlConnection>, ISa
         {
             Engine = "MySQL",
             ServerName = builder.Server ?? string.Empty,
+            // GH-5435: lets two tenant databases with one name on one host be told apart by port
+            Port = (int)builder.Port,
             DatabaseName = builder.Database ?? string.Empty,
             Subject = GetType().FullNameInCode(),
             SubjectUri = SubjectUri,
@@ -568,6 +582,13 @@ internal partial class MySqlMessageStore : MessageDatabase<MySqlConnection>, ISa
         yield return new IncomingEnvelopeTable(Durability, SchemaName);
         yield return new DeadLettersTable(Durability, SchemaName);
         yield return new DeadLetterHistoryTable(SchemaName);
+
+        // GH-5665. Every store role, since a saga's history is written to the store its saga's transaction is in, but
+        // only once some saga records its history
+        if (Durability.ProvisionsSagaHistory)
+        {
+            yield return new SagaHistoryTable(SchemaName);
+        }
 
         // GH-4180. Every store role, not just Main -- see the PostgreSQL twin.
         // GH-4757: exactly one of the two, never both. The hash mode's key is a binary column, which
@@ -618,10 +639,10 @@ internal partial class MySqlMessageStore : MessageDatabase<MySqlConnection>, ISa
             nodeTable.AddColumn<string>("version");
             nodeTable.AddColumn("capabilities", "TEXT").AllowNulls();
 
-            // GH-4593, mirroring the PostgreSQL gate from GH-3959: provisioned only behind the opt-in so
-            // an upgrade migrates nothing, and MySqlNodePersistence gates every statement naming it on the
-            // same flag. Plain DOUBLE with no modifiers in the type string, per GH-3983.
-            if (Durability.CapacityAwareAssignment)
+            // GH-4593, mirroring the PostgreSQL gate from GH-3959: always provisioned since 7.0 (GH-5193) unless
+            // AlwaysProvisionOptionalSchemaObjects is off, and MySqlNodePersistence gates every statement naming it on
+            // CapacityAwareAssignment, so the behaviour stays opt-in. Plain DOUBLE with no modifiers in the type string, per GH-3983.
+            if (Durability.ProvisionsNodeLoadFactor)
             {
                 nodeTable.AddColumn(DatabaseConstants.LoadFactor, "DOUBLE").AllowNulls();
             }
@@ -662,7 +683,11 @@ internal partial class MySqlMessageStore : MessageDatabase<MySqlConnection>, ISa
             eventTable.AddColumn<int>("id").AsPrimaryKey().AutoIncrement();
             eventTable.AddColumn<int>("node_number").NotNull();
             eventTable.AddColumn("event_name", "varchar(500)").NotNull();
-            eventTable.AddColumn<DateTimeOffset>("timestamp").DefaultValueByExpression("(UTC_TIMESTAMP(6))").NotNull();
+            // GH-5498: the age sweep filters on timestamp. Without this index it was a full scan that
+            // next-key locked every row in the table under REPEATABLE READ and deadlocked with the row trim.
+            // It has to live here: an index added outside Wolverine is dropped by the next migration.
+            eventTable.AddColumn<DateTimeOffset>("timestamp").DefaultValueByExpression("(UTC_TIMESTAMP(6))").NotNull()
+                .AddIndex();
             eventTable.AddColumn("description", $"varchar({NodeRecord.DescriptionLength})").AllowNulls();
             yield return eventTable;
 

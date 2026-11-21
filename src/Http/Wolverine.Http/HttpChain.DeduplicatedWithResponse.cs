@@ -3,6 +3,7 @@ using JasperFx;
 using JasperFx.CodeGeneration;
 using JasperFx.CodeGeneration.Frames;
 using JasperFx.CodeGeneration.Model;
+using JasperFx.Core.Reflection;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
@@ -27,15 +28,39 @@ public partial class HttpChain
         DeduplicationScope.Tenant | DeduplicationScope.User | DeduplicationScope.Endpoint;
 
     /// <summary>
-    /// Refuses a defect in the endpoint's own declaration, which every host that discovers it shares, and
-    /// registers the refusal codes before the metadata is built.
+    /// Refuses a defect in the endpoint's own declaration, which every host that discovers it shares. Called from
+    /// the constructor, once the attributes have been applied.
     /// </summary>
     private void validateDeduplicatedWithResponse()
     {
         if (DeduplicatedWithResponse is not { } requirement) return;
 
+        // GH-5617. [DeduplicatedWithResponse] with no scope takes it from WolverineHttpOptions.DeduplicateWithResponse(),
+        // which runs later as a policy. Validated in FinalizeDeduplicatedWithResponse() instead
+        if (requirement.InheritsScope) return;
+
         assertDeduplicatedWithResponseIsValid(requirement);
         _validatedDeduplicatedWithResponse = requirement;
+    }
+
+    private DeduplicatedWithResponseRequirement? _validatedDeduplicatedWithResponse;
+    private bool _producesMissingKey;
+    private bool _producesRefusals;
+
+    /// <summary>
+    /// After the policies, before the endpoint is built: validate a requirement a policy set or completed, at
+    /// startup like one from the attribute, and register the refusal codes. A policy may change whether a key is
+    /// required, so the codes wait until here.
+    /// </summary>
+    internal void FinalizeDeduplicatedWithResponse()
+    {
+        if (DeduplicatedWithResponse is not { } requirement) return;
+
+        if (!ReferenceEquals(requirement, _validatedDeduplicatedWithResponse))
+        {
+            assertDeduplicatedWithResponseIsValid(requirement);
+            _validatedDeduplicatedWithResponse = requirement;
+        }
 
         if (requirement.Required && !_producesMissingKey)
         {
@@ -51,24 +76,37 @@ public partial class HttpChain
         }
     }
 
-    private DeduplicatedWithResponseRequirement? _validatedDeduplicatedWithResponse;
-    private bool _producesMissingKey;
-    private bool _producesRefusals;
-
     /// <summary>
-    /// After the policies, before the endpoint is built: validate and describe a requirement a policy set, at
-    /// startup like one from the attribute.
+    /// GH-5617. Whether <c>[DeduplicatedWithResponse]</c> could apply to this endpoint as it is shaped: it returns a
+    /// resource written as JSON or a replayable <see cref="IResult" />, and has no <c>[Deduplicated]</c>.
+    /// <see cref="WolverineHttpOptions.DeduplicateWithResponse" /> skips the endpoints where it could not, rather than
+    /// failing startup. A custom <see cref="Resources.IResourceWriterPolicy" /> is not seen here, and is still refused
+    /// when the endpoint is compiled.
     /// </summary>
-    internal void FinalizeDeduplicatedWithResponse()
+    internal bool CanDeduplicateWithResponse()
     {
-        if (!ReferenceEquals(DeduplicatedWithResponse, _validatedDeduplicatedWithResponse))
-        {
-            validateDeduplicatedWithResponse();
-        }
+        if (Deduplication != null || !HasResourceType()) return false;
+
+        if (typeof(IResult).IsAssignableFrom(ResourceType)) return HttpHandler.CanReplayResultOf(ResourceType!);
+
+        // Written as text, as a bare status code, or by the handler's own WriteResponse methods, never as JSON
+        if (ResourceType == typeof(string) || ResourceType == typeof(int)) return false;
+        return ContentNegotiation.ContentNegotiationWriterPolicy.DiscoverWriteMethods(Method.HandlerType).Count == 0;
     }
+
+    /// <summary>GH-5617. Marked <see cref="DisableDeduplicatedWithResponseAttribute" />, on the method or its class.</summary>
+    internal bool OptsOutOfDeduplicatedWithResponse()
+        => Method.Method.HasAttribute<DisableDeduplicatedWithResponseAttribute>() ||
+           Method.HandlerType.HasAttribute<DisableDeduplicatedWithResponseAttribute>();
 
     private void assertDeduplicatedWithResponseIsValid(DeduplicatedWithResponseRequirement requirement)
     {
+        if (requirement.InheritsScope)
+        {
+            throw new InvalidOperationException(
+                $"[DeduplicatedWithResponse] on {Description} needs a {nameof(DeduplicationScope)}: it names none, and no WolverineHttpOptions.DeduplicateWithResponse() call covers this endpoint to give it one. Pass a scope to the attribute, or widen that call's filter. See GH-5617");
+        }
+
         if (requirement.Scope == DeduplicationScope.None)
         {
             throw new InvalidOperationException(
@@ -94,15 +132,10 @@ public partial class HttpChain
                 $"[DeduplicatedWithResponse] on {Description} returns no resource, so a repeat has no response to replay. Use [Deduplicated] instead. See GH-4742");
         }
 
-        if (BindsFormValues)
+        if (typeof(IResult).IsAssignableFrom(ResourceType) && !HttpHandler.CanReplayResultOf(ResourceType!))
         {
-            // The fingerprint reads the body after binding, which needs a rewindable stream --
-            // EnableRequestBufferingFrame, at Middleware[0]. A form value's creator frame is never IN
-            // Middleware (HttpChain.BindsFormValues says why), so the arranger hoists the form read ahead of
-            // the buffering and ComputeDeduplicationFingerprintAsync then fails its !Body.CanSeek guard on
-            // EVERY request. Refuse while the chain is being built rather than 500 at runtime.
             throw new NotSupportedException(
-                $"[DeduplicatedWithResponse] on {Description} binds a form value, and form-encoded requests are not supported by this attribute: the request fingerprint needs to re-read the body after binding, and the form read consumes it first. Take a JSON body instead, or use [Deduplicated], which does not fingerprint the request. See GH-4742");
+                $"{Description} has [DeduplicatedWithResponse], which replays the response as its status, System.Text.Json body and Location, but this endpoint returns {ResourceType!.FullNameInCode()}, which writes its response another way. Return Ok, Created, Accepted, NoContent, StatusCode or Empty results, or a resource written as JSON. See GH-4742");
         }
     }
 
@@ -178,7 +211,7 @@ public partial class HttpChain
         var flush = Postprocessors.FindIndex(x => x is FlushOutgoingMessages or IFlushesMessages);
         Postprocessors.Insert(flush < 0 ? Postprocessors.Count : flush,
             new RecordDeduplicatedResponseFrame(scoped.Variable, claim.ClaimToken, ResourceVariable ?? Method.Creates.First(),
-                MissingResponseBodyStatusCode, AncillaryStoreType));
+                MissingResponseBodyStatusCode, requirement.StoreBody, AncillaryStoreType));
     }
 
     /// <summary>
@@ -197,21 +230,21 @@ public partial class HttpChain
         if (rules.GetPersistenceProviders(this, container) is not ITransactionalReplayableDeduplicationProvider
             provider)
         {
-            warnClaimInTransactionFallsBack(container, asked,
+            reportClaimInTransactionFallsBack(container, asked,
                 "its persistence cannot write the claim inside its transaction; only Marten can today");
             return false;
         }
 
         var resource = ResourceVariable ?? Method.Creates.First();
         var prepare = new PrepareDeduplicatedResponseClaimFrame(scoped, fingerprint, resource,
-            MissingResponseBodyStatusCode, requirement.Window);
+            MissingResponseBodyStatusCode, requirement.StoreBody, requirement.Window);
         var storageId = new DeduplicationStorageIdFrame(scoped);
 
         // As [Deduplicated] on Marten: the lookup may join a batch only when the key is required
         if (!provider.TryBuildTransactionalReplayableDeduplication(this, storageId.Variable, requirement.Required,
                 prepare.Variable, container, out var transactional))
         {
-            warnClaimInTransactionFallsBack(container, asked,
+            reportClaimInTransactionFallsBack(container, asked,
                 "it does not commit through Wolverine's Marten transactional middleware on a single-database store with the PostgreSQL message store in the same database");
             return false;
         }
@@ -223,7 +256,7 @@ public partial class HttpChain
         // commit would pull that read ahead of the commit, and answer with the aggregate before this request's events
         if (resource.Creator != null && Postprocessors.IndexOf(resource.Creator) > commit)
         {
-            warnClaimInTransactionFallsBack(container, asked,
+            reportClaimInTransactionFallsBack(container, asked,
                 "its response is only produced after the commit (UpdatedAggregate, say), and the claim has to be written before it");
             return false;
         }
@@ -258,11 +291,21 @@ public partial class HttpChain
         typeof(HttpHandler).GetMethod(nameof(HttpHandler.MarkDeduplicatedDatabaseCommitted))!;
 
     /// <param name="asked">
-    /// The endpoint asked for it itself. One that only inherited <see cref="WolverineHttpOptions.DefaultClaimInTransaction" />
-    /// is logged at debug level: a global default is expected to miss endpoints on other stores.
+    /// The endpoint asked for it itself. When the fallback is logged rather than refused, one that only inherited
+    /// <see cref="WolverineHttpOptions.DefaultClaimInTransaction" /> is logged at debug level: a global default is
+    /// expected to miss endpoints on other stores.
     /// </param>
-    private void warnClaimInTransactionFallsBack(IServiceContainer container, bool asked, string reason)
+    private void reportClaimInTransactionFallsBack(IServiceContainer container, bool asked, string reason)
     {
+        var endpoint = RoutePattern?.RawText ?? Description;
+
+        if (_parent.ThrowWhenClaimInTransactionFallsBack)
+        {
+            throw new InvalidOperationException(asked
+                ? $"[DeduplicatedWithResponse(ClaimInTransaction = true)] on {endpoint} cannot claim inside its transaction, because {reason}. WolverineHttpOptions.ThrowWhenClaimInTransactionFallsBack refuses the claim-and-release fallback. See GH-5160"
+                : $"[DeduplicatedWithResponse] on {endpoint} cannot claim inside its transaction despite WolverineHttpOptions.DefaultClaimInTransaction, because {reason}. WolverineHttpOptions.ThrowWhenClaimInTransactionFallsBack refuses the claim-and-release fallback. See GH-5160");
+        }
+
         try
         {
             var logger = container.GetInstance<ILogger<HttpGraph>>();
@@ -270,13 +313,13 @@ public partial class HttpChain
             {
                 logger.LogWarning(
                     "[DeduplicatedWithResponse(ClaimInTransaction = true)] on {Endpoint} keeps claim-and-release, because {Reason}. See GH-5160",
-                    RoutePattern?.RawText ?? Description, reason);
+                    endpoint, reason);
             }
             else
             {
                 logger.LogDebug(
                     "[DeduplicatedWithResponse] on {Endpoint} keeps claim-and-release despite WolverineHttpOptions.DefaultClaimInTransaction, because {Reason}. See GH-5160",
-                    RoutePattern?.RawText ?? Description, reason);
+                    endpoint, reason);
             }
         }
         catch (Exception)
@@ -288,8 +331,11 @@ public partial class HttpChain
     /// <summary>Called from DetermineFrames once the response writer is chosen.</summary>
     private void assertDeduplicatedWithResponseIsJson()
     {
-        // The stored body is System.Text.Json; any other writer would replay different bytes.
-        if (DeduplicatedWithResponse != null && !Postprocessors.OfType<WriteJsonFrame>().Any())
+        // The stored body is System.Text.Json; any other writer would replay different bytes. An IResult counts only
+        // when ResultWriterPolicy wrote it: a custom IResourceWriterPolicy runs first and may write it another way.
+        if (DeduplicatedWithResponse != null && !Postprocessors.OfType<WriteJsonFrame>().Any() &&
+            !Postprocessors.OfType<MethodCall>().Any(x =>
+                x.Method.DeclaringType == typeof(IResult) && x.Method.Name == nameof(IResult.ExecuteAsync)))
         {
             throw new NotSupportedException(
                 $"{Description} has [DeduplicatedWithResponse], which replays the response as System.Text.Json, but this endpoint writes its response another way. See GH-4742");
@@ -302,9 +348,17 @@ public partial class HttpChain
     /// </summary>
     private void bufferRequestForDeduplicatedWithResponse()
     {
-        if (DeduplicatedWithResponse != null && !Middleware.OfType<EnableRequestBufferingFrame>().Any())
+        if (DeduplicatedWithResponse == null) return;
+
+        var buffering = Middleware.OfType<EnableRequestBufferingFrame>().FirstOrDefault();
+        if (buffering == null)
         {
-            Middleware.Insert(0, new EnableRequestBufferingFrame());
+            buffering = new EnableRequestBufferingFrame();
+            Middleware.Insert(0, buffering);
         }
+
+        // A form value's read is hoisted ahead of the middleware, and would consume the body before it is
+        // buffered. Ordered whether this call inserted the buffering or found it already in place
+        ReadFormCollection.MustFollow(buffering);
     }
 }

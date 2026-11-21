@@ -220,6 +220,87 @@ public class openapi_shape_tests : IClassFixture<OpenApiShapeFixture>
     }
 
     [Fact]
+    public void complex_query_string_property_annotations_describe_the_flattened_parameters()
+    {
+        var name = parameterFor("/shapes/complex-query-annotated", "get", "Name");
+        name.GetProperty("required").GetBoolean().ShouldBeTrue();
+        name.GetProperty("description").GetString().ShouldBe("The name to search for");
+        name.GetProperty("schema").GetProperty("minLength").GetInt32().ShouldBe(5);
+        name.GetProperty("schema").GetProperty("maxLength").GetInt32().ShouldBe(255);
+
+        var pageNumber = parameterFor("/shapes/complex-query-annotated", "get", "PageNumber");
+        (pageNumber.TryGetProperty("required", out var required) && required.GetBoolean()).ShouldBeFalse();
+        pageNumber.GetProperty("schema").GetProperty("minimum").GetRawText().ShouldBe("1");
+        pageNumber.GetProperty("schema").GetProperty("default").GetInt32().ShouldBe(1);
+    }
+
+    [Fact]
+    public void complex_query_string_constructor_parameter_annotations_describe_the_flattened_parameters()
+    {
+        var code = parameterFor("/shapes/complex-query-annotated-record", "get", "Code");
+        code.GetProperty("required").GetBoolean().ShouldBeTrue();
+        code.GetProperty("schema").GetProperty("maxLength").GetInt32().ShouldBe(10);
+
+        var limit = parameterFor("/shapes/complex-query-annotated-record", "get", "Limit");
+        limit.GetProperty("schema").GetProperty("minimum").GetRawText().ShouldBe("1");
+        limit.GetProperty("schema").GetProperty("maximum").GetRawText().ShouldBe("100");
+    }
+
+    [Fact]
+    public void query_parameter_annotations_and_declared_default_describe_the_parameter()
+    {
+        var code = parameterFor("/shapes/query-annotated", "get", "code");
+        code.GetProperty("required").GetBoolean().ShouldBeTrue();
+        code.GetProperty("schema").GetProperty("maxLength").GetInt32().ShouldBe(10);
+
+        var limit = parameterFor("/shapes/query-annotated", "get", "limit");
+        limit.GetProperty("schema").GetProperty("default").GetInt32().ShouldBe(100);
+    }
+
+    [Fact]
+    public void as_parameters_query_member_annotations_describe_the_parameters()
+    {
+        var code = parameterFor("/shapes/asparameters-annotated", "get", "Code");
+        code.GetProperty("required").GetBoolean().ShouldBeTrue();
+        code.GetProperty("schema").GetProperty("maxLength").GetInt32().ShouldBe(10);
+
+        var limit = parameterFor("/shapes/asparameters-annotated", "get", "Limit");
+        limit.GetProperty("schema").GetProperty("maximum").GetRawText().ShouldBe("100");
+    }
+
+    [Fact]
+    public void header_parameter_annotations_describe_the_parameter()
+    {
+        var tenant = parameterFor("/shapes/header-annotated", "get", "x-tenant");
+        tenant.GetProperty("required").GetBoolean().ShouldBeTrue();
+        tenant.GetProperty("description").GetString().ShouldBe("The tenant");
+    }
+
+    [Fact]
+    public void as_parameters_header_member_annotations_describe_the_parameter()
+    {
+        var code = parameterFor("/shapes/asparameters-header-annotated", "get", "x-code");
+        code.GetProperty("required").GetBoolean().ShouldBeTrue();
+        code.GetProperty("schema").GetProperty("maxLength").GetInt32().ShouldBe(10);
+    }
+
+    [Fact]
+    public void form_parameter_annotations_describe_the_parameter()
+    {
+        var (properties, required) = formSchemaFor("/shapes/form-annotated");
+        properties.GetProperty("name").GetProperty("maxLength").GetInt32().ShouldBe(100);
+        required.ShouldContain("name");
+    }
+
+    [Fact]
+    public void form_type_property_annotations_describe_the_parameters()
+    {
+        var (properties, required) = formSchemaFor("/shapes/form-type-annotated");
+        properties.GetProperty("Title").GetProperty("maxLength").GetInt32().ShouldBe(20);
+        required.ShouldContain("Title");
+    }
+
+    [Fact]
     public void as_parameters_route_and_query_members()
     {
         ParametersFor("/shapes/asparameters/orders/{orderId}", "get")
@@ -379,9 +460,11 @@ public class openapi_shape_tests : IClassFixture<OpenApiShapeFixture>
             string? type = null;
             string? format = null;
 
-            if (x.TryGetProperty("schema", out var schema))
+            if (x.TryGetProperty("schema", out var rawSchema))
             {
-                type = schema.TryGetProperty("type", out var t) ? t.GetString() : null;
+                // Microsoft.AspNetCore.OpenApi 10 moves an enum parameter's schema into components and refers to it
+                var schema = resolveSchema(rawSchema);
+                type = schema.TryGetProperty("type", out var t) ? typeName(t) : null;
                 format = schema.TryGetProperty("format", out var f) ? f.GetString() : null;
             }
 
@@ -390,6 +473,53 @@ public class openapi_shape_tests : IClassFixture<OpenApiShapeFixture>
             return new ParameterShape(x.GetProperty("name").GetString()!, x.GetProperty("in").GetString()!,
                 required, type, format);
         }).ToList();
+    }
+
+    /// <summary>
+    /// The schema's <c>type</c> keyword as one JSON Schema type name. Microsoft.AspNetCore.OpenApi 10 writes
+    /// OpenAPI 3.1, where <c>type</c> may be an array: a nullable value adds "null", and a number that
+    /// System.Text.Json will also read from a string adds "string" beside "integer" or "number". Neither
+    /// changes what the parameter is, so both are left out here.
+    /// </summary>
+    private static string? typeName(JsonElement type)
+    {
+        if (type.ValueKind != JsonValueKind.Array)
+        {
+            return type.GetString();
+        }
+
+        var names = type.EnumerateArray().Select(x => x.GetString()!).Where(x => x != "null").ToList();
+        if (names.Count > 1)
+        {
+            names.Remove("string");
+        }
+
+        return names.FirstOrDefault();
+    }
+
+    private (JsonElement Properties, List<string> Required) formSchemaFor(string path)
+    {
+        var content = operationFor(path, "post").GetProperty("requestBody").GetProperty("content");
+        var media = content.EnumerateObject().First(x => x.Name.Contains("form")).Value;
+        var schema = resolveSchema(media.GetProperty("schema"));
+
+        var required = schema.TryGetProperty("required", out var r)
+            ? r.EnumerateArray().Select(x => x.GetString()!).ToList()
+            : [];
+
+        return (schema.GetProperty("properties"), required);
+    }
+
+    private JsonElement parameterFor(string path, string httpMethod, string name)
+    {
+        var parameters = operationFor(path, httpMethod).GetProperty("parameters").EnumerateArray().ToList();
+
+        var parameter = parameters.FirstOrDefault(x => x.GetProperty("name").GetString() == name);
+        parameter.ValueKind.ShouldBe(JsonValueKind.Object,
+            $"No parameter '{name}' on {httpMethod} {path}. Known: " +
+            string.Join(", ", parameters.Select(x => x.GetProperty("name").GetString())));
+
+        return parameter;
     }
 
     public bool HasRequestBody(string path, string httpMethod)

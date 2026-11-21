@@ -5,7 +5,10 @@ using JasperFx.CodeGeneration;
 using JasperFx.CodeGeneration.Frames;
 using JasperFx.CodeGeneration.Model;
 using JasperFx.CodeGeneration.Services;
+using Marten;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Wolverine.Marten;
 using Wolverine.Http.CodeGen;
 using Wolverine.Http.FSharpContracts;
 using Wolverine.Http.Runtime;
@@ -24,6 +27,21 @@ namespace Wolverine.Http.FSharpTests;
 public static class HttpFSharpCodegenSample
 {
     public static string GenerateCode()
+    {
+        return generate(CodegenLanguage.fsharp);
+    }
+
+    /// <summary>
+    ///     GH-5644. The same endpoints and registry rendered as C#, so a test can show the registry really was
+    ///     assembled as <c>codegen write</c> assembles it: the C# output carries the rooting block that the F#
+    ///     output leaves out.
+    /// </summary>
+    public static string GenerateCSharpCode()
+    {
+        return generate(CodegenLanguage.csharp);
+    }
+
+    private static string generate(CodegenLanguage language)
     {
         // No-host container setup mirroring Wolverine.Http.Tests.initializing_endpoints_from_method_call.
         var registry = new ServiceCollection();
@@ -75,6 +93,10 @@ public static class HttpFSharpCodegenSample
         // ReleaseUnansweredDeduplicatedResponseFrame and RecordDeduplicatedResponseFrame.
         var dedupChain   = HttpChain.ChainFor<ThingEndpoints>(x => x.Deduplicated(null!), httpGraph);
 
+        // The same frames with StoreBody off, which adds the storeBody argument to the record of the response
+        var dedupWithoutBodyChain =
+            HttpChain.ChainFor<ThingEndpoints>(x => x.DeduplicatedWithoutBody(null!), httpGraph);
+
         // GH-4978: a single-value wrapper (record struct ThingId(Guid Value)) bound from a route value and
         // one around a string (ThingCode) bound from the query string
         var thingIdChain   = HttpChain.ChainFor<ThingEndpoints>(x => x.GetByThingId(default), httpGraph);
@@ -92,7 +114,7 @@ public static class HttpFSharpCodegenSample
         {
             helloChain, createChain, getByIdChain, searchChain, getItemsChain,
             pagedChain, resultChain, deleteChain, publishChain, filterChain, uploadChain, dedupChain,
-            thingIdChain, thingCodeChain, authedChain
+            dedupWithoutBodyChain, thingIdChain, thingCodeChain, authedChain
         };
 
         // TagHttpHandlerFrame.GenerateFSharpCode — applied to all chains via TagHttpHandlerPolicy.
@@ -105,20 +127,91 @@ public static class HttpFSharpCodegenSample
         tenantDetection.IsRequestHeaderValue("x-tenant-id");
         ((IHttpPolicy)tenantDetection).Apply(chains, httpGraph.Rules, container);
 
+        // GH-5644. The target language goes on the assembly BEFORE anything is assembled into it, exactly as
+        // `codegen write --language fsharp` does it. AddAotRoots reads it to leave the C#-only Native AOT
+        // rooting block out of F#; an assembly left on the C# default and then rendered as F# carries a block
+        // that does not compile.
         var generatedAssembly = httpGraph.StartAssembly(httpGraph.Rules);
+        generatedAssembly.TargetLanguage = language;
+
         foreach (var chain in chains)
         {
             ((ICodeFile)chain).AssembleTypes(generatedAssembly);
         }
 
         // WriteEndpointTypesFrame.GenerateFSharpCode — emitted by HttpEndpointRegistryCodeFile as
-        // the body of GeneratedHttpEndpointRegistry.EndpointTypes().
+        // the body of GeneratedHttpEndpointRegistry.EndpointTypes(). Built the way HttpGraph.BuildFiles builds
+        // it, generated endpoint type names included, and assembled as `codegen write` assembles it. That is
+        // per instance (AsCodegenCommand) rather than through the process-wide
+        // DynamicCodeBuilder.WithinCodegenCommand, which would leak into the tests running beside this one.
         var allEndpointTypes = new[] { typeof(ThingEndpoints), typeof(AuthedEndpoints) };
-        var registryFile = new HttpEndpointRegistryCodeFile(allEndpointTypes);
+        var registryFile = new HttpEndpointRegistryCodeFile(allEndpointTypes,
+            generatedEndpointTypeNames: chains.Select(x => ((ICodeFile)x).FileName))
+        {
+            AsCodegenCommand = true
+        };
         ((ICodeFile)registryFile).AssembleTypes(generatedAssembly);
 
         var serviceVariableSource = new ServiceCollectionServerVariableSource(container);
-        return generatedAssembly.GenerateFSharpCode(serviceVariableSource);
+        return language == CodegenLanguage.fsharp
+            ? generatedAssembly.GenerateFSharpCode(serviceVariableSource)
+            : generatedAssembly.GenerateCode(serviceVariableSource);
+    }
+
+    // Codegen never opens a connection; the string only has to be well-formed for AddMarten bootstrap
+    private const string MartenConnectionString =
+        "Host=localhost;Port=5433;Database=postgres;Username=postgres;password=postgres";
+
+    /// <summary>
+    ///     GH-5401. Renders the <c>[WaitForProjection&lt;T&gt;]</c> endpoints in <see cref="ReadYourWritesEndpoints" />
+    ///     as F#. The attribute needs a document store integrated with Wolverine, which the no-host container above
+    ///     does not have, so these chains come from a host with Marten that is built but never started (no database,
+    ///     no Roslyn). Exercises both read-your-writes frames in their HTTP form: the request token read before the
+    ///     endpoint, and the wait after the commit that writes the response headers.
+    /// </summary>
+    public static string GenerateReadYourWritesCode()
+    {
+        // Deliberately NOT setting DynamicCodeBuilder.WithinCodegenCommand, as the Marten gates do. The flag is
+        // process-wide and HttpFSharpFrameTests runs this in parallel with the compile gate's GenerateCode(), and
+        // nothing here needs it: the host is never started and the chains come straight from the HttpGraph.
+        using var host = Host.CreateDefaultBuilder()
+            .UseWolverine(opts =>
+            {
+                opts.Services.AddMarten(m => m.Connection(MartenConnectionString)).IntegrateWithWolverine();
+                opts.Services.AddWolverineHttp();
+
+                opts.Discovery.DisableConventionalDiscovery();
+            })
+            .Build();
+
+        // Applies the Marten integration to the options without starting the host
+        var runtime = host.Services.GetRequiredService<IWolverineRuntime>();
+        _ = host.Services.GetServices<ICodeFileCollection>().ToArray();
+
+        var httpGraph = new HttpGraph(runtime.Options, host.Services.GetRequiredService<IServiceContainer>());
+
+        var chains = new[]
+        {
+            HttpChain.ChainFor(typeof(ReadYourWritesEndpoints), nameof(ReadYourWritesEndpoints.Post), httpGraph),
+            HttpChain.ChainFor(typeof(ReadYourWritesEndpoints), nameof(ReadYourWritesEndpoints.Get), httpGraph)
+        };
+
+        var generatedAssembly = httpGraph.StartAssembly(httpGraph.Rules);
+        generatedAssembly.TargetLanguage = CodegenLanguage.fsharp;
+
+        foreach (var chain in chains)
+        {
+            ((ICodeFile)chain).AssembleTypes(generatedAssembly);
+        }
+
+        return generatedAssembly.GenerateFSharpCode(host.Services.GetService<IServiceVariableSource>());
+    }
+
+    public static string ReadYourWritesGeneratedFilePath([CallerFilePath] string thisFile = "")
+    {
+        var testProjectDir = Path.GetDirectoryName(thisFile)!;
+        var srcTestingDir = Path.GetDirectoryName(testProjectDir)!;
+        return Path.Combine(srcTestingDir, "Wolverine.Http.FSharpFixture", "ReadYourWritesGenerated.fs");
     }
 
     public static string DefaultGeneratedFilePath([CallerFilePath] string thisFile = "")

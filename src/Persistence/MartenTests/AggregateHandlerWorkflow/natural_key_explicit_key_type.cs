@@ -252,15 +252,15 @@ public static class NkRefusedHandler
 {
     public static NkShelfAudited Handle(AuditNkShelfIdentityOnly command, [WriteAggregate] NkShelf shelf) => new();
 
-    // JFXEVT014/015 refuse these two at build time. Suppressed so the codegen check behind them, for code
+    // JFXEVT016/017 refuse these two at build time. Suppressed so the codegen check behind them, for code
     // the analyzer never sees, can be tested.
-#pragma warning disable JFXEVT014, JFXEVT015
+#pragma warning disable JFXEVT016, JFXEVT017
     public static NkProductRestocked Handle(AuditNkProductByShelfCode command,
         [WriteAggregate<NkShelfCode>] NkProduct product) => new(1);
 
     public static NkShelfAudited Handle(AuditNkShelfByNullableKeyType command,
         [WriteAggregate(NaturalKey = typeof(NkSku?))] NkShelf shelf) => new();
-#pragma warning restore JFXEVT014, JFXEVT015
+#pragma warning restore JFXEVT016, JFXEVT017
 
     public static NkShelfAudited Handle(AuditNkShelfTwoCodes command, [WriteAggregate<NkShelfCode>] NkShelf shelf)
         => new();

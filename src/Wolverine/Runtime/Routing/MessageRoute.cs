@@ -106,6 +106,9 @@ public class MessageRoute : IMessageRoute, IMessageInvoker
 
         Rules.AddRange(RulesForMessageType(messageType));
 
+        // GH-5537: opts.Tracing.StartNewLinkedTraceFor() rules, resolved once per route
+        Rules.AddRange(runtime.Options.Tracing.RulesFor(messageType));
+
         MessageType = messageType;
 
         _endpoint = endpoint;
@@ -197,6 +200,10 @@ public class MessageRoute : IMessageRoute, IMessageInvoker
         envelope.WireTap = _endpoint.WireTap;
         envelope.TenantId = options?.TenantId;
         envelope.GroupId = options?.GroupId;
+
+        // GH-4484: a message grouped by the saga-id header needs its saga id before the group id is worked out.
+        // DeliveryOptions.Override below stamps the same value again
+        envelope.SagaId = options?.SagaId;
 
         // GH-4325: IsLocal is the ctor-computed answer to exactly this type test
         if (IsLocal)
@@ -312,6 +319,13 @@ public class MessageRoute : IMessageRoute, IMessageInvoker
             Rules[i].Modify(envelope);
         }
 
+        // GH-5537: an explicit DeliveryOptions.StartsNewLinkedTrace wins over a linked trace rule, even
+        // on this path where the rules run after the delivery options
+        if (options?.StartsNewLinkedTrace is { } startsNewLinkedTrace)
+        {
+            envelope.StartsNewLinkedTrace = startsNewLinkedTrace;
+        }
+
         if (typeof(T) == typeof(Acknowledgement))
         {
             envelope.AckRequested = true;
@@ -373,6 +387,12 @@ public class MessageRoute : IMessageRoute, IMessageInvoker
         if (deduplication != null)
         {
             rules.Add(deduplication);
+        }
+
+        // GH-5537: the marker interface is the interface flavor of [StartsNewLinkedTrace]
+        if (type.CanBeCastTo<IStartsNewLinkedTrace>() && !rules.OfType<StartsNewLinkedTraceAttribute>().Any())
+        {
+            rules.Add(StartsNewLinkedTraceRule.Instance);
         }
 
         _rulesByMessageType = _rulesByMessageType.AddOrUpdate(type, rules);

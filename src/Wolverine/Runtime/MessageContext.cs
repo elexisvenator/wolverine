@@ -11,6 +11,7 @@ using Wolverine.Runtime.WorkerQueues;
 using JasperFx;
 using JasperFx.MultiTenancy;
 using Wolverine.Persistence.Durability;
+using Wolverine.Persistence.Sagas;
 using Wolverine.Runtime.Agents;
 using Wolverine.Runtime.Batching;
 using Wolverine.Runtime.RemoteInvocation;
@@ -54,6 +55,13 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
     // envelope as if it were already persisted. Both stand only if that transaction commits, so a failed attempt
     // puts the envelope back the way the check found it. See ClearAllAsync
     private bool _eagerIdempotencyStamped;
+
+    /// <summary>
+    ///     GH-5423. Whether eager idempotency wrote this execution's own Handled inbox row into the handler's
+    ///     transaction. A transaction that commits the work then has nothing left to mark, and a Handled row for the
+    ///     envelope is its own rather than another execution's
+    /// </summary>
+    public bool EagerIdempotencyRowWritten => _eagerIdempotencyStamped;
     private EnvelopeStatus _statusBeforeEagerIdempotency;
 
     /// <summary>
@@ -205,15 +213,91 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
         var outgoing = await beginFlushAsync().ConfigureAwait(false);
         if (outgoing == null) return;
 
-        foreach (var envelope in outgoing)
+        await flushEnvelopesAsync(outgoing).ConfigureAwait(false);
+
+        await completeFlushAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// GH-5587. Hand every envelope to its destination in order, without letting a destination that is slow to take
+    /// one hold up the envelopes for any other destination. While nothing waits this is the plain loop it always was.
+    /// The first time a destination makes it wait, the rest go out by destination: each destination's envelopes still
+    /// one at a time and in order, the destinations side by side.
+    /// </summary>
+    private Task flushEnvelopesAsync(Envelope[] outgoing)
+    {
+        for (var i = 0; i < outgoing.Length; i++)
         {
+            var envelope = outgoing[i];
+
             // https://github.com/JasperFx/wolverine/issues/2006
             if (envelope == null) continue;
 
-            await flushEnvelopeAsync(envelope).ConfigureAwait(false);
+            var flushing = flushEnvelopeAsync(envelope);
+            if (!flushing.IsCompleted)
+            {
+                return flushRemainingByDestinationAsync(outgoing, i, flushing);
+            }
         }
 
-        await completeFlushAsync().ConfigureAwait(false);
+        return Task.CompletedTask;
+    }
+
+    private async Task flushRemainingByDestinationAsync(Envelope[] outgoing, int waitingIndex, Task waiting)
+    {
+        // Only the destinations that are waiting. A destination that took its envelope right away has nothing for
+        // the next one to wait behind. Bounded by the number of envelopes in this flush, and nothing outlives it
+        var waitingByDestination = new Dictionary<Uri, Task>
+        {
+            [destinationOf(outgoing[waitingIndex])] = waiting
+        };
+
+        for (var i = waitingIndex + 1; i < outgoing.Length; i++)
+        {
+            var envelope = outgoing[i];
+            if (envelope == null) continue;
+
+            var destination = destinationOf(envelope);
+            if (waitingByDestination.TryGetValue(destination, out var ahead) && !ahead.IsCompleted)
+            {
+                // Never alongside the envelope ahead of it: a destination takes its envelopes one at a time
+                waitingByDestination[destination] = flushAfterAsync(ahead, envelope);
+                continue;
+            }
+
+            var flushing = flushEnvelopeAsync(envelope);
+            if (flushing.IsCompleted)
+            {
+                waitingByDestination.Remove(destination);
+            }
+            else
+            {
+                waitingByDestination[destination] = flushing;
+            }
+        }
+
+        // flushEnvelopeAsync() logs and swallows its own failures, so this waits for every destination
+        foreach (var flushing in waitingByDestination.Values)
+        {
+#pragma warning disable VSTHRD003 // started by this flush, and waiting for it is the whole point
+            await flushing.ConfigureAwait(false);
+#pragma warning restore VSTHRD003
+        }
+    }
+
+    private async Task flushAfterAsync(Task ahead, Envelope envelope)
+    {
+#pragma warning disable VSTHRD003 // started by this flush: the envelope ahead of this one at the same destination
+        await ahead.ConfigureAwait(false);
+#pragma warning restore VSTHRD003
+        await flushEnvelopeAsync(envelope).ConfigureAwait(false);
+    }
+
+    private static readonly Uri _noDestination = new("unknown://none");
+
+    private static Uri destinationOf(Envelope envelope)
+    {
+        return envelope.Destination ?? envelope.Sender?.Destination ?? _noDestination;
     }
 
     /// <summary>
@@ -323,8 +407,8 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
                     if (!agent.IsDurable)
                     {
                         Runtime.Logger.LogError(results[i].Exception,
-                            "Unable to send outgoing message {Envelope} inline to non-durable destination {Destination}, so it has been discarded",
-                            envelope, envelope.Destination);
+                            "Unable to send outgoing message {Name}#{Id} inline to non-durable destination {Destination}, so it has been discarded",
+                            envelope.GetMessageTypeName(), envelope.Id, envelope.Destination);
                         Runtime.MessageTracking.DiscardedEnvelope(envelope);
                         continue;
                     }
@@ -336,16 +420,16 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
                     if (Runtime.Options.Durability.Mode != DurabilityMode.ServerlessWithOutbox)
                     {
                         Runtime.Logger.LogError(results[i].Exception,
-                            "Unable to send outgoing message {Envelope} inline to {Destination}. Handing it to the destination's sending agent to retry",
-                            envelope, envelope.Destination);
+                            "Unable to send outgoing message {Name}#{Id} inline to {Destination}. Handing it to the destination's sending agent to retry",
+                            envelope.GetMessageTypeName(), envelope.Id, envelope.Destination);
 
                         await flushEnvelopeAsync(envelope).ConfigureAwait(false);
                         continue;
                     }
 
                     Runtime.Logger.LogError(results[i].Exception,
-                        "Unable to send outgoing message {Envelope} inline to {Destination}. It is left in the outbox to be recovered by a later durability pass",
-                        envelope, envelope.Destination);
+                        "Unable to send outgoing message {Name}#{Id} inline to {Destination}. It is left in the outbox to be recovered by a later durability pass",
+                        envelope.GetMessageTypeName(), envelope.Id, envelope.Destination);
 
                     if (!alreadyPersisted)
                     {
@@ -367,14 +451,15 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
     {
         try
         {
+            await envelope.SerializeAheadAsync().ConfigureAwait(false);
             await (envelope.Store ?? Runtime.Storage).Outbox
                 .StoreOutgoingAsync(envelope, Runtime.Options.Durability.OutgoingOwnerId).ConfigureAwait(false);
         }
         catch (Exception e)
         {
             Runtime.Logger.LogError(e,
-                "Unable to store unsent outgoing message {Envelope} in the outbox, so it has been discarded",
-                envelope);
+                "Unable to store unsent outgoing message {Name}#{Id} in the outbox, so it has been discarded",
+                envelope.GetMessageTypeName(), envelope.Id);
             Runtime.MessageTracking.DiscardedEnvelope(envelope);
         }
     }
@@ -406,7 +491,9 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
             switch (MultiFlushMode)
             {
                 case MultiFlushMode.OnlyOnce:
-                    lock (_outstandingLock)
+                    // System.Threading.Lock's scope is a ref struct, which C# 12 refuses in an async method
+                    _outstandingLock.Enter();
+                    try
                     {
                         if (_outstanding.Count > 0)
                         {
@@ -416,6 +503,10 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
                                 "MessageContext for {MessageType} has already flushed its outgoing messages, so {Count} envelope(s) enqueued after that flush will not be sent. This can happen when messages are enqueued after an explicit transaction commit (e.g. SaveChangesAsync()) has already drained the context. Consider MultiFlushMode.AllowMultiples if multiple flushes are expected",
                                 Envelope?.MessageType, _outstanding.Count);
                         }
+                    }
+                    finally
+                    {
+                        _outstandingLock.Exit();
                     }
 
                     return null;
@@ -441,10 +532,16 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
         // Snapshot under lock so concurrent publishes from a Marten projection
         // (Block parallelism = 10 in AggregationRunner) cannot corrupt the list
         // while we're iterating it. GH-2529.
-        lock (_outstandingLock)
+        // System.Threading.Lock's scope is a ref struct, which C# 12 refuses in an async method
+        _outstandingLock.Enter();
+        try
         {
             if (_outstanding.Count == 0) return null;
             return _outstanding.ToArray();
+        }
+        finally
+        {
+            _outstandingLock.Exit();
         }
     }
 
@@ -497,8 +594,8 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
             // reach this catch. It can now, and an unreachable message store is the more common cause
             // of the two, so name both -- and name the envelope, which this never did.
             Runtime.Logger.LogError(e,
-                "Unable to send outgoing message {Envelope}, so it has been discarded. This is usually either a serialization failure or an unreachable message store",
-                envelope);
+                "Unable to send outgoing message {Name}#{Id}, so it has been discarded. This is usually either a serialization failure or an unreachable message store",
+                envelope.GetMessageTypeName(), envelope.Id);
             Runtime.MessageTracking.DiscardedEnvelope(envelope);
         }
 
@@ -523,10 +620,16 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
         }
 
         _sent ??= new();
-        lock (_outstandingLock)
+        // System.Threading.Lock's scope is a ref struct, which C# 12 refuses in an async method
+        _outstandingLock.Enter();
+        try
         {
             _sent.AddRange(_outstanding);
             _outstanding.Clear();
+        }
+        finally
+        {
+            _outstandingLock.Exit();
         }
 
         _hasFlushed = true;
@@ -543,9 +646,15 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
                 var failureDescription = $"No response was created for expected response '{Envelope!.ReplyRequested}' back to reply-uri {Envelope.ReplyUri}. ";
 
                 Envelope[] outstandingSnapshot;
-                lock (_outstandingLock)
+                // System.Threading.Lock's scope is a ref struct, which C# 12 refuses in an async method
+                _outstandingLock.Enter();
+                try
                 {
                     outstandingSnapshot = _outstanding.ToArray();
+                }
+                finally
+                {
+                    _outstandingLock.Exit();
                 }
 
                 if (outstandingSnapshot.Length > 0)
@@ -637,6 +746,17 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
     /// </summary>
     internal bool HasRescheduledEnvelope => _rescheduled;
 
+    /// <summary>
+    ///     GH-5556. The saga id a saga handler resolved for the current message, if it got that far
+    /// </summary>
+    internal object? ResolvedSagaId => _sagaId;
+
+    /// <summary>GH-5674. Replacing saga timeouts this handler scheduled, until the saga keeps their ids</summary>
+    internal List<SagaTimeoutScheduled>? ScheduledSagaTimeouts { get; set; }
+
+    /// <summary>GH-5674. Ids of saga timeouts superseded by this handler, deleted once the saga is saved</summary>
+    internal List<Guid>? SupersededSagaTimeouts { get; set; }
+
     private ISupportNativeScheduling? tryGetRescheduler(IChannelCallback? channel, Envelope e)
     {
         // TODO: is that ok, or should we modify Task ISupportNativeScheduling.MoveToScheduledUntilAsync(Envelope envelope, DateTimeOffset time) in DurableReceiver and BufferedReceiver?
@@ -684,6 +804,14 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
         {
             await moveBatchToDeadLetterQueueAsync(Envelope, exception).ConfigureAwait(false);
             return;
+        }
+
+        // GH-5557. A saga handler resolves its saga id from the message, so the incoming envelope usually carries
+        // none. Record the id the handler resolved, so the dead letter can be found by its saga. The same string
+        // form outgoing envelopes get from this context
+        if (Envelope.SagaId.IsEmpty() && _sagaId != null)
+        {
+            Envelope.SagaId = _sagaId.ToString();
         }
 
         var deadLetterQueue = tryGetDeadLetterQueue(_channel, Envelope);
@@ -925,7 +1053,7 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
 
     Task IEnvelopeTransaction.PersistOutgoingAsync(Envelope envelope)
     {
-        lock (_outstandingLock)
+        using (_outstandingLock.EnterScope())
         {
             _outstanding.Fill(envelope);
         }
@@ -934,7 +1062,7 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
 
     Task IEnvelopeTransaction.PersistOutgoingAsync(Envelope[] envelopes)
     {
-        lock (_outstandingLock)
+        using (_outstandingLock.EnterScope())
         {
             _outstanding.Fill(envelopes);
         }
@@ -993,9 +1121,15 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
     internal async Task CopyToAsync(IEnvelopeTransaction other)
     {
         Envelope[] snapshot;
-        lock (_outstandingLock)
+        // System.Threading.Lock's scope is a ref struct, which C# 12 refuses in an async method
+        _outstandingLock.Enter();
+        try
         {
             snapshot = _outstanding.ToArray();
+        }
+        finally
+        {
+            _outstandingLock.Exit();
         }
         await other.PersistOutgoingAsync(snapshot).ConfigureAwait(false);
 
@@ -1008,9 +1142,15 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
     public async ValueTask ClearAllAsync()
     {
         Scheduled.Clear();
-        lock (_outstandingLock)
+        // System.Threading.Lock's scope is a ref struct, which C# 12 refuses in an async method
+        _outstandingLock.Enter();
+        try
         {
             _outstanding.Clear();
+        }
+        finally
+        {
+            _outstandingLock.Exit();
         }
 
         if (Transaction != null)
@@ -1159,7 +1299,15 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
 
         if (Envelope?.ReplyUri != null && message.GetType().ToMessageTypeName() == Envelope.ReplyRequested)
         {
-            await EndpointFor(Envelope.ReplyUri!).SendAsync(message, new DeliveryOptions { IsResponse = true }).ConfigureAwait(false);
+            var responseOptions = new DeliveryOptions { IsResponse = true };
+
+            // GH-5673: a business reply that confirms a saga's undo message goes back to that saga
+            if (Envelope.HasHeaders && Envelope.Headers.TryGetValue(SagaUndo.EntryHeader, out var undoEntry))
+            {
+                responseOptions.Headers[SagaUndo.EntryHeader] = undoEntry;
+            }
+
+            await EndpointFor(Envelope.ReplyUri!).SendAsync(message, responseOptions).ConfigureAwait(false);
 
             // If [AlwaysPublishResponse] was used, also publish as a cascading message
             if (Envelope.AlwaysPublishResponse)
@@ -1279,7 +1427,7 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
         _hasFlushed = false;
 
         _sent?.Clear();
-        lock (_outstandingLock)
+        using (_outstandingLock.EnterScope())
         {
             _outstanding.Clear();
         }
@@ -1287,12 +1435,27 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
         Envelope = null;
         Transaction = null;
         _sagaId = null;
+        ScheduledSagaTimeouts = null;
+        SupersededSagaTimeouts = null;
         _rescheduled = false;
         _eagerIdempotencyStamped = false;
         Tracker = null;
     }
 
     public void SetSagaId(object sagaId) => _sagaId = sagaId;
+
+    private protected override DeliveryOptions? applySagaGrouping(DeliveryOptions? options, Type messageType)
+    {
+        if (options?.SagaId != null || !Runtime.Options.MessagePartitioning.GroupsBySagaId(messageType)) return options;
+
+        // The same precedence TrackEnvelopeCorrelation stamps the outgoing saga id with
+        var sagaId = _sagaId?.ToString() ?? Envelope?.SagaId;
+        if (sagaId.IsEmpty()) return options;
+
+        options ??= new DeliveryOptions();
+        options.SagaId = sagaId;
+        return options;
+    }
 
     internal void ReadEnvelope(Envelope? originalEnvelope, IChannelCallback channel)
     {
@@ -1355,7 +1518,15 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
             var ackEnvelope = Runtime.RoutingFor(typeof(Acknowledgement))
                 .RouteToDestination(ack, Envelope.ReplyUri, null);
             TrackEnvelopeCorrelation(ackEnvelope, Activity.Current);
-            lock (_outstandingLock)
+
+            // GH-5673: the acknowledgement of a saga's undo message confirms it, so it goes back to that saga
+            if (Envelope.HasHeaders && Envelope.Headers.TryGetValue(SagaUndo.EntryHeader, out var undoEntry))
+            {
+                ackEnvelope.Headers[SagaUndo.EntryHeader] = undoEntry;
+                ackEnvelope.SagaId = Envelope.SagaId;
+                ackEnvelope.IsResponse = true;
+            }
+            using (_outstandingLock.EnterScope())
             {
                 _outstanding.Add(ackEnvelope);
             }
@@ -1403,6 +1574,34 @@ public class MessageContext : MessageBus, IMessageContext, IHasTenantId, IEnvelo
         outbound.SagaId = outbound.SagaId.IsNotEmpty()
             ? outbound.SagaId
             : (_sagaId?.ToString() ?? Envelope?.SagaId);
+
+        if (outbound.Message is { } outgoingMessage)
+        {
+            var messageType = outgoingMessage.GetType();
+
+            // GH-4484: a message grouped by the saga-id header that reached here without a group id -- sent to an
+            // explicit endpoint, which works out no group id -- takes the saga id it now carries
+            if (outbound.GroupId == null && outbound.SagaId.IsNotEmpty() &&
+                Runtime.Options.MessagePartitioning.GroupsBySagaId(messageType))
+            {
+                outbound.GroupId = outbound.SagaId;
+            }
+
+            // GH-5553: a saga that handles Fault<T> asks for the fault of every T it sends. The header names where
+            // this message's replies come back to, or asks the receiver to use the envelope's reply address
+            if (Envelope?.Message is { } incoming && Runtime.Options.HandlerGraph.FaultReplies.IsRequested(incoming.GetType(), messageType)
+                && !(outbound.HasHeaders && outbound.Headers.ContainsKey(FaultHeaders.ReplyTo)))
+            {
+                outbound.Headers[FaultHeaders.ReplyTo] = outbound.ReplyUri?.ToString() ?? FaultHeaders.ReplyToSender;
+            }
+        }
+
+        // GH-5673: the replies to a saga's step carry back the undo entries the step confirms
+        if (Envelope is { HasHeaders: true } inbound && inbound.Headers.TryGetValue(SagaUndo.StepHeader, out var step) &&
+            !(outbound.HasHeaders && outbound.Headers.ContainsKey(SagaUndo.StepHeader)))
+        {
+            outbound.Headers[SagaUndo.StepHeader] = step;
+        }
 
         if (ConversationId != Guid.Empty)
         {

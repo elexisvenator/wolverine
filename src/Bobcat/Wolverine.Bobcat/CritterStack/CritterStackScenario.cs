@@ -265,7 +265,7 @@ public class CritterStackScenario
     /// ancillary store unless told otherwise — is used instead.
     /// </remarks>
     /// <exception cref="InvalidOperationException">No store is registered under <typeparamref name="TStore" />.</exception>
-    public CritterStackScenario In<TStore>() where TStore : class => createView(resolveStore(typeof(TStore)));
+    public CritterStackScenario In<TStore>() where TStore : class => view(resolveStore(typeof(TStore)));
 
     /// <summary>
     /// bobcat#504. The same Given/Then vocabulary against the event store whose <see cref="IEventStore.Identity" />
@@ -276,19 +276,23 @@ public class CritterStackScenario
     public CritterStackScenario In(string storeName)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(storeName);
-        return createView(Services.EventStore(storeName));
+        return view(Services.EventStore(storeName));
+    }
+
+    // A view's store is one the specification touched, so AfterAsyncDaemonsCatchUpAsync() waits on it: counted here, not
+    // in createView, which a derived scenario overrides (WolverineScenario, WolverineHttpScenario)
+    private CritterStackScenario view(IEventStore store)
+    {
+        _state.Touched.Add(store);
+        return createView(store);
     }
 
     /// <summary>
     /// bobcat#504. Build the view <see cref="In{TStore}" /> and <see cref="In(string)" /> hand out, pinned to
     /// <paramref name="store" />. A derived scenario whose own steps should be on the view overrides this and
-    /// returns its own type, built with the protected view constructor.
+    /// returns its own type, built with the protected view constructor. The store already counts as touched.
     /// </summary>
-    protected virtual CritterStackScenario createView(IEventStore store)
-    {
-        _state.Touched.Add(store);
-        return new(this, store);
-    }
+    protected virtual CritterStackScenario createView(IEventStore store) => new(this, store);
 
     private IEventStore resolveStore(Type marker)
     {
@@ -658,8 +662,8 @@ public class CritterStackScenario
         var values = document is IPartialObject partial ? PartialObjects.DescribeValues(partial) : ScenarioValues.DescribeDocument(document);
         var inline = values.Length <= ScenarioValues.InlineLimit;
         var text = asTenant(inline && values.Length > 0
-            ? $"there is a {nameOf(typeof(T))} with {values}"
-            : $"there is a {nameOf(typeof(T))}");
+            ? $"there is {articleFor(typeof(T))} {nameOf(typeof(T))} with {values}"
+            : $"there is {articleFor(typeof(T))} {nameOf(typeof(T))}");
         await inStep(ScenarioRecorder.Step("Given", text), async () =>
         {
             // bobcat#618: a document too long for the line keeps its values, as a table under the step
@@ -1587,11 +1591,11 @@ public class CritterStackScenario
     [EventModelRole(SliceRole.Aggregate, nameof(aggregate))]
     public async Task ThenStreamIsStarted(Type aggregate, object id)
     {
-        await inStep(ScenarioRecorder.Step("Then", $"a {nameOf(aggregate)} stream is started with id \"{id}\""), async () =>
+        await inStep(ScenarioRecorder.Step("Then", $"{articled(nameOf(aggregate))} stream is started with id \"{id}\""), async () =>
         {
             if (!actSucceeded()) return;
 
-            var events = await fetchAsync(await storeForAsync($"a {nameOf(aggregate)} stream is started", aggregate),
+            var events = await fetchAsync(await storeForAsync($"{articled(nameOf(aggregate))} stream is started", aggregate),
                 StrongTypedIds.StreamIdentity(id));
             fact(events.Count > 0,
                 $"Expected a {nameOf(aggregate)} stream with id {id}, but no stream exists there. The act appended its events somewhere else, or started no stream at all.");
@@ -1614,7 +1618,7 @@ public class CritterStackScenario
     private async Task streamIsStartedWithEvents(Type aggregate, object[] expected)
     {
         var paragraph = new Paragraph("Then");
-        var stream = await inStep<object?>(paragraph.Sentence($"a {nameOf(aggregate)} stream is started"), async () =>
+        var stream = await inStep<object?>(paragraph.Sentence($"{articled(nameOf(aggregate))} stream is started"), async () =>
         {
             if (!actSucceeded()) return null;
 
@@ -1641,7 +1645,7 @@ public class CritterStackScenario
     private Task<IEventStore> startedStreamStoreAsync(Type aggregate, object stream)
     {
         var known = LastAct.AllNewEvents.Where(x => isOn(x, stream)).Select(LastAct.StoreOf).FirstOrDefault(x => x is not null);
-        return known is not null && _pinned is null ? Task.FromResult(known) : storeForAsync($"a {nameOf(aggregate)} stream is started", aggregate);
+        return known is not null && _pinned is null ? Task.FromResult(known) : storeForAsync($"{articled(nameOf(aggregate))} stream is started", aggregate);
     }
 
     // The one stream of this type the act started, or null with the reason recorded as the step's failure
@@ -2019,7 +2023,9 @@ public class CritterStackScenario
         });
     }
 
-    private static string existsText<T>(object id) => $"there is a {documentNamed<T>(id)}";
+    private static string existsText<T>(object id) => $"there is {articleFor(typeof(T))} {documentNamed<T>(id)}";
+
+    private static string articleFor(Type type) => "AEIOU".Contains(char.ToUpperInvariant(nameOf(type)[0])) ? "an" : "a";
 
     // bobcat#682: "the Wallet #fromWallet matches", so a from- and a to-wallet checked side by side can be told apart
     private static string matchesText<T>(object id) => $"the {documentNamed<T>(id)} matches";
@@ -2507,7 +2513,7 @@ public class CritterStackScenario
     }
 
     // Judge subject against expected on the step in progress: a partial object on the members it names, else structurally
-    private void judge(object? subject, object expected)
+    private protected void judge(object? subject, object expected)
     {
         if (expected is IPartialObject partial)
         {
@@ -2590,7 +2596,7 @@ public class CritterStackScenario
 
     // "3 days", "1 hour 30 minutes", "0.5 milliseconds": the words FriendlyTimeSpanParser reads back, to the
     // tick. Never negative; the clock steps refuse one before they get here
-    private static string formatDuration(TimeSpan duration)
+    internal static string formatDuration(TimeSpan duration)
     {
         if (duration == TimeSpan.Zero) return "0 seconds";
 
@@ -2780,6 +2786,10 @@ public class CritterStackScenario
 
     /// <summary>A type as a step reads it: <c>List&lt;Account&gt;</c>, never <c>List`1</c> (bobcat#618).</summary>
     protected static string nameOf(Type type) => ScenarioValues.TypeName(type);
+
+    // "an OrderFulfillment stream", "a Tab stream" (wolverine#5609 did the same for the saga steps)
+    private static string articled(string noun)
+        => (noun.Length > 0 && "AEIOUaeiou".Contains(noun[0]) ? "an " : "a ") + noun;
 
     /// <summary>Type names as a step reads them: <c>A, B</c>, or <c>nothing</c>.</summary>
     protected static string describeTypes(IReadOnlyList<Type> types)

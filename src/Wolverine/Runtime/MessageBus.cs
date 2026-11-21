@@ -22,7 +22,7 @@ public partial class MessageBus : IMessageBus, IMessageContext
     // concurrent List<Envelope>.Add silently corrupts the list and drops messages.
     // GH-2529.
     // ReSharper disable once InconsistentNaming
-    protected readonly object _outstandingLock = new();
+    protected readonly Lock _outstandingLock = new();
     private string? _tenantId;
 
     public MessageBus(IWolverineRuntime runtime) : this(runtime, Activity.Current?.RootId ?? Guid.NewGuid().ToString())
@@ -74,7 +74,7 @@ public partial class MessageBus : IMessageBus, IMessageContext
     {
         get
         {
-            lock (_outstandingLock) return _outstanding.ToArray();
+            using (_outstandingLock.EnterScope()) return _outstanding.ToArray();
         }
     }
 
@@ -283,6 +283,7 @@ public partial class MessageBus : IMessageBus, IMessageContext
         Runtime.AssertHasStarted();
         assertNotMediatorOnly();
         options = applyTenantContext(options);
+        options = applySagaGrouping(options, message.GetType());
 
         // Cannot trust the T here. Can be "object"
         var outgoing = Runtime.RoutingFor(message.GetType()).RouteForSend(message, options);
@@ -308,6 +309,7 @@ public partial class MessageBus : IMessageBus, IMessageContext
         Runtime.AssertHasStarted();
         assertNotMediatorOnly();
         options = applyTenantContext(options);
+        options = applySagaGrouping(options, message.GetType());
 
         // You can't trust the T here.
         var outgoing = Runtime.RoutingFor(message.GetType()).RouteForPublish(message, options);
@@ -360,12 +362,25 @@ public partial class MessageBus : IMessageBus, IMessageContext
             throw new InvalidOperationException("Envelope has not been routed");
         }
 
+        // GH-5554: a dead letter's faults are routed now and written with the dead-letter move
+        if (CapturedOutgoing is not null)
+        {
+            CapturedOutgoing.Add(envelope);
+            return;
+        }
+
         if (Transaction is not null)
         {
-            lock (_outstandingLock)
+            // System.Threading.Lock's scope is a ref struct, which C# 12 refuses in an async method
+            _outstandingLock.Enter();
+            try
             {
                 // Fill, NOT Add. The dedup is load-bearing -- see PersistOrSendAsync(Envelope[]).
                 _outstanding.Fill(envelope);
+            }
+            finally
+            {
+                _outstandingLock.Exit();
             }
 
             await envelope.PersistAsync(Transaction).ConfigureAwait(false);
@@ -375,6 +390,11 @@ public partial class MessageBus : IMessageBus, IMessageContext
 
         await envelope.StoreAndForwardAsync().ConfigureAwait(false);
     }
+
+    /// <summary>
+    ///     GH-5554. While set, everything this bus would persist or send is only routed and collected here
+    /// </summary>
+    internal List<Envelope>? CapturedOutgoing { get; set; }
 
     public void EnlistInOutbox(IEnvelopeTransaction transaction)
     {
@@ -443,6 +463,13 @@ public partial class MessageBus : IMessageBus, IMessageContext
             }
         }
 
+        // GH-5554: a dead letter's faults are routed now and written with the dead-letter move
+        if (CapturedOutgoing is not null)
+        {
+            CapturedOutgoing.AddRange(outgoing);
+            return;
+        }
+
         if (Transaction != null)
         {
             // This filtering is done to only persist envelopes where
@@ -479,7 +506,9 @@ public partial class MessageBus : IMessageBus, IMessageContext
 
             await Transaction.PersistAsync(envelopes).ConfigureAwait(false);
 
-            lock (_outstandingLock)
+            // System.Threading.Lock's scope is a ref struct, which C# 12 refuses in an async method
+            _outstandingLock.Enter();
+            try
             {
                 // Fill, NOT AddRange. GH-4325 replaced this with AddRange on the reasoning that
                 // every envelope here is freshly minted by the router and so the Contains check
@@ -495,6 +524,10 @@ public partial class MessageBus : IMessageBus, IMessageContext
                 // of ids alongside the list), not the removal of one.
                 _outstanding.Fill(outgoing);
             }
+            finally
+            {
+                _outstandingLock.Exit();
+            }
         }
         else
         {
@@ -506,6 +539,12 @@ public partial class MessageBus : IMessageBus, IMessageContext
     {
         return envelope.Sender?.IsDurable ?? Runtime.Endpoints.GetOrBuildSendingAgent(envelope.Destination!).IsDurable;
     }
+
+    /// <summary>
+    /// GH-4484. A message context hands the saga id it is working under to a message grouped by the saga-id header,
+    /// so the group id is known while the message is routed, as a partitioned route needs. Nothing to do outside one
+    /// </summary>
+    private protected virtual DeliveryOptions? applySagaGrouping(DeliveryOptions? options, Type messageType) => options;
 
     private DeliveryOptions? applyTenantContext(DeliveryOptions? options)
     {

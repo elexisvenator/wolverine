@@ -1,13 +1,15 @@
 using Polecat;
 using Wolverine.Polecat.Persistence.Operations;
 using Wolverine.Persistence.Durability;
+using Wolverine.Persistence.Sagas;
 using Wolverine.SqlServer.Persistence;
 using Wolverine.Runtime;
 using MultiTenantedMessageStore = Wolverine.Persistence.Durability.MultiTenantedMessageStore;
+using Wolverine.RDBMS.Outbox;
 
 namespace Wolverine.Polecat;
 
-internal class PolecatEnvelopeTransaction : IEnvelopeTransaction
+internal class PolecatEnvelopeTransaction : IEnvelopeTransaction, ISagaHistoryTransaction
 {
     private readonly MessageContext _context;
 
@@ -17,21 +19,11 @@ internal class PolecatEnvelopeTransaction : IEnvelopeTransaction
     public PolecatEnvelopeTransaction(IDocumentSession session, MessageContext context)
     {
         _context = context;
-        if (context.Storage is SqlServerMessageStore store)
-        {
-            Store = store;
-            _nodeId = store.Durability.OutgoingOwnerId;
-        }
-        else if (context.Storage is MultiTenantedMessageStore { Main: SqlServerMessageStore s })
-        {
-            Store = s;
-            _nodeId = s.Durability.OutgoingOwnerId;
-        }
-        else
-        {
-            throw new InvalidOperationException(
-                "This Wolverine application is not using SQL Server + Polecat as the backing message persistence");
-        }
+        // GH-5144: resolved the same way the session factory resolves it
+        Store = DocumentSessionOutboxSupport.TryResolveMessageStore<SqlServerMessageStore>(context.Storage)
+                ?? throw new InvalidOperationException(
+                    "This Wolverine application is not using SQL Server + Polecat as the backing message persistence");
+        _nodeId = Store.Durability.OutgoingOwnerId;
 
         Session = session;
     }
@@ -62,6 +54,21 @@ internal class PolecatEnvelopeTransaction : IEnvelopeTransaction
     public ValueTask RollbackAsync()
     {
         return ValueTask.CompletedTask;
+    }
+
+    // GH-5665: the saga's history row joins the transaction of the session that saves the saga
+
+    public Task<bool> TryPersistSagaHistoryAsync(SagaHistoryRecord record, CancellationToken token)
+    {
+        Session.AddTransactionParticipant(SagaHistoryParticipant.Insert(Store, record));
+        return Task.FromResult(true);
+    }
+
+    public Task<bool> TryDeleteSagaHistoryAsync(string sagaType, string sagaId, string? tenantId,
+        CancellationToken token)
+    {
+        Session.AddTransactionParticipant(SagaHistoryParticipant.Delete(Store, sagaType, sagaId, tenantId));
+        return Task.FromResult(true);
     }
 
     public async Task<bool> TryMakeEagerIdempotencyCheckAsync(Envelope envelope, DurabilitySettings settings,

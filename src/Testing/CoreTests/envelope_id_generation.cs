@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Data.SqlTypes;
-using MassTransit;
 using Microsoft.Extensions.Hosting;
 using Shouldly;
 using Wolverine;
@@ -14,7 +13,7 @@ public class envelope_id_generation : IDisposable
     public void Dispose()
     {
         // Reset to default after each test
-        Envelope.IdGenerator = NewId.NextSequentialGuid;
+        Envelope.IdGenerator = EnvelopeIds.NextSequentialGuid;
     }
 
     [Fact]
@@ -27,7 +26,7 @@ public class envelope_id_generation : IDisposable
     [Fact]
     public void new_id_mode_produces_non_empty_guids()
     {
-        Envelope.IdGenerator = NewId.NextSequentialGuid;
+        Envelope.IdGenerator = EnvelopeIds.NextSequentialGuid;
 
         var envelope = new Envelope();
         envelope.Id.ShouldNotBe(Guid.Empty);
@@ -118,7 +117,7 @@ public class envelope_id_generation : IDisposable
                 #endregion
             }).StartAsync(cancellationToken: TestContext.Current.CancellationToken);
 
-        Envelope.IdGenerator.Method.ShouldBe(typeof(NewId).GetMethod(nameof(NewId.NextGuid), Type.EmptyTypes));
+        Envelope.IdGenerator.Method.ShouldBe(typeof(EnvelopeIds).GetMethod(nameof(EnvelopeIds.NextGuid), Type.EmptyTypes));
 
         await host.InvokeMessageAndWaitAsync(new GuidV7TestMessage("sql server"));
         GuidV7TestHandler.LastReceived.ShouldBe("sql server");
@@ -128,7 +127,7 @@ public class envelope_id_generation : IDisposable
     [Fact]
     public void sql_server_order_ids_sort_in_sql_server_order()
     {
-        Envelope.IdGenerator = NewId.NextGuid;
+        Envelope.IdGenerator = EnvelopeIds.NextGuid;
 
         var ids = Enumerable.Range(0, 1000).Select(_ => new SqlGuid(new Envelope().Id)).ToArray();
 
@@ -142,7 +141,7 @@ public class envelope_id_generation : IDisposable
     [Fact]
     public void default_ids_do_not_sort_in_sql_server_order()
     {
-        Envelope.IdGenerator = NewId.NextSequentialGuid;
+        Envelope.IdGenerator = EnvelopeIds.NextSequentialGuid;
 
         var ids = Enumerable.Range(0, 1000).Select(_ => new Envelope().Id).ToArray();
 
@@ -158,6 +157,56 @@ public class envelope_id_generation : IDisposable
             .Count(i => sqlServerOrder[i].CompareTo(sqlServerOrder[i - 1]) < 0);
 
         outOfOrder.ShouldBeGreaterThan(0);
+    }
+
+    // GH-5626. Both orders come from JasperFx's SequentialGuid, which writes the sequence big-endian, so every id
+    // sorts after the one drawn before it in its own database's order, however many land in one 100 ns tick (the
+    // old generator wrote the sequence little-endian, so the 257th id of a tick sorted before the 256th in
+    // PostgreSQL order). JasperFx's own tests pin the fixed-clock case; this pins that Wolverine uses it.
+    [Fact]
+    public void every_default_id_sorts_after_the_one_before_it_in_postgresql_order()
+    {
+        var ids = Enumerable.Range(0, 70_000).Select(_ => EnvelopeIds.NextSequentialGuid()).ToArray();
+
+        for (var i = 1; i < ids.Length; i++)
+        {
+            ids[i].CompareTo(ids[i - 1]).ShouldBeGreaterThan(0, $"id {i} sorted before id {i - 1} in PostgreSQL order");
+        }
+    }
+
+    [Fact]
+    public void every_sql_server_order_id_sorts_after_the_one_before_it_in_sql_server_order()
+    {
+        var ids = Enumerable.Range(0, 70_000).Select(_ => new SqlGuid(EnvelopeIds.NextGuid())).ToArray();
+
+        for (var i = 1; i < ids.Length; i++)
+        {
+            ids[i].CompareTo(ids[i - 1]).ShouldBeGreaterThan(0, $"id {i} sorted before id {i - 1} in SQL Server order");
+        }
+    }
+
+    [Fact]
+    public void the_two_orders_are_unique_against_each_other()
+    {
+        var ids = Enumerable.Range(0, 10_000)
+            .SelectMany(_ => new[] { EnvelopeIds.NextSequentialGuid(), EnvelopeIds.NextGuid() })
+            .ToArray();
+
+        ids.Distinct().Count().ShouldBe(ids.Length);
+    }
+
+    [Fact]
+    public async Task default_ids_are_unique_across_threads()
+    {
+        var ids = new ConcurrentBag<Guid>();
+        var tasks = Enumerable.Range(0, 10).Select(_ => Task.Run(() =>
+        {
+            for (var i = 0; i < 1000; i++) ids.Add(EnvelopeIds.NextSequentialGuid());
+        }, TestContext.Current.CancellationToken)).ToArray();
+
+        await Task.WhenAll(tasks);
+
+        ids.Distinct().Count().ShouldBe(10_000);
     }
 
     [Fact]

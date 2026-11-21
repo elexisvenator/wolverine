@@ -84,11 +84,11 @@ public interface IEventSourcingFrameProvider
     /// <summary>
     /// The <see cref="BuildFetchLatestFrame"/> counterpart for an aggregate found by one of its natural keys,
     /// owned or mapped: <paramref name="naturalKey"/> is the key itself, of the key's type or its nullable form,
-    /// never unwrapped. Must create exactly one variable of the aggregate type. Null — the default — for a store
-    /// that cannot fetch the latest state by natural key, in which case <c>[ReadModel]</c> reports that it could
-    /// not determine an identity.
+    /// never unwrapped. Must create exactly one variable of the aggregate type. Null for a store that cannot fetch
+    /// the latest state by natural key, in which case <c>[ReadModel]</c> reports that it could not determine an
+    /// identity.
     /// </summary>
-    Frame? BuildFetchLatestByNaturalKeyFrame(Type aggregateType, Variable naturalKey) => null;
+    Frame? BuildFetchLatestByNaturalKeyFrame(Type aggregateType, Variable naturalKey);
 
     /// <summary>
     /// Build the frame that opens a Dynamic Consistency Boundary for writing — the store's
@@ -147,6 +147,20 @@ public interface IEventSourcingFrameProvider
     StreamIdentity DetermineStreamIdentity(IServiceContainer container);
 
     /// <summary>
+    /// <see cref="DetermineStreamIdentity(IServiceContainer)" /> for the store this chain actually writes to.
+    /// </summary>
+    /// <remarks>
+    /// GH-5142, the stream-identity twin of GH-4439 (natural keys) and GH-4441 (saga id types). Stream identity
+    /// is configured per <b>store</b>, so an ancillary store keyed by string beside a Guid-keyed default store
+    /// is perfectly legal, and asking the default store generated <c>IEvent.StreamId</c> where the chain needed
+    /// <c>IEvent.StreamKey</c> (or a Guid route argument where it needed a string). Implementations should call
+    /// <c>chain.DetermineAncillaryStoreType()</c>, not <see cref="IChain.AncillaryStoreType" />, which is still
+    /// null at this point on an HTTP chain. The default answers for the default store, as before.
+    /// </remarks>
+    StreamIdentity DetermineStreamIdentity(IChain chain, IServiceContainer container)
+        => DetermineStreamIdentity(container);
+
+    /// <summary>
     /// The store's natural-key type for this aggregate, when it has one and the workflow could not find
     /// the stream identity by any other means. Return null — the default — for a store with no
     /// natural-key concept, in which case the workflow simply reports that it could not determine an
@@ -167,15 +181,15 @@ public interface IEventSourcingFrameProvider
     /// <summary>
     /// The types of the aggregate's <b>mapped</b> natural keys: keys whose lookup another projection owns,
     /// declared with <c>[MappedNaturalKey&lt;T&gt;]</c> or <c>[NaturalKey(SourceProjection = ...)]</c>. The
-    /// aggregate's owned key is <see cref="TryDetermineNaturalKeyType"/>'s, and is not repeated here. Empty —
-    /// the default — for a store without mapped keys.
+    /// aggregate's owned key is <see cref="TryDetermineNaturalKeyType"/>'s, and is not repeated here. Empty for a
+    /// store without mapped keys.
     /// </summary>
     /// <remarks>
     /// Resolve the store the same way as <see cref="TryDetermineNaturalKeyType"/> (GH-4439). Every type is the
     /// key's own type, never <c>Nullable&lt;T&gt;</c>; the workflow also matches a <c>T?</c> command member.
     /// </remarks>
     IReadOnlyList<Type> DetermineMappedNaturalKeyTypes(Type aggregateType, IChain chain,
-        IServiceContainer container) => [];
+        IServiceContainer container);
 }
 
 internal static class EventSourcingFrameProviderExtensions

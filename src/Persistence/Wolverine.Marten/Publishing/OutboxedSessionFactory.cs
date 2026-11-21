@@ -1,9 +1,11 @@
+using System.Data;
 using JasperFx.Core;
 using JasperFx.Core.Reflection;
 using Marten;
 using Marten.Services;
 using Wolverine.Persistence.Durability;
 using Wolverine.Runtime;
+using Wolverine.RDBMS.Outbox;
 
 namespace Wolverine.Marten.Publishing;
 
@@ -69,7 +71,7 @@ public class OutboxedSessionFactory
                     options.TenantId = c.TenantId;
                 }
 
-                return _store.OpenSession(options);
+                return openSession(options, factoryBase);
             };
         }
         else
@@ -85,6 +87,23 @@ public class OutboxedSessionFactory
         }
     }
     
+    // GH-5570: Marten 10 has no synchronous way to open a Serializable session that opens its own connection, because
+    // that session begins its transaction as it is created. Wolverine opens a handler's session synchronously, so a
+    // SessionFactoryBase asking for Serializable fails here, and the message says what to do instead
+    private IDocumentSession openSession(SessionOptions options, SessionFactoryBase factory)
+    {
+        try
+        {
+            return _store.OpenSession(options);
+        }
+        catch (NotSupportedException e) when (options.IsolationLevel == IsolationLevel.Serializable)
+        {
+            throw new NotSupportedException(
+                $"{factory.GetType().FullNameInCode()}.BuildOptions() asks for a Serializable session, which Marten 10 can only open asynchronously, and Wolverine opens the session for a handler synchronously. Use a weaker isolation level in BuildOptions(), or open the session in the handler with IDocumentStore.LightweightSerializableSessionAsync() (or one of its siblings) and enroll it in the outbox with IMartenOutbox.Enroll()",
+                e);
+        }
+    }
+
     /// <summary>
     /// The message store this factory enlists sessions in. Defaults to the runtime's <b>Main</b> store,
     /// resolved on every read rather than captured in the constructor; an ancillary-store subclass
@@ -164,32 +183,17 @@ public class OutboxedSessionFactory
     {
         context.OverrideStorage(MessageStore);
 
-        // Per-message CausationId override supplied via
-        // DeliveryOptions.CausationId (envelope header "causation-id") takes
-        // precedence over the default Wolverine ConversationId-based causation
-        // chain. This is how a projection that calls
-        // slice.PublishMessage(cmd, metadata with CausationId = ...) gets the
-        // overridden id onto the events the command's handler writes.
-        if (context.Envelope is { } env
-            && env.Headers.TryGetValue(EnvelopeConstants.CausationIdKey, out var headerCausationId)
-            && !string.IsNullOrEmpty(headerCausationId))
+        // GH-5144: what the session stamps on its writes comes from one place for every store
+        if (DocumentSessionOutboxSupport.CausationIdFor(context) is { } causationId)
         {
-            session.CausationId = headerCausationId;
-        }
-        else if (context.ConversationId != Guid.Empty)
-        {
-            session.CausationId = context.ConversationId.ToString();
+            session.CausationId = causationId;
         }
 
         session.CorrelationId = context.CorrelationId;
 
-        if (context.Envelope?.UserName is not null)
+        if (DocumentSessionOutboxSupport.UserNameFor(context) is { } userName)
         {
-            session.LastModifiedBy = context.Envelope.UserName;
-        }
-        else if (context.UserName is not null)
-        {
-            session.LastModifiedBy = context.UserName;
+            session.LastModifiedBy = userName;
         }
 
         var transaction = new MartenEnvelopeTransaction(session, context);

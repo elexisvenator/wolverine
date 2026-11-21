@@ -38,6 +38,10 @@ tables alongside Fisher's in the same file: use a transaction participant there 
 Leader election and agent distribution require several nodes sharing one database, and a Fisher store
 is a file. Configure `opts.Durability.Mode = DurabilityMode.Solo`. If you need several nodes over one
 event store, use [Marten](/guide/durability/marten/) or [Polecat](/guide/durability/polecat/).
+
+Because of that, `runtime.LocallyOwnedDatabases()` always answers `IsEvery` on a Fisher node. The `Contains()`
+overload that takes the Fisher database is in the `Wolverine.Fisher` namespace, the same as the
+[Marten one](/guide/durability/marten/distribution#which-databases-does-this-node-own).
 :::
 
 ## Getting Started
@@ -101,7 +105,7 @@ var builder = Host.CreateDefaultBuilder()
             });
     });
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/FisherTests/Bug_3947_prefix_name_for_sqlite_queue_tables.cs#L132-L151' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_fisher_prefix_name_for_sqlite_queue_tables' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/FisherTests/Bug_3947_prefix_name_for_sqlite_queue_tables.cs#L102-L121' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_fisher_prefix_name_for_sqlite_queue_tables' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 This is completely opt in. If you never set `PrefixName`, or you set it to SQLite's built-in `"main"`, the
@@ -111,10 +115,9 @@ copying any messages over. See [Prefixing the Queue Tables](/guide/durability/sq
 in the SQLite guide for the rest of the details.
 
 ::: warning
-`FisherIntegration.TransportSchemaName` is now obsolete. It never did anything on Fisher, because there's no
-schema for it to name. Setting it now sets `PrefixName` instead, so if you had set it before, your queue
-tables will pick up that value as a prefix when you upgrade. Either switch to `PrefixName` deliberately, or
-remove the `TransportSchemaName` setting to keep your existing queue table names.
+`FisherIntegration.TransportSchemaName` was removed in Wolverine 7.0. It never named anything on Fisher, because
+there's no schema for it to name, and in 6.x setting it set `PrefixName`. If you set it, set `PrefixName` to the same
+value to keep your queue table names, or delete the line if you never meant to prefix them.
 :::
 
 ## Event Sourcing

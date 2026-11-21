@@ -46,7 +46,7 @@ public class static_multi_tenancy : MultiTenancyContext
         var store = theHost.Services.GetRequiredService<IMessageStore>()
             .ShouldBeOfType<MultiTenantedMessageStore>();
 
-        store.Main.Describe().DatabaseName.ShouldBe("postgres");
+        store.Main.Describe().DatabaseName.ShouldBe(Servers.PostgresDatabaseName);
 
         (await store.Source.FindAsync("red")).Describe().DatabaseName.ShouldBe("db1");
         (await store.Source.FindAsync("blue")).Describe().DatabaseName.ShouldBe("db2");
@@ -84,6 +84,7 @@ public class static_multi_tenancy : MultiTenancyContext
             .ShouldBeOfType<MultiTenantedMessageStore>();
         var tables = await store.Main.As<PostgresqlMessageStore>().SchemaTables(TestContext.Current.CancellationToken);
 
+        // The 7.0 defaults add the hashed deduplication and deduplicated-responses tables (GH-5194) and partition the inbox by status (GH-5519)
         var expected = @"
 static_multi_tenancy2.blues
 static_multi_tenancy2.reds
@@ -91,7 +92,13 @@ static_multi_tenancy2.wolverine_agent_restrictions
 static_multi_tenancy2.wolverine_control_queue
 static_multi_tenancy2.wolverine_dead_letter_history
 static_multi_tenancy2.wolverine_dead_letters
+static_multi_tenancy2.wolverine_deduplicated_responses
+static_multi_tenancy2.wolverine_deduplication_hashed
 static_multi_tenancy2.wolverine_incoming_envelopes
+static_multi_tenancy2.wolverine_incoming_envelopes_default
+static_multi_tenancy2.wolverine_incoming_envelopes_handled
+static_multi_tenancy2.wolverine_incoming_envelopes_incoming
+static_multi_tenancy2.wolverine_incoming_envelopes_scheduled
 static_multi_tenancy2.wolverine_node_assignments
 static_multi_tenancy2.wolverine_node_records
 static_multi_tenancy2.wolverine_nodes
@@ -110,12 +117,19 @@ static_multi_tenancy2.wolverine_outgoing_envelopes
 
         await store.Source.RefreshAsync();
 
+        // The 7.0 defaults add the hashed deduplication and deduplicated-responses tables (GH-5194) and partition the inbox by status (GH-5519)
         var expected = @"
 static_multi_tenancy2.blues
 static_multi_tenancy2.reds
 static_multi_tenancy2.wolverine_dead_letter_history
 static_multi_tenancy2.wolverine_dead_letters
+static_multi_tenancy2.wolverine_deduplicated_responses
+static_multi_tenancy2.wolverine_deduplication_hashed
 static_multi_tenancy2.wolverine_incoming_envelopes
+static_multi_tenancy2.wolverine_incoming_envelopes_default
+static_multi_tenancy2.wolverine_incoming_envelopes_handled
+static_multi_tenancy2.wolverine_incoming_envelopes_incoming
+static_multi_tenancy2.wolverine_incoming_envelopes_scheduled
 static_multi_tenancy2.wolverine_outgoing_envelopes
 ".ReadLines().Where(x => x.IsNotEmpty()).ToArray();
 
@@ -135,8 +149,8 @@ static_multi_tenancy2.wolverine_outgoing_envelopes
         var store = theHost.Services.GetRequiredService<IMessageStore>()
             .ShouldBeOfType<MultiTenantedMessageStore>();
 
-        var expected = @"
-wolverinedb://postgresql/localhost/postgres/static_multi_tenancy2
+        var expected = $@"
+wolverinedb://postgresql/localhost/{Servers.PostgresDatabaseName}/static_multi_tenancy2
 wolverinedb://postgresql/localhost/db1/static_multi_tenancy2
 wolverinedb://postgresql/localhost/db3/static_multi_tenancy2
 wolverinedb://postgresql/localhost/db2/static_multi_tenancy2

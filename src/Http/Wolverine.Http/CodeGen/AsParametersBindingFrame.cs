@@ -53,7 +53,6 @@ internal class AsParamatersAttributeUsage : IParameterStrategy
             DescribeAsParametersBinding(parameter.ParameterType, out var hasForm, out var hasBody);
             chain.IsFormData = hasForm;
             chain.ReadsRequestBody = hasForm || hasBody;
-            if (hasForm) chain.BindsFormValues = true; // GH-4742
 
             var bindingFrame = new AsParametersBindingFrame(parameter.ParameterType, chain, container);
             chain.AsParametersVariable = bindingFrame.Variable;
@@ -230,7 +229,6 @@ internal class AsParametersBindingFrame : SyncFrame
         // 404'd. See GH-3630.
         chain.IsFormData = _hasForms;
         chain.ReadsRequestBody = _hasForms || _hasJsonBody;
-        if (_hasForms) chain.BindsFormValues = true; // GH-4742
     }
     
     /// <summary>
@@ -259,16 +257,29 @@ internal class AsParametersBindingFrame : SyncFrame
         {
             _hasForms = true;
             var formName = fatt.Name ?? memberName;
-            variable = HttpChain.UseDeclaredDefault(chain.TryFindOrCreateFormValue(memberType, memberName!, formName), parameter);
+            var formVariable = chain.TryFindOrCreateFormValue(memberType, memberName!, formName);
+
+            if (formVariable is not null)
+            {
+                formVariable.BoundParameter ??= parameter;
+            }
+
+            variable = HttpChain.UseDeclaredDefault(formVariable, parameter);
             return true;
         }
 
         if (parameter.TryGetAttribute<FromQueryAttribute>(out var qatt))
         {
             var queryStringName = qatt.Name ?? memberName;
+            var queryVariable = chain.TryFindOrCreateQuerystringValue(memberType, queryStringName!);
+
+            if (queryVariable is not null)
+            {
+                queryVariable.BoundParameter ??= parameter;
+            }
+
             // GH-5099: a constructor parameter's declared default survives a missing value
-            variable = HttpChain.UseDeclaredDefault(
-                chain.TryFindOrCreateQuerystringValue(memberType, queryStringName!), parameter);
+            variable = HttpChain.UseDeclaredDefault(queryVariable, parameter);
 
             return true;
         }
@@ -325,15 +336,28 @@ internal class AsParametersBindingFrame : SyncFrame
         {
             _hasForms = true;
             var formName = fatt.Name ?? memberName;
-            variable = chain.TryFindOrCreateFormValue(memberType, memberName!, formName);
+            var formVariable = chain.TryFindOrCreateFormValue(memberType, memberName!, formName);
+
+            if (formVariable is not null)
+            {
+                formVariable.BoundParameter ??= new PropertyAsParameterInfo(propertyInfo);
+            }
+
+            variable = formVariable;
             return true;
         }
 
         if (propertyInfo.TryGetAttribute<FromQueryAttribute>(out var qatt))
         {
             var queryStringName = qatt.Name ?? memberName;
-            variable =
-                chain.TryFindOrCreateQuerystringValue(memberType, queryStringName!);
+            var queryVariable = chain.TryFindOrCreateQuerystringValue(memberType, queryStringName!);
+
+            if (queryVariable is not null)
+            {
+                queryVariable.BoundParameter ??= new PropertyAsParameterInfo(propertyInfo);
+            }
+
+            variable = queryVariable;
 
             return true;
         }
@@ -402,6 +426,12 @@ internal class AsParametersBindingFrame : SyncFrame
     public override IEnumerable<Variable> FindVariables(IMethodVariables chain)
     {
         foreach (var parameter in _dependencies) yield return parameter;
+
+        // The arranger never sees the absorbed frames, which this frame emits inline
+        foreach (var variable in _parameterFrames.Concat(_props).SelectMany(x => x.FindVariables(chain)))
+        {
+            yield return variable;
+        }
     }
 
     // A member is nullable when it's a Nullable<T> value type or a reference type whose nullable

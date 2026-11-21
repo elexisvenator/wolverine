@@ -54,6 +54,20 @@ internal class DeadLettersTable : Table
             Columns = [DatabaseConstants.FailureGroup]
         });
 
+        // GH-5557: the saga id of the dead lettered envelope, so one saga's dead letters can be found. Nullable
+        AddColumn(DatabaseConstants.SagaId, "varchar(500)").AllowNulls();
+        Indexes.Add(new IndexDefinition($"idx_{DatabaseConstants.DeadLetterTable}_{DatabaseConstants.SagaId}")
+        {
+            Columns = [DatabaseConstants.SagaId]
+        });
+
+        // GH-5556: why Wolverine dead lettered the message (compensated, compensation-failed, ...). Nullable
+        AddColumn(DatabaseConstants.Tag, "varchar(100)").AllowNulls();
+        Indexes.Add(new IndexDefinition($"idx_{DatabaseConstants.DeadLetterTable}_{DatabaseConstants.Tag}")
+        {
+            Columns = [DatabaseConstants.Tag]
+        });
+
         if (durability.DeadLetterQueueExpirationEnabled)
         {
             AddColumn<DateTimeOffset>(DatabaseConstants.Expires).AllowNulls();

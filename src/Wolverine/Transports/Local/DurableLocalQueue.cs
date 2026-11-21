@@ -12,7 +12,7 @@ using Wolverine.Transports.Sending;
 
 namespace Wolverine.Transports.Local;
 
-internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
+internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue, IPlaysScheduledMessages
 {
     private readonly IMessageInbox _inbox;
     private readonly ILogger _logger;
@@ -28,13 +28,35 @@ internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
     private Restarter? _restarter;
 
     // F6. What reached this queue while it was paused -- a batch carrier assembled while its batch queue was paused,
-    // above all -- held here until the queue resumes. Guarded by _receiverLock, together with the swap of _receiver.
+    // above all -- held here until the queue resumes. Guarded by _receiverLock, together with the swap of _receiver,
+    // the paused flags and _restarter, so a pause and a start each change all of them at once.
     private readonly object _receiverLock = new();
     private List<Envelope>? _heldWhilePaused;
+
+    // Serializes StartAsync against itself. Only StartAsync takes it, so a pause raised from a handler still running
+    // in the drain a start is waiting for can never wait on it.
+    private readonly SemaphoreSlim _startLock = new(1, 1);
 
     // L1. The drain of the receiver a pause took away, when that pause did not wait for it. The restart waits for it
     // so the old receiver's release can never hand back rows the new receiver has already taken.
     private Task? _pausedDrain;
+
+    // GH-5586. Set once the queue holds InMemoryLimit envelopes, and cleared once it has drained to its
+    // BufferingLimits.Restart. While it is set, what is published here is written to the inbox for any node and left
+    // there for recovery, instead of the publisher waiting for room.
+    private volatile bool _full;
+
+    // GH-5586. Leaving a message in the inbox only works when something will recover it from there: a real message
+    // store and a durability agent. Without them the queue takes everything published to it, as before 7.0, but
+    // without ever making the publisher wait for room.
+    private readonly bool _canLeaveInInbox;
+
+    /// <summary>
+    /// GH-5586. How many envelopes a durable local queue holds in memory before what is published to it waits in the
+    /// inbox instead. The same number its in-memory block was bounded at before 7.0, so a queue that never filled that
+    /// far behaves exactly as it did.
+    /// </summary>
+    internal const int InMemoryLimit = Block<Envelope>.DefaultBoundedCapacity;
 
     public DurableLocalQueue(Endpoint endpoint, WolverineRuntime runtime)
     {
@@ -77,7 +99,11 @@ internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
             Pipeline = new HandlerPipeline(runtime, runtime, endpoint);
         }
 
-        _receiver = new DurableReceiver(endpoint, runtime, Pipeline);
+        _receiver = new DurableReceiver(endpoint, runtime, Pipeline, Block<Envelope>.Unbounded);
+
+        _canLeaveInInbox = runtime.Storage is not NullMessageStore
+                           && _settings.DurabilityAgentEnabled
+                           && _settings.Mode is DurabilityMode.Solo or DurabilityMode.Balanced;
 
         if (_settings.StoreIncomingBatchSize > 1)
         {
@@ -121,6 +147,10 @@ internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
         // waits for, and it sat out the whole DrainTimeout waiting on itself. The drain still latches first and
         // still waits for running handlers before it releases their rows (GH-4797) -- it just does so in the
         // background, where the frame that asked for it can finish.
+
+        // GH-5446. Not the breaker's pause, so the start that ends it is not a breaker recovery
+        CircuitBreaker?.PauseSuperseded();
+
         return pauseCoreAsync(pauseTime, waitForDrain: false);
     }
 
@@ -132,15 +162,15 @@ internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
 
     private async ValueTask pauseCoreAsync(TimeSpan pauseTime, bool waitForDrain)
     {
-        Latched = true;
-        // GH-3832 — remember that this latch is a timed pause so Status reports Paused rather than
-        // the TooBusy that a back-pressure latch reports. This one is released by the Restarter
-        // installed at the end of this method; TooBusy is released by the queue draining.
-        _paused = true;
-
         DurableReceiver? receiver;
         lock (_receiverLock)
         {
+            Latched = true;
+            // GH-3832 — remember that this latch is a timed pause so Status reports Paused rather than
+            // the TooBusy that a back-pressure latch reports. This one is released by the Restarter
+            // installed at the end of this method; TooBusy is released by the queue draining.
+            _paused = true;
+
             receiver = _receiver;
             _receiver = null;
         }
@@ -164,15 +194,22 @@ internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
 
         CircuitBreaker?.Reset();
 
-        _runtime.Tracker.Publish(
-            new ListenerState(Endpoint.Uri, Endpoint.EndpointName, ListeningStatus.Paused));
+        lock (_receiverLock)
+        {
+            // A start since this pause took the receiver has resumed the queue, so this pause no longer applies
+            if (!_paused) return;
+
+            // A second pause while paused -- a sibling handler failing the same way -- restarts the clock instead of
+            // leaving two restarters behind. Installed before Paused is published: a subscriber that resumes the
+            // queue on that event has to find this Restarter to dispose, or it fires later on an accepting queue.
+            _restarter?.Dispose();
+            _restarter = new Restarter(() => startAsync(CircuitBreakerResetReason.PauseTimeElapsed), pauseTime);
+
+            _runtime.Tracker.Publish(
+                new ListenerState(Endpoint.Uri, Endpoint.EndpointName, ListeningStatus.Paused));
+        }
 
         _logger.LogInformation("Pausing message listening at {Uri}", Endpoint.Uri);
-
-        // A second pause while paused -- a sibling handler failing the same way -- restarts the clock instead of
-        // leaving two restarters behind
-        _restarter?.Dispose();
-        _restarter = new Restarter(this, pauseTime);
     }
 
     private Task drainPausedReceiverAsync(DurableReceiver receiver)
@@ -213,7 +250,45 @@ internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
         }
     }
 
-    public async ValueTask StartAsync()
+    public ValueTask StartAsync()
+    {
+        return startAsync(CircuitBreakerResetReason.ExplicitStart);
+    }
+
+    private async ValueTask startAsync(CircuitBreakerResetReason reason)
+    {
+        if (((IListenerCircuit)this).Status == ListeningStatus.Accepting)
+        {
+            return;
+        }
+
+        // Reached from the pause's Restarter, from a global partition slot coming back, and from anything that
+        // resumes the queue on its Paused event, so two starts can overlap. Unserialized, each built a receiver and
+        // the later one replaced the earlier, which was never disposed. Same re-check under the lock as
+        // ListeningAgent.StartAsync (GH-5217).
+        await _startLock.WaitAsync();
+        try
+        {
+            if (((IListenerCircuit)this).Status == ListeningStatus.Accepting)
+            {
+                return;
+            }
+
+            await startQueueAsync();
+        }
+        finally
+        {
+            _startLock.Release();
+        }
+
+        // GH-5446. Outside the start lock, so an observer that reaches back into this queue cannot deadlock it
+        if (((IListenerCircuit)this).Status == ListeningStatus.Accepting && CircuitBreaker != null)
+        {
+            await CircuitBreaker.ListenerResumedAsync(reason, _logger);
+        }
+    }
+
+    private async ValueTask startQueueAsync()
     {
         // L1. A pause that did not wait for its drain leaves it here. The drain ends in a release of every row this
         // node owns at this address, so it has to be over before a new receiver starts taking rows at the same one.
@@ -226,7 +301,7 @@ internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
 #pragma warning restore VSTHRD003
         }
 
-        var receiver = new DurableReceiver(Endpoint, _runtime, Pipeline)
+        var receiver = new DurableReceiver(Endpoint, _runtime, Pipeline, Block<Envelope>.Unbounded)
         {
             AlsoReleaseIncomingAt = _partitionSlotUri
         };
@@ -241,14 +316,15 @@ internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
             _receiver = receiver;
             held = _heldWhilePaused;
             _heldWhilePaused = null;
-        }
 
-        Latched = false;
-        _paused = false;
-        _runtime.Tracker.Publish(new ListenerState(receiver.Uri, Endpoint.EndpointName,
-            ListeningStatus.Accepting));
-        _restarter?.Dispose();
-        _restarter = null;
+            Latched = false;
+            _paused = false;
+            _restarter?.Dispose();
+            _restarter = null;
+
+            _runtime.Tracker.Publish(new ListenerState(receiver.Uri, Endpoint.EndpointName,
+                ListeningStatus.Accepting));
+        }
 
         if (held != null)
         {
@@ -262,15 +338,81 @@ internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
     private DurableReceiver? receiverOrHold(Envelope envelope)
     {
         var receiver = _receiver;
-        if (receiver != null) return receiver;
+        if (receiver is { HasFaulted: false }) return receiver;
 
         lock (_receiverLock)
         {
+            if (_receiver is { HasFaulted: true } faulted && !Latched)
+            {
+                replaceFaultedReceiver(faulted);
+            }
+
             if (_receiver != null) return _receiver;
 
             (_heldWhilePaused ??= []).Add(envelope);
             return null;
         }
+    }
+
+    /// <summary>
+    /// GH-5358. No ListeningAgent owns a local queue, so nothing else would ever replace a receiver whose block faulted
+    /// terminally (jasperfx#506), and every message sent here afterwards would throw for the life of the process. Taken
+    /// out the way a pause takes a receiver out: latched, so what is published meanwhile is stored for recovery rather
+    /// than held against rows the drain is about to release, and drained, which hands the faulted receiver's rows back
+    /// for recovery to run again. The rows are durable, so unlike a buffered queue nothing is lost. Called under
+    /// <see cref="_receiverLock" />.
+    /// </summary>
+    private void replaceFaultedReceiver(DurableReceiver faulted)
+    {
+        _receiver = null;
+        Latched = true;
+
+        _logger.LogWarning(
+            "The durable local queue at {Uri} faulted and is being rebuilt. Its {Count} envelope(s) still owned by this node are being released for recovery",
+            Uri, faulted.QueueCount);
+
+        faulted.Latch();
+
+        // startAsync waits for this before the new receiver can claim a row at the same address (L1). Disposed
+        // asynchronously, as ListeningAgent disposes a faulted receiver: the sync Dispose skips DisposeAsync's work.
+        _pausedDrain = Task.Run(async () =>
+        {
+            try
+            {
+                await faulted.DrainAsync();
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "Error trying to drain in flight messages for {Uri}", Destination);
+            }
+
+            try
+            {
+                await faulted.DisposeAsync();
+            }
+            catch (Exception e)
+            {
+                _logger.LogInformation(e, "Error disposing the faulted receiver for {Uri}", Uri);
+            }
+        });
+
+        _ = Task.Run(async () =>
+        {
+            await _startLock.WaitAsync();
+            try
+            {
+                // A pause since then owns the restart, through its Restarter
+                if (_receiver == null && !_paused) await startQueueAsync();
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "Unable to rebuild the faulted durable local queue at {Uri}", Uri);
+            }
+            finally
+            {
+                _startLock.Release();
+            }
+        });
     }
 
     private bool _paused;
@@ -289,7 +431,13 @@ internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
     {
         _receiver?.SafeDispose();
         CircuitBreaker?.SafeDisposeSynchronously();
-        _receiver?.SafeDispose();
+
+        // A pending Restarter would otherwise start the queue again after its host has gone
+        lock (_receiverLock)
+        {
+            _restarter?.SafeDispose();
+            _restarter = null;
+        }
     }
 
     ValueTask IReceiver.ReceivedAsync(IListener listener, Envelope[] messages)
@@ -345,6 +493,59 @@ internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
 
     public bool IsDurable => true;
 
+    /// <summary>
+    /// GH-5586. Is the queue holding all it should in memory? Once it is, it stays full until it has drained to its
+    /// BufferingLimits.Restart, so a publisher's messages do not flip between the queue and the inbox one by one.
+    /// </summary>
+    internal bool IsFull
+    {
+        get
+        {
+            if (!_canLeaveInInbox) return false;
+
+            var count = _receiver?.QueueCount ?? 0;
+            if (_full)
+            {
+                if (count <= Math.Min(Endpoint.BufferingLimits.Restart, InMemoryLimit / 2)) _full = false;
+            }
+            else if (count >= InMemoryLimit)
+            {
+                _full = true;
+            }
+
+            return _full;
+        }
+    }
+
+    /// <summary>
+    /// GH-5699. An envelope sent to this queue by its address -- <c>EndpointFor(...).SendAsync()</c>, or a
+    /// <see cref="Fault{T}" /> going to the reply address a saga asked for -- never went through the local message route
+    /// that marks a local envelope <see cref="EnvelopeStatus.Incoming" />. Written to the inbox as it is, its row would
+    /// stay <see cref="EnvelopeStatus.Outgoing" /> with no owner, and recovery would never pick it up after a crash.
+    /// </summary>
+    internal void PrepareForInbox(Envelope envelope)
+    {
+        if (envelope.Status != EnvelopeStatus.Outgoing) return;
+
+        envelope.PrepareForIncomingPersistence(DateTimeOffset.UtcNow, _settings);
+    }
+
+    /// <summary>
+    /// GH-5586. Called as an envelope bound here joins a transaction. If the queue is full (or latched), its inbox row
+    /// is written for any node and the flush after the commit leaves it for recovery, so the publisher never waits for
+    /// room in the queue.
+    /// </summary>
+    internal void ChooseInboxOwner(Envelope envelope)
+    {
+        if (envelope.Status != EnvelopeStatus.Incoming) return;
+
+        if (Latched || IsFull)
+        {
+            envelope.OwnerId = TransportConstants.AnyNode;
+            envelope.LeftInInboxForRecovery = true;
+        }
+    }
+
     public async ValueTask EnqueueOutgoingAsync(Envelope envelope)
     {
         // The envelope would be persisted regardless
@@ -354,6 +555,13 @@ internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
         }
 
         _messageLogger.Sent(envelope);
+
+        // GH-5586. Its row was written for any node because the queue was full when it joined the transaction, so
+        // recovery brings it into the queue once there is room
+        if (envelope.LeftInInboxForRecovery)
+        {
+            return;
+        }
 
         // A pause can land between the check above and here
         var receiver = receiverOrHold(envelope);
@@ -377,6 +585,19 @@ internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
         // GH-4662: awaited rather than posted to a RetryBlock, so a store that stays down fails the
         // publish instead of discarding the envelope behind the caller's back.
         return new ValueTask(storeAndEnqueueAsync(envelope));
+    }
+
+    /// <inheritdoc />
+    public Task PlayNowAsync(Envelope envelope)
+    {
+        writeMessageData(envelope);
+        _messageLogger.Sent(envelope);
+        envelope.PrepareForIncomingPersistence(DateTimeOffset.UtcNow, _settings);
+
+        var receiver = _receiver ?? throw new InvalidOperationException(
+            $"The durable local queue {Uri} is paused, so it cannot play {envelope.MessageType}");
+
+        return receiver.Pipeline.InvokeAsync(envelope, receiver);
     }
 
     public bool SupportsNativeScheduledSend => true;
@@ -410,12 +631,14 @@ internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
 
     private async Task storeAndEnqueueAsync(Envelope envelope)
     {
-        var isLatched = Latched;
+        // GH-5586. A full queue is treated like a latched one: the row is written for any node and left for
+        // recovery, rather than the publisher waiting for room once it is written
+        var leaveForRecovery = Latched || IsFull;
 
         try
         {
-            // Use AnyNode when latched so the durability agent can recover the message.
-            envelope.OwnerId = isLatched
+            // Use AnyNode when latched or full so the durability agent can recover the message.
+            envelope.OwnerId = leaveForRecovery
                 ? TransportConstants.AnyNode
                 : _settings.AssignedNodeNumber;
 
@@ -442,7 +665,7 @@ internal class DurableLocalQueue : ISendingAgent, IListenerCircuit, ILocalQueue
             return;
         }
 
-        if (isLatched)
+        if (leaveForRecovery)
         {
             return;
         }

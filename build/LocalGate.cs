@@ -22,17 +22,18 @@ using static Nuke.Common.Tools.DotNet.DotNetTasks;
 //   ./build.sh LocalGate                              every suite, then the extras
 //   ./build.sh LocalGateSuites                        the supervised suites alone
 //   ./build.sh LocalGateSuites --gate-only Marten     only the suites whose project name contains "Marten"
-//   ./build.sh LocalGate --framework all              every framework a suite declares (EF Core 9 AND 10)
+//   ./build.sh LocalGate --gate-with AzureServiceBus  every suite plus the opt-in suites named (see OptIn below)
+//   ./build.sh LocalGate --framework all              every framework a suite declares (every framework, net10.0 AND net11.0)
 //
 // Release, as in CI, unless --configuration says otherwise. The framework is .nuke/parameters.json's
-// net9.0, as in CI; a suite that does not target it runs on its newest.
+// net10.0, as in CI; a suite that does not target it runs on its newest.
 //
 // What it does, in order:
 //
 //   1. Starts (or reuses) every docker-compose service a selected suite needs, without waiting.
 //   2. Builds ONCE, Release, while the containers boot: one `dotnet build` per framework over a
 //      generated solution of the selected test projects. Not the whole solution: `-f` on a
-//      solution applies to every project in it, and wolverine.slnx has net9.0-only and net10.0-only
+//      solution applies to every project in it, and wolverine.slnx has net10.0-only and net10.0;net11.0
 //      projects side by side (bobcat#774), while building it unpinned builds everything twice.
 //   3. Waits for the services' real readiness probes (AwaitDockerServices), then runs every suite as
 //      a unit of one Bobcat gate: longest first, concurrently, under one worker budget, never two
@@ -74,6 +75,9 @@ partial class Build
 
     [Parameter("LocalGate: run only the suites whose project name contains one of these (case-insensitive)")]
     readonly string[] GateOnly;
+
+    [Parameter("LocalGate: also run the opt-in suites whose project name contains one of these (case-insensitive), e.g. AzureServiceBus")]
+    readonly string[] GateWith;
 
     [Parameter("LocalGate: reuse the test hosts already built under bin/Release instead of building them")]
     readonly bool GateSkipBuild;
@@ -118,6 +122,18 @@ partial class Build
         /// <summary>Extra environment for every worker.</summary>
         public Dictionary<string, string> Environment { get; init; } = new();
 
+        /// <summary>
+        /// Connection strings each lane gets its own of, by lane number, handed over as ConnectionStrings__{name}
+        /// (which src/Servers.cs reads first). For services the gate already runs one of per lane.
+        /// </summary>
+        public Dictionary<string, Func<int, string>> LaneConnectionStrings { get; init; } = new();
+
+        /// <summary>
+        /// Left out of a default LocalGate run; it runs only when named with --gate-with or --gate-only. Still a
+        /// gated suite as far as VerifyLocalGateCoverage is concerned, so it never goes in NotGated.
+        /// </summary>
+        public bool OptIn { get; init; }
+
         public IEnumerable<string> ComposeServices()
         {
             if (Postgres != ServerUse.None) yield return "postgresql";
@@ -143,24 +159,26 @@ partial class Build
     [
         // ─── dotnet.yml (`./build.sh ci`) ───
         new("src/Testing/CoreTests/CoreTests.csproj", "CoreTests"),
+        // GH-5545: the build's own decisions (build/ServiceHeal.cs)
+        new("src/Testing/BuildTests/BuildTests.csproj", "CoreTests"),
         new("src/Testing/MessageRoutingTests/MessageRoutingTests.csproj", "CIMessageRouting") { Services = ["rabbitmq"] },
 
         // ─── Persistence ───
         new("src/Persistence/PersistenceTests/PersistenceTests.csproj", "CIPersistence")
         {
-            Postgres = ServerUse.Shared, SqlServer = ServerUse.Shared, Services = ["rabbitmq"], Frameworks = ["net9.0"]
+            Postgres = ServerUse.Shared, SqlServer = ServerUse.Shared, Services = ["rabbitmq"], Frameworks = ["net10.0"]
         },
-        new("src/Persistence/PostgresqlTests/PostgresqlTests.csproj", "CIPersistence") { Postgres = ServerUse.Shared },
+        new("src/Persistence/PostgresqlTests/PostgresqlTests.csproj", "CIPersistence, CIPostgresql, CIPostgresqlFeatures") { Postgres = ServerUse.Shared, Services = ["rabbitmq"] },
         new("src/Persistence/MartenTests/MartenTests.csproj", "CIMarten, CIMartenDistribution, CIMartenTenancy")
         {
             Postgres = ServerUse.Shared
         },
         new("src/Persistence/MartenSubscriptionTests/MartenSubscriptionTests.csproj", "CIMarten") { Postgres = ServerUse.OwnDatabase },
-        new("src/Persistence/EfCoreTests/EfCoreTests.csproj", "CIEfCore, CIEfCoreNet10")
+        new("src/Persistence/EfCoreTests/EfCoreTests.csproj", "CIEfCore")
         {
             Postgres = ServerUse.Shared, SqlServer = ServerUse.Shared, Services = ["rabbitmq"]
         },
-        new("src/Persistence/EfCoreTests.MultiTenancy/EfCoreTests.MultiTenancy.csproj", "CIEfCoreNet10")
+        new("src/Persistence/EfCoreTests.MultiTenancy/EfCoreTests.MultiTenancy.csproj", "CIEfCoreMultiTenancy")
         {
             Postgres = ServerUse.Shared, SqlServer = ServerUse.Shared, Services = ["rabbitmq"]
         },
@@ -186,10 +204,10 @@ partial class Build
         {
             Holds = ["cosmos-emulator"]
         },
-        new("src/Persistence/RavenDbTests/RavenDbTests.csproj", "CIRavenDb") { Holds = ["ravendb"], Frameworks = ["net9.0"] },
+        new("src/Persistence/RavenDbTests/RavenDbTests.csproj", "CIRavenDb") { Holds = ["ravendb"], Frameworks = ["net10.0"] },
         new("src/Persistence/LeaderElection/RavenDbTests.LeaderElection/RavenDbTests.LeaderElection.csproj", "CIRavenDb")
         {
-            Holds = ["ravendb"], Frameworks = ["net9.0"]
+            Holds = ["ravendb"], Frameworks = ["net10.0"]
         },
         new("src/Persistence/Wolverine.ClaimCheck.Postgresql.Tests/Wolverine.ClaimCheck.Postgresql.Tests.csproj", "CIClaimCheck")
         {
@@ -234,17 +252,26 @@ partial class Build
         new("src/Transports/Azure/Wolverine.AzureServiceBus.Tests/Wolverine.AzureServiceBus.Tests.csproj",
             "CIAzureServiceBus, CIAzureServiceBusLeader, CIAzureServiceBusRouting")
         {
-            Services = ["asb-emulator"], Postgres = ServerUse.OwnDatabase
+            // Two lanes, one emulator pair each. The suite deletes everything in its emulator between tests, so two lanes
+            // can never share one, and the supervisor keeps each class on one lane. GH-5196: strict_tenancy_5196 uses
+            // asb-emulator-2 as a tenant's own namespace, so it is [Trait("Isolated", "true")] and runs alone after the
+            // lanes. The Postgres-backed classes use schemas of their own (registry, asb_dlq_recovery, gletters_asb,
+            // gh5116_asb, Bug_5202's prefix), so the lanes share the suite's database
+            Services = ["asb-emulator", "asb-emulator-2"], Postgres = ServerUse.OwnDatabase, Workers = 2,
+            LaneConnectionStrings = new()
+            {
+                ["azureservicebus"] = lane => azureServiceBusEmulatorForLane(lane, management: false),
+                ["azureservicebus-management"] = lane => azureServiceBusEmulatorForLane(lane, management: true)
+            },
+            // Jeremy 2026-11-17: opt-in. The emulators are slow and contended, so the suite runs only when a change
+            // touches src/Transports/Azure: --gate-with AzureServiceBus, or --gate-only AzureServiceBus alone
+            OptIn = true
         },
         new("src/Transports/Kafka/Wolverine.Kafka.Tests/Wolverine.Kafka.Tests.csproj", "CIKafka")
         {
             Services = ["kafka"], Postgres = ServerUse.OwnDatabase
         },
         new("src/Transports/MQTT/Wolverine.MQTT.Tests/Wolverine.MQTT.Tests.csproj", "CIMQTT")
-        {
-            Holds = ["mqtt-broker-ports"], Postgres = ServerUse.OwnDatabase, SqlServer = ServerUse.OwnDatabase
-        },
-        new("src/Transports/MQTT/Wolverine.Mqtt5.Tests/Wolverine.Mqtt5.Tests.csproj", "CIMQTT5")
         {
             Holds = ["mqtt-broker-ports"], Postgres = ServerUse.OwnDatabase, SqlServer = ServerUse.OwnDatabase
         },
@@ -272,9 +299,14 @@ partial class Build
         new("src/Transports/Redis/Wolverine.Redis.Tests/Wolverine.Redis.Tests.csproj", "CIRedis") { Postgres = ServerUse.OwnDatabase },
         new("src/Testing/OpenTelemetry/TracingTests/TracingTests.csproj", "CIOtel") { Services = ["rabbitmq"] },
         new("src/Wolverine.Grpc.Tests/Wolverine.Grpc.Tests.csproj", "CIGrpc"),
+        // Starts the AspireWith* sample AppHosts through Aspire.Hosting.Testing: Pulsar, LocalStack and the gcloud
+        // Pub/Sub emulator each run in a container of Aspire's own, on random host ports, so no compose service
+        // and no track. They are heavy, so the suite runs its classes one at a time (NoParallelization.cs).
+        new("src/Testing/Wolverine.Aspire.Hosting.Tests/Wolverine.Aspire.Hosting.Tests.csproj", "CIAspireHosting"),
 
         // ─── http.yml ───
         new("src/Http/Wolverine.Http.Tests/Wolverine.Http.Tests.csproj", "CIHttp") { Postgres = ServerUse.OwnDatabase },
+        new("src/Http/Wolverine.Http.Compat.Tests/Wolverine.Http.Compat.Tests.csproj", "CIHttpCompat"),
         new("src/Http/Wolverine.Http.AspVersioning.Tests/Wolverine.Http.AspVersioning.Tests.csproj", "CIHttpAspVersioning")
         {
             Frameworks = ["net10.0"]
@@ -304,6 +336,19 @@ partial class Build
         new("src/Samples/ProcessManagerViaHandlers/ProcessManagerViaHandlers.Tests/ProcessManagerViaHandlers.Tests.csproj", "CIBobcat")
         {
             Postgres = ServerUse.OwnDatabase, SqlServer = ServerUse.OwnDatabase
+        },
+        new("src/Samples/SagaFaults/SagaFaults.Specs/SagaFaults.Specs.csproj", "CIBobcat")
+        {
+            Postgres = ServerUse.OwnDatabase
+        },
+        new("src/Samples/EventSourcedSagas/EventSourcedSagas.Specs/EventSourcedSagas.Specs.csproj", "CIBobcat")
+        {
+            // Marten on PostgreSQL, Polecat on SQL Server, Fisher on a SQLite file of its own
+            Postgres = ServerUse.OwnDatabase, SqlServer = ServerUse.OwnDatabase
+        },
+        new("src/Samples/SagaWorkflows/SagaWorkflows.Specs/SagaWorkflows.Specs.csproj", "CIBobcat")
+        {
+            Postgres = ServerUse.OwnDatabase
         },
 
         // ─── CIExtensions ───
@@ -387,12 +432,23 @@ partial class Build
             var clock = Stopwatch.StartNew();
             verifyLocalGateCoverage();
 
+            static bool named(GateSuite suite, string[] names) =>
+                names is { Length: > 0 } && names.Any(x => suite.Name.Contains(x, StringComparison.OrdinalIgnoreCase));
+
+            // --gate-only picks by name, opt-in suites included. Otherwise every suite runs except the opt-in
+            // ones, unless --gate-with names them.
             var suites = GateSuites
-                .Where(s => GateOnly is not { Length: > 0 } ||
-                            GateOnly.Any(x => s.Name.Contains(x, StringComparison.OrdinalIgnoreCase)))
+                .Where(s => GateOnly is { Length: > 0 } ? named(s, GateOnly) : !s.OptIn || named(s, GateWith))
                 .ToArray();
             if (suites.Length == 0)
                 throw new InvalidOperationException($"--gate-only {string.Join(" ", GateOnly)} matched no suite.");
+
+            if (GateWith is { Length: > 0 } && !GateSuites.Any(s => s.OptIn && named(s, GateWith)))
+                throw new InvalidOperationException($"--gate-with {string.Join(" ", GateWith)} matched no opt-in suite.");
+
+            foreach (var skipped in GateSuites.Where(s => s.OptIn).Except(suites))
+                Log.Information("Skipped {Suite}: an opt-in suite. Add --gate-with {Suite} to run it with the gate.",
+                    skipped.Name, skipped.Name);
 
             var gate = new GateDeclaration
             {
@@ -404,21 +460,45 @@ partial class Build
             };
             if (GateWorkers is { } budget) gate.WorkerBudget = budget;
 
-            foreach (var track in suites.SelectMany(s => s.Tracks()).Distinct(StringComparer.OrdinalIgnoreCase))
+            // GH-5545: SQL Server can be recreated mid-gate only when no two units use it at once. See gateHealsSqlServer.
+            var healSqlServer = gateHealsSqlServer(suites.Select(s => (s.Name, s.SqlServer)).ToArray(), out var whyNotSqlServer);
+            if (!healSqlServer && whyNotSqlServer is not null)
+                Log.Information("GH-5545: SQL Server is not recreated mid-gate if it degrades: {Reason}", whyNotSqlServer);
+
+            string[] tracksOf(GateSuite suite)
+            {
+                var tracks = suite.Tracks().ToList();
+
+                // The one suite on SQL Server holds its track, so the heal is the track's
+                if (healSqlServer && suite.SqlServer != ServerUse.None && !tracks.Contains("sqlserver")) tracks.Add("sqlserver");
+                return tracks.ToArray();
+            }
+
+            foreach (var track in suites.SelectMany(tracksOf).Distinct(StringComparer.OrdinalIgnoreCase))
                 gate.Tracks.Add(new Track(track));
 
             foreach (var suite in suites)
             {
+                var tracks = tracksOf(suite);
                 var project = gate.Project(RootDirectory / suite.Path, suite.Workers)
                     .Targeting(suite.Frameworks ?? gateFrameworksOf(suite))
-                    .Supervise((unit, supervisor) => configureSupervisor(supervisor, suite.Name, unit.Framework, null,
-                        message => Log.Information("  [{Unit}] {Message}", unit.Name, message)))
+                    .Supervise((unit, supervisor) =>
+                    {
+                        configureSupervisor(supervisor, suite.Name, unit.Framework, null,
+                            message => Log.Information("  [{Unit}] {Message}", unit.Name, message));
+
+                        // GH-5545: Bobcat's degradation signal reads each test against its known duration, and a box
+                        // has none unless it fetched CI's. The gate's own last clean run is the next best thing.
+                        supervisor.KnownTestDurations ??= gateKnownDurations(suite.Name, unit.Framework);
+
+                        // The gate wired its heal for a unit on a healable track; check the service's probes first.
+                        confirmBeforeHealing(supervisor, unit.Name, healedServicesOf(gate, tracks));
+                    })
                     // Provisioned when the unit starts rather than before the gate: a database is the
                     // unit's alone, and recreating it is only safe once the unit is the one running.
                     .LaunchingWith(unit => workerFactoryFor(unit.Executable, gateConnectionStrings(suite, unit),
                         suite.Environment.Count > 0 ? suite.Environment : null));
 
-                var tracks = suite.Tracks().ToArray();
                 if (tracks.Length > 0) project.On(tracks);
             }
 
@@ -428,16 +508,34 @@ partial class Build
             Log.Information("=== LocalGate: {Units} unit(s) from {Suites} suite(s), {Services} ===",
                 units.Count, suites.Length, services.Length == 0 ? "no docker services" : string.Join(" ", services));
 
-            if (services.Length > 0) LaunchDockerServices(services);
+            // GH-5532: the gate owns its services for the run, so SQL Server and the ASB emulator pairs
+            // start fresh after the build and before any unit provisions a database or lane on them.
+            // Keyed on the compose services, not the tracks: SqlServerTests' lanes hold no sqlserver track.
+            var fresh = FreshServices.Select(f => f.Requested).Intersect(services).ToArray();
+            var rest = services.Except(fresh).ToArray();
+
+            if (rest.Length > 0) LaunchDockerServices(rest);
             if (!GateSkipBuild) buildGateUnits(units);
-            if (services.Length > 0) AwaitDockerServices(services);
+
+            // Taken after the build and before the emulators are started fresh, and held until every unit is done: one
+            // Azure Service Bus run on this box at a time (build/AzureServiceBusLock.cs)
+            using var asbLock = services.Contains("asb-emulator") ? acquireAzureServiceBusLock() : null;
+
+            if (fresh.Length > 0) StartServicesFresh(fresh);
+            if (rest.Length > 0) AwaitDockerServices(rest);
+
+            // GH-5545: the tracks of a service this gate started fresh may recreate it when a unit degrades on it
+            healGateTracks(gate, suites, healSqlServer);
 
             var cleanBefore = cleanFSharpFixtures();
             var results = await gate.Run();
             restoreFSharpFixtures(cleanBefore);
 
             foreach (var unit in results.Units.Where(u => u.Results is not null))
+            {
                 recordLedger(unit.Unit.Project.Name, unit.Unit.Framework, unit.Results, GateLedgerJob);
+                recordGateDurations(unit.Unit.Project.Name, unit.Unit.Framework, unit.Results);
+            }
 
             clock.Stop();
             Console.WriteLine();
@@ -466,7 +564,7 @@ partial class Build
 
     /// <summary>
     /// The frameworks a suite's project declares: its own TargetFramework(s), or the repository's
-    /// net9.0;net10.0 from Directory.Build.props when it declares none, which the gate's project-file
+    /// net10.0;net11.0 from Directory.Build.props when it declares none, which the gate's project-file
     /// reader cannot see.
     /// </summary>
     static string[] gateFrameworksOf(GateSuite suite)
@@ -498,7 +596,7 @@ partial class Build
                 .ToArray();
 
             // A solution of its own rather than a filter over wolverine.slnx: that marks its net10.0-only
-            // projects <Build Project="false" /> (Compile builds it pinned to net9.0), and a filter
+            // projects <Build Project="false" /> (Compile builds it pinned to one framework), and a filter
             // inherits the mark.
             File.WriteAllText(filter, "<Solution>\n" + string.Concat(projects.Select(p =>
                 $"  <Project Path=\"{Path.GetRelativePath(directory, RootDirectory / p).Replace('\\', '/')}\" />\n")) + "</Solution>\n");
@@ -526,8 +624,7 @@ partial class Build
     WorkerConnectionStrings gateConnectionStrings(GateSuite suite, GateUnit unit)
     {
         var connectionStrings = new WorkerConnectionStrings();
-        var database = "wolverine_gate_" + new string(suite.Name.ToLowerInvariant()
-            .Select(c => char.IsAsciiLetterOrDigit(c) ? c : '_').ToArray());
+        var database = gateDatabaseName(suite);
 
         if (suite.Postgres == ServerUse.OwnDatabase)
         {
@@ -554,7 +651,36 @@ partial class Build
             connectionStrings.Add("sqlserver", context => sqlServerLaneConnectionString(context.Lane));
         }
 
+        foreach (var (name, forLane) in suite.LaneConnectionStrings)
+        {
+            connectionStrings.Add(name, context => forLane(context.Lane));
+        }
+
         return connectionStrings.Names.Count > 0 ? connectionStrings : null;
+    }
+
+    static string gateDatabaseName(GateSuite suite)
+        => "wolverine_gate_" + new string(suite.Name.ToLowerInvariant()
+            .Select(c => char.IsAsciiLetterOrDigit(c) ? c : '_').ToArray());
+
+    /// <summary>
+    /// The Azure Service Bus emulator pair for a lane: asb-emulator (5673, management 5300) for lane 0, which is also
+    /// where retries and isolated tests run, and asb-emulator-2 (5674, management 5301) for lane 1. The same strings
+    /// as Servers' defaults.
+    /// </summary>
+    static string azureServiceBusEmulatorForLane(int lane, bool management)
+    {
+        var port = (lane, management) switch
+        {
+            (0, false) => 5673,
+            (0, true) => 5300,
+            (1, false) => 5674,
+            (1, true) => 5301,
+            _ => throw new ArgumentOutOfRangeException(nameof(lane), lane,
+                "There are two Azure Service Bus emulator pairs in docker-compose.yml, so two lanes at most")
+        };
+
+        return $"Endpoint=sb://localhost:{port};SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;";
     }
 
     void recreatePostgresDatabase(string database)
@@ -584,15 +710,15 @@ partial class Build
     }
 
     /// <summary>
-    /// The F# compile-gate suites regenerate their fixtures' committed Generated.fs as they run, as they do
+    /// The F# compile-gate suites regenerate their fixtures' committed *Generated.fs as they run, as they do
     /// in fsharp.yml's throwaway checkout. Here the checkout is yours, so a fixture that was clean before
     /// the gate is put back after it; one you had already changed is left alone.
     /// </summary>
     static string[] cleanFSharpFixtures()
     {
         var fixtures = Directory.GetDirectories(RootDirectory / "src" / "Testing", "*.FSharpFixture")
-            .Select(d => Path.Combine(d, "Generated.fs"))
-            .Where(File.Exists)
+            // Generated.fs, and ReadYourWritesGenerated.fs beside it in the Http fixture (GH-5401)
+            .SelectMany(d => Directory.GetFiles(d, "*Generated.fs"))
             .Select(f => Path.GetRelativePath(RootDirectory, f).Replace('\\', '/'))
             .ToArray();
         if (fixtures.Length == 0) return [];
@@ -675,6 +801,7 @@ partial class Build
                 path = s.Path,
                 ciTargets = s.CITargets,
                 workers = s.Workers,
+                optIn = s.OptIn ? true : (bool?)null,
                 frameworks = s.Frameworks,
                 postgres = s.Postgres == ServerUse.None ? null : s.Postgres.ToString(),
                 sqlServer = s.SqlServer == ServerUse.None ? null : s.SqlServer.ToString(),

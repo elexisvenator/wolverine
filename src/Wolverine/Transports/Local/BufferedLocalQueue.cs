@@ -8,7 +8,7 @@ using Wolverine.Transports.Sending;
 
 namespace Wolverine.Transports.Local;
 
-internal class BufferedLocalQueue : BufferedReceiver, ISendingAgent, IListenerCircuit
+internal class BufferedLocalQueue : BufferedReceiver, ISendingAgent, IListenerCircuit, IPlaysScheduledMessages
 {
     private readonly IMessageTracker _messageTracker;
     private readonly IWolverineRuntime _runtime;
@@ -25,6 +25,9 @@ internal class BufferedLocalQueue : BufferedReceiver, ISendingAgent, IListenerCi
         Destination = endpoint.Uri;
         Endpoint = endpoint;
     }
+
+    // No ListeningAgent owns a local queue, so nothing else would ever replace a faulted block here
+    protected override bool RebuildsFaultedBlock => true;
 
     public ListeningStatus Status => ListeningStatus.Accepting;
     public Endpoint Endpoint { get; }
@@ -104,6 +107,16 @@ internal class BufferedLocalQueue : BufferedReceiver, ISendingAgent, IListenerCi
     public ValueTask StoreAndForwardAsync(Envelope envelope)
     {
         return EnqueueOutgoingAsync(envelope);
+    }
+
+    /// <inheritdoc />
+    public Task PlayNowAsync(Envelope envelope)
+    {
+        _messageTracker.Sent(envelope);
+        envelope.ReplyUri ??= ReplyUri;
+        envelope.ContentType ??= EnvelopeConstants.JsonContentType;
+
+        return Pipeline.InvokeAsync(envelope, this);
     }
 
     public bool SupportsNativeScheduledSend => true;

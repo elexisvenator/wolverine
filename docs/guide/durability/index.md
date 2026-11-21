@@ -90,7 +90,7 @@ and [Marten](/guide/durability/marten), [Polecat](/guide/durability/polecat/), o
 
 There are three things you need to enable for the transactional outbox (and inbox for incoming messages):
 
-1. Set up message storage in your application, and manage the storage schema objects -- don't worry though, Wolverine comes with a lot of tooling to help you with that
+1. Set up message storage in your application, and manage the storage schema objects -- don't worry though, Wolverine comes with a lot of tooling to help you with that; see [Managing Message Storage](/guide/durability/managing#choosing-an-approach)
 2. Enroll outgoing subscriber or listener endpoints in the durable storage at configuration time
 3. Enable Wolverine's transactional middleware or utilize one of Wolverine's outbox publishing services
 
@@ -173,8 +173,9 @@ you can "bump" a persisted record in the `wolverine_outgoing_envelopes` to be re
 setting the `owner_id` field to zero.
 
 ::: info
-Just be aware that opting into the `OutboxStaleTime` or `InboxStaleTime` threshold will require database changes through Wolverine's database
-migration subsystem
+Since 7.0 both thresholds default to 1 hour (outside `ServerlessWithOutbox`, which has its own defaults), and the
+`timestamp` columns they need are always created. Set either to `null` to turn it off, or call `opts.RestoreV6Defaults()`
+for the 6.x behaviour, where they were off and opting in required a database migration.
 :::
 
 You also have this setting to force Wolverine to automatically "bump" and older messages that seem to be stalled in
@@ -375,6 +376,22 @@ None of this is configurable, and it works the same in `Solo` mode as in `Balanc
 worth remembering: **if no node in the cluster is running an exclusive endpoint's listener, that endpoint's
 unowned inbox messages stay put by design.** They are recovered promptly once a listener activates. See
 [Exclusive Node Processing](/guide/messaging/exclusive-node-processing#inbox-recovery-ownership).
+
+### One Slow Destination Doesn't Hold Up Recovery <Badge type="tip" text="7.0" />
+
+The durability agent recovers each destination on its own, so a destination that is slow to take its messages
+doesn't hold up any other destination. That could be a sequential listener whose handler is still busy, or a broker
+that isn't accepting sends. Inbox and outbox recovery don't wait on each other either, and this is the same for
+every message store.
+
+While a destination is still taking what was recovered for it, later recovery passes skip it, and nothing more is
+claimed for it until it has taken that. The rest of its messages stay in the database for any node to pick up, so a
+stuck destination never ends up with more than one page of recovered messages in memory, and a sequential listener
+is never handed a second message while it is still running the first.
+
+The same goes for the flush after a transaction commits. If one destination makes the flush wait, the messages for
+the other destinations still go out while it waits. Each destination still gets its own messages one at a time and
+in the order they were published, and the flush still finishes only once every destination has its messages.
 
 ## When a Tenant Database Is Down <Badge type="tip" text="6.42" />
 

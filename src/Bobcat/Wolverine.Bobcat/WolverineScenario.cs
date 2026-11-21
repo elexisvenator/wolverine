@@ -109,7 +109,7 @@ public sealed record ActOutcome(
 /// <see cref="SpecificationFailedException" />.
 /// </para>
 /// </remarks>
-public class WolverineScenario : CritterStackScenario
+public partial class WolverineScenario : CritterStackScenario
 {
     // GH-4931: the message an act dispatches -- built from a partial object, so not always the object the
     // step was given -- which is how its own events are told from its cascades'
@@ -135,6 +135,7 @@ public class WolverineScenario : CritterStackScenario
 
     // GH-4940: the concurrent append the next act lands between its read and its write
     private object[]? _concurrently;
+    private (Type Aggregate, object Id)? _concurrentStream;
 
     /// <param name="host">The application under test.</param>
     /// <param name="storeName">Which event store to use, when the application has several. Null takes the only one.</param>
@@ -274,6 +275,29 @@ public class WolverineScenario : CritterStackScenario
         recordTouched(events.Select(PartialMatching.ExpectedType));
 
         root._concurrently = events.Select(x => Build(x, "a concurrent writer appends")).ToArray();
+        root._concurrentStream = null;
+    }
+
+    /// <summary>
+    /// GH-5415. <see cref="WhileActing" />, onto the <typeparamref name="TAggregate" /> stream with this identity rather
+    /// than a new one -- another message appending to (or starting) the very stream the act writes -- so the act's save
+    /// meets a concurrency conflict. Reads "while the act runs, a concurrent writer appends OrderFulfillmentStarted to
+    /// OrderFulfillment #OrderFulfillmentId".
+    /// </summary>
+    [EventModelRole(SliceRole.ArrangedEvent, nameof(concurrently))]
+    public void WhileActingOn<TAggregate>(object id, params object[] concurrently) where TAggregate : class
+    {
+        var events = flatten(concurrently);
+        if (events.Length == 0) throw new ArgumentException("Name the events a concurrent writer appends.", nameof(concurrently));
+
+        var (described, inline) = describe(events);
+        using var step = ScenarioRecorder.Step("Given",
+            $"while the act runs, a concurrent writer appends {described} to {nameOf(typeof(TAggregate))} {ScenarioValues.Format(id)}");
+        if (!inline) recordValues("event", events);
+        recordTouched(events.Select(PartialMatching.ExpectedType));
+
+        root._concurrently = events.Select(x => Build(x, "a concurrent writer appends")).ToArray();
+        root._concurrentStream = (typeof(TAggregate), id);
     }
 
     /// <summary>
@@ -352,9 +376,11 @@ public class WolverineScenario : CritterStackScenario
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Every message the last act scheduled is executed, a local one inline and any other sent to its destination.
-    /// The replay keeps the scheduled messages' correlation id, so <see cref="ThenEventuallyCaused(object[])" /> still
-    /// finds what they caused.
+    /// Every message the last act scheduled is executed. GH-5700: it is delivered to its queue as if its time had come,
+    /// a local queue included, so the endpoint's retries, dead-lettering and a saga's <c>Compensate</c> methods apply,
+    /// and the act waits for all of it. Pass <c>playInline: true</c> to run a local message inline instead, as before
+    /// 7.0, where its first failure fails the act. The replay keeps the scheduled messages' correlation id, so
+    /// <see cref="ThenEventuallyCaused(object[])" /> still finds what they caused.
     /// </para>
     /// <para>
     /// With no act before it, or an act that scheduled nothing, the step fails and stops the scenario, saying what
@@ -363,9 +389,11 @@ public class WolverineScenario : CritterStackScenario
     /// </para>
     /// </remarks>
     /// <param name="timeout">How long the replay waits for everything it caused to settle. <see cref="Timeout" /> by default.</param>
-    public Task WhenScheduledMessagesAreExecuted(TimeSpan? timeout = null) => root.playScheduledAsync(timeout ?? Timeout);
+    /// <param name="playInline">Run a message for a local queue inline: only inline retries, no dead-lettering or compensation.</param>
+    public Task WhenScheduledMessagesAreExecuted(TimeSpan? timeout = null, bool playInline = false)
+        => root.playScheduledAsync(timeout ?? Timeout, playInline);
 
-    private async Task playScheduledAsync(TimeSpan timeout)
+    private async Task playScheduledAsync(TimeSpan timeout, bool playInline)
     {
         var previous = acted ? LastAct : null;
         var scheduled = previous?.Session is { } session ? scheduledIn(session).ToList() : [];
@@ -392,16 +420,82 @@ public class WolverineScenario : CritterStackScenario
 
             // Everything the replay commits is the act's own: there is no one message to tell its work from a cascade's
             _dispatched = null;
-            await executeAsync(_ => replayAsync(previous, played, timeout),
+            await executeAsync(_ => replayAsync(previous, played, timeout, playInline),
                 outcome => Task.FromResult(outcome with { CorrelationId = previous.CorrelationId ?? outcome.CorrelationId }));
         });
     }
 
-    private static async Task<ITrackedSession> replayAsync(ActOutcome previous, ITrackedSession played, TimeSpan timeout)
+    /// <summary>
+    /// GH-5664. <paramref name="duration" /> passes: the scheduled messages that come due within it are executed, in due
+    /// order, through Wolverine's <see cref="ITrackedSession.PlayScheduledMessagesAsync(TimeSpan, TimeSpan?, bool)" />, and
+    /// this is the new act. A message scheduled while the time passes, such as a saga's next poll, is executed too when
+    /// it comes due before the end; everything due later stays scheduled for the next <c>WhenTimePasses</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The clock that moves is the ambient <see cref="BobcatClock" />, the one an application that shares the spec's
+    /// clock reads (<c>services.ShareClock()</c>), so a handler sees the instant its message came due. A saga that
+    /// schedules a poll every five minutes and a deadline in an hour can be walked through step by step: the deadline
+    /// is executed once an hour has passed, not with the first poll. <see cref="WhenScheduledMessagesAreExecuted" />
+    /// still executes everything at once.
+    /// </para>
+    /// <para>
+    /// GH-5700. A due message is delivered to its queue as if its time had come, a local queue included, so the
+    /// endpoint's retries, dead-lettering and a saga's <c>Compensate</c> methods apply: "time passes, the poll fails,
+    /// the saga compensates" is a spec. Pass <c>playInline: true</c> to run a local message inline instead, where its
+    /// first failure fails the act.
+    /// </para>
+    /// <para>
+    /// With no act before it, the step fails and stops the scenario. Time passing with nothing due is not a failure:
+    /// the act then did nothing, which a Then step can judge.
+    /// </para>
+    /// </remarks>
+    /// <param name="duration">How much time passes. Never negative.</param>
+    /// <param name="timeout">How long the act waits for everything it caused to settle. <see cref="Timeout" /> by default.</param>
+    /// <param name="playInline">Run a message for a local queue inline: only inline retries, no dead-lettering or compensation.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="duration" /> is negative: time only passes forward.</exception>
+    public Task WhenTimePasses(TimeSpan duration, TimeSpan? timeout = null, bool playInline = false)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(duration, TimeSpan.Zero);
+
+        // Synchronous on purpose: the clock is AsyncLocal, and one installed inside an async method never flows back to
+        // the spec, so the next step would not see the time that passed
+        var clock = BobcatClock.Controllable();
+        return root.passTimeAsync(duration, timeout ?? Timeout, clock, playInline);
+    }
+
+    private async Task passTimeAsync(TimeSpan duration, TimeSpan timeout, TimeProvider clock, bool playInline)
+    {
+        var previous = acted ? LastAct : null;
+
+        await inStep(ScenarioRecorder.Step("When", $"{formatDuration(duration)} passes"), async () =>
+        {
+            if (previous?.Session is not TrackedSession played)
+            {
+                throw new SpecCriticalException(
+                    "There is no act whose scheduled messages could come due: WhenTimePasses follows the When step that scheduled them.");
+            }
+
+            var due = played.pendingScheduled();
+            var end = played.Clock.GetUtcNow() + duration;
+            foreach (var type in due.Where(x => x.DueAt <= end).Select(x => x.Envelope.Message?.GetType()).OfType<Type>().Distinct())
+            {
+                recordTouched(type);
+            }
+
+            // Everything the window commits is the act's own: there is no one message to tell its work from a cascade's
+            _dispatched = null;
+            await executeAsync(_ => played.PlayScheduledMessagesAsync(duration, timeout, clock, playInline),
+                outcome => Task.FromResult(outcome with { CorrelationId = previous.CorrelationId ?? outcome.CorrelationId }));
+        });
+    }
+
+    private static async Task<ITrackedSession> replayAsync(ActOutcome previous, ITrackedSession played, TimeSpan timeout,
+        bool playInline)
     {
         try
         {
-            return await played.PlayScheduledMessagesAsync(timeout);
+            return await played.PlayScheduledMessagesAsync(timeout, playInline);
         }
         catch (Exception e) when (e.Message.Contains("No scheduled messages recorded", StringComparison.Ordinal))
         {
@@ -561,7 +655,11 @@ public class WolverineScenario : CritterStackScenario
         if (marks.Count == 0) return outcome;
 
         var unheard = marks.Where(mark => !outcome.Appended.Any(commit => heardOn(commit, mark.Store, marks))).ToList();
-        if (unheard.Count == 0) return outcome;
+        if (unheard.Count == 0)
+        {
+            // GH-5385: a session the application opened itself is heard too, so on several stores say which each came from
+            return marks.Count > 1 ? outcome with { StoreByEvent = storeOfHeardEvents(outcome, marks) } : outcome;
+        }
 
         // Read even after a failure: an act can commit and then throw, and what it committed is a fact
         return mergeReadBack(outcome, await readBackSinceAsync(unheard, outcome.Error), marks);
@@ -576,23 +674,30 @@ public class WolverineScenario : CritterStackScenario
         return hasStore() && ReferenceEquals(EventStore, store);
     }
 
+    private Dictionary<IEvent, IEventStore> storeOfHeardEvents(ActOutcome outcome, IReadOnlyList<StoreHighWaterMark> marks)
+    {
+        var map = new Dictionary<IEvent, IEventStore>(ReferenceEqualityComparer.Instance);
+        foreach (var commit in outcome.Appended)
+        {
+            var store = marks.FirstOrDefault(x => heardOn(commit, x.Store, marks))?.Store;
+            if (store is null) continue;
+            foreach (var e in commit.Events) map[e] = store;
+        }
+
+        return map;
+    }
+
     private ActOutcome mergeReadBack(ActOutcome outcome, CritterStackActOutcome readBack, IReadOnlyList<StoreHighWaterMark> marks)
     {
-        if (readBack.AllNewEvents.Count == 0 && readBack.ForeignEvents.Count == 0) return outcome;
+        if (readBack.AllNewEvents.Count == 0 && readBack.ForeignEvents.Count == 0)
+            return marks.Count > 1 ? outcome with { StoreByEvent = storeOfHeardEvents(outcome, marks) } : outcome;
 
         // Which store every event came from, when there was a choice: what the tracked session heard, by the
         // store each commit names, and what was read back, by the store it was read from
         IReadOnlyDictionary<IEvent, IEventStore> byEvent = CritterStackActOutcome.NoStores;
         if (marks.Count > 1)
         {
-            var map = new Dictionary<IEvent, IEventStore>(ReferenceEqualityComparer.Instance);
-            foreach (var commit in outcome.Appended)
-            {
-                var store = marks.FirstOrDefault(x => heardOn(commit, x.Store, marks))?.Store;
-                if (store is null) continue;
-                foreach (var e in commit.Events) map[e] = store;
-            }
-
+            var map = storeOfHeardEvents(outcome, marks);
             foreach (var (e, store) in readBack.StoreByEvent) map[e] = store;
             byEvent = map;
         }
@@ -701,15 +806,27 @@ public class WolverineScenario : CritterStackScenario
 
         var tracking = trackActivity().WithCorrelationId(correlationId);
 
+        // GH-5554 / GH-5556: what the Givens armed for this act -- a condition its session waits for, a seam to disarm
+        var conditions = _actConditions;
+        _actConditions = [];
+        foreach (var condition in conditions) tracking = tracking.WaitForCondition(condition);
+        var cleanups = _afterAct;
+        _afterAct = [];
+
         // GH-4940: arm the concurrent writer for this act alone, by its flow and its correlation id
         var concurrent = _concurrently;
+        var concurrentStream = _concurrentStream;
         _concurrently = null;
+        _concurrentStream = null;
         IDisposable? armed = null;
         if (concurrent is not null)
         {
-            var store = await storeForAsync("a concurrent writer appends", null, concurrent);
-            armed = ConcurrentAppends.Arm(correlationId, token =>
-                EventStoreAuthoring.AppendAsync(store, null!, Guid.CreateVersion7(), concurrent, token));
+            var store = await storeForAsync("a concurrent writer appends", concurrentStream?.Aggregate, concurrent);
+            armed = concurrentStream is { } target
+                ? ConcurrentAppends.Arm(correlationId, token =>
+                    EventStoreAuthoring.AppendAsync(store, target.Aggregate, target.Id, concurrent, token))
+                : ConcurrentAppends.Arm(correlationId, token =>
+                    EventStoreAuthoring.AppendAsync(store, null!, Guid.CreateVersion7(), concurrent, token));
         }
 
         ITrackedSession? session = null;
@@ -717,7 +834,9 @@ public class WolverineScenario : CritterStackScenario
         try
         {
             session = await dispatch(tracking);
-            error = session.AllExceptions().FirstOrDefault();
+            // GH-5553 (proposed): with DeadLettersFailTheAct off, a failure that ended in a dead letter is an outcome
+            // ThenDeadLettered judges, not the act failing
+            error = DeadLettersFailTheAct ? session.AllExceptions().FirstOrDefault() : failureNotDeadLettered(session);
         }
         catch (Exception e)
         {
@@ -726,6 +845,7 @@ public class WolverineScenario : CritterStackScenario
         finally
         {
             armed?.Dispose();
+            foreach (var cleanup in cleanups) cleanup();
         }
 
         // GH-4940: whether the concurrent append landed is the tracked session's to say
@@ -801,6 +921,10 @@ public class WolverineScenario : CritterStackScenario
     private TrackedSessionConfiguration trackActivity()
     {
         var tracking = (_host is null ? Services.TrackActivity() : _host.TrackActivity()).Timeout(Timeout).DoNotAssertOnExceptionsDetected();
+
+        // GH-5553 (proposed): every other service the specification tracks
+        if (root._otherServices.Count > 0) tracking = tracking.AlsoTrack(root._otherServices.Values.ToArray());
+
         return IncludeExternalTransports ? tracking.IncludeExternalTransports() : tracking;
     }
 
@@ -883,8 +1007,9 @@ public class WolverineScenario : CritterStackScenario
     /// <see cref="EventuallyTimeout" /> for work that lands after the daemons, such as a handler on a local queue.
     /// </para>
     /// <para>
-    /// The store must record correlation ids, which Marten, Polecat and Fisher all leave off by default. When it
-    /// does not, the step fails and says how to turn them on. The correlation only reaches an event when every
+    /// The store must record correlation ids, which Marten 10, Polecat 6 and Fisher 2 do by default; a store can turn
+    /// them off, or <c>RestoreV9Defaults()</c> turns them off on Marten. When it does not record them, the step fails
+    /// and says how to turn them on. The correlation only reaches an event when every
     /// hop carries it: Wolverine's handlers do, but an event subscription or a projection's side effect that
     /// publishes a message has to pass the event's <c>CorrelationId</c> on itself.
     /// </para>
@@ -1298,21 +1423,14 @@ public class WolverineScenario : CritterStackScenario
     [EventModelRole(SliceRole.Message, nameof(expected))]
     public void ThenMessageSent(object expected)
     {
-        if (expected is IPartialObject partial)
-        {
-            using var partialStep = ScenarioRecorder.Step("Then", $"{partial.Type.Name} is sent");
-            if (!actSucceeded()) return;
-            judgeMessage(partial, sentOf(partial.Type).Select(x => x.Message!).ToArray(), "sent",
-                scheduledOf(partial.Type).Any() ? " (one was SCHEDULED for later: use ThenMessageScheduled)" : "");
-            return;
-        }
-
-        var value = unwrap(expected);
-        using var step = ScenarioRecorder.Step("Then", $"{value.GetType().Name} is sent");
+        // GH-5556: the expected values on the step's own line when they fit, as ThenMessageScheduled has them
+        var type = PartialMatching.ExpectedType(expected);
+        var (described, inline) = describe([expected is IPartialObject ? expected : unwrap(expected)]);
+        using var step = ScenarioRecorder.Step("Then", $"{(inline ? described : nameOf(type))} is sent");
         if (!actSucceeded()) return;
 
-        judgeMessage(expected, sentOf(value.GetType()).Select(x => x.Message!).ToArray(), "sent",
-            scheduledOf(value.GetType()).Any() ? " (one was SCHEDULED for later: use ThenMessageScheduled)" : "");
+        judgeMessage(expected, sentOf(type).Select(x => x.Message!).ToArray(), "sent",
+            scheduledOf(type).Any() ? " (one was SCHEDULED for later: use ThenMessageScheduled)" : "");
     }
 
     /// <summary>The act sent no <typeparamref name="T" /> anywhere.</summary>

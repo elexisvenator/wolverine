@@ -1483,8 +1483,8 @@ struct key) are. Wolverine takes, in order:
 3. a member named `{aggregate}Id` or `Id`;
 4. the only member of that type.
 
-Naming a type the aggregate doesn't have is an error at build time (`JFXEVT014`), and so is naming `TKey?`
-(`JFXEVT015`). Wolverine checks both again when it generates the handler.
+Naming a type the aggregate doesn't have is an error at build time (`JFXEVT016`), and so is naming `TKey?`
+(`JFXEVT017`). Wolverine checks both again when it generates the handler.
 
 Without a key type, `[Identity]` on a member of one of the aggregate's natural key types is refused when the
 handler is generated: it would otherwise be taken as the stream id.

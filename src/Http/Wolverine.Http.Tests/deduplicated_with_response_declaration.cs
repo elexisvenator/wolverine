@@ -4,6 +4,7 @@ using JasperFx.Resources;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Http.Metadata;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
@@ -43,6 +44,35 @@ public class deduplicated_with_response_declaration
     {
         Should.Throw<NotSupportedException>(() => HttpChain.ChainFor(typeof(ResourcelessDeduplicatedResponse), "Post"))
             .Message.ShouldContain("returns no resource");
+    }
+
+    [Fact]
+    public void a_result_that_is_never_written_as_json_is_refused_at_startup()
+    {
+        Should.Throw<NotSupportedException>(() => HttpChain.ChainFor(typeof(FileResultDeduplicatedResponse), "Post"))
+            .Message.ShouldContain(nameof(FileContentHttpResult));
+    }
+
+    [Fact]
+    public void a_result_interface_no_replayable_result_implements_is_refused_at_startup()
+    {
+        Should.Throw<NotSupportedException>(() =>
+                HttpChain.ChainFor(typeof(ContentInterfaceDeduplicatedResponse), "Post"))
+            .Message.ShouldContain(nameof(ITextResult));
+    }
+
+    [Fact]
+    public void a_custom_nested_result_is_refused_at_startup()
+    {
+        Should.Throw<NotSupportedException>(() =>
+                HttpChain.ChainFor(typeof(EnvelopeResultDeduplicatedResponse), "Post"))
+            .Message.ShouldContain(nameof(EnvelopeResult));
+    }
+
+    [Fact]
+    public void a_result_union_with_a_replayable_arm_is_not_refused()
+    {
+        Should.NotThrow(() => HttpChain.ChainFor(typeof(UnionResultDeduplicatedResponse), "Post"));
     }
 
     [Fact]
@@ -124,36 +154,6 @@ public class deduplicated_with_response_declaration
 
         logs.Warnings.ShouldContain(x =>
             x.Contains("/declaration/storeless") && x.Contains("does not implement IReplayableDeduplicationStore"));
-    }
-
-    [Fact]
-    public void a_form_bound_endpoint_is_refused_at_startup()
-    {
-        // GH-4742. Form values are kept as variables whose creator frames are never in Middleware, so the
-        // arranger hoists the form read ahead of EnableRequestBufferingFrame; the fingerprint then throws on
-        // an unseekable body for EVERY request. Refused while the chain is built, not at the first request.
-        Should.Throw<NotSupportedException>(() => HttpChain.ChainFor(typeof(FormBoundDeduplicatedResponse), "Post"))
-            .Message.ShouldContain("form-encoded requests are not supported");
-    }
-
-    [Fact]
-    public void a_bound_form_type_is_refused_at_startup_too()
-    {
-        // The other form shape: [FromForm] on a whole type rather than on a simple value.
-        Should.Throw<NotSupportedException>(() =>
-                HttpChain.ChainFor(typeof(BoundFormTypeDeduplicatedResponse), "Post"))
-            .Message.ShouldContain("form-encoded requests are not supported");
-    }
-
-    [Fact]
-    public void a_file_upload_endpoint_is_not_refused()
-    {
-        // Multipart/file bindings put their frames IN Middleware, so the buffering still comes first. They
-        // must keep working -- the refusal above is deliberately narrower than HttpChain.IsFormData.
-        var chain = HttpChain.ChainFor(typeof(FileUploadDeduplicatedResponse), "Post");
-
-        chain.IsFormData.ShouldBeTrue();
-        chain.DeduplicatedWithResponse.ShouldNotBeNull();
     }
 
     [Fact]
@@ -322,7 +322,7 @@ public class deduplicated_with_response_declaration
     }
 }
 
-// The four below are invalid on purpose. Hidden from discovery, so no other host scanning this assembly fails
+// The ones below are invalid on purpose. Hidden from discovery, so no other host scanning this assembly fails
 // to start; the tests build their chains directly.
 
 [WolverineIgnore]
@@ -353,11 +353,60 @@ public static class ResourcelessDeduplicatedResponse
 }
 
 [WolverineIgnore]
+public static class FileResultDeduplicatedResponse
+{
+    [DeduplicatedWithResponse(DeduplicationScope.User)]
+    [WolverinePost("/declaration/file-result")]
+    public static FileContentHttpResult Post(DeduplicatedOrder request) => TypedResults.File([1, 2, 3]);
+}
+
+[WolverineIgnore]
+public static class ContentInterfaceDeduplicatedResponse
+{
+    [DeduplicatedWithResponse(DeduplicationScope.User)]
+    [WolverinePost("/declaration/content-result")]
+    public static ITextResult Post(DeduplicatedOrder request) => new TextResult(request.Name);
+}
+
+public interface ITextResult : IResult;
+
+public record TextResult(string Text) : ITextResult
+{
+    public Task ExecuteAsync(HttpContext httpContext) => httpContext.Response.WriteAsync(Text);
+}
+
+[WolverineIgnore]
+public static class EnvelopeResultDeduplicatedResponse
+{
+    [DeduplicatedWithResponse(DeduplicationScope.User)]
+    [WolverinePost("/declaration/envelope-result")]
+    public static EnvelopeResult Post(DeduplicatedOrder request)
+        => new(TypedResults.Ok(new DeduplicatedOrderCreated(Guid.NewGuid())));
+}
+
+// Holds an Ok, but writes it inside an envelope, so a replay of the Ok alone would differ
+public record EnvelopeResult(IResult Result) : IResult, INestedHttpResult
+{
+    public Task ExecuteAsync(HttpContext httpContext)
+        => httpContext.Response.WriteAsJsonAsync(new { data = (Result as IValueHttpResult)?.Value });
+}
+
+[WolverineIgnore]
 public static class NegativeWindowDeduplicatedResponse
 {
     [DeduplicatedWithResponse(DeduplicationScope.User, WindowInSeconds = -1)]
     [WolverinePost("/declaration/negative-window")]
     public static DeduplicatedOrderCreated Post(DeduplicatedOrder request) => new(Guid.NewGuid());
+}
+
+// Valid, but hidden from discovery like the ones above: its test only builds the chain.
+[WolverineIgnore]
+public static class UnionResultDeduplicatedResponse
+{
+    [DeduplicatedWithResponse(DeduplicationScope.User)]
+    [WolverinePost("/declaration/union-result")]
+    public static Results<Created<DeduplicatedOrderCreated>, NotFound> Post(DeduplicatedOrder request)
+        => TypedResults.NotFound();
 }
 
 public static class StorelessDeduplicatedResponse
@@ -380,36 +429,6 @@ public static class PolicyDeduplicatedResponse
 {
     [WolverinePost("/declaration/policy")]
     public static DeduplicatedOrderCreated Post(DeduplicatedOrder request) => new(Guid.NewGuid());
-}
-
-[WolverineIgnore]
-public static class FormBoundDeduplicatedResponse
-{
-    [DeduplicatedWithResponse(DeduplicationScope.User)]
-    [WolverinePost("/declaration/form-value")]
-    public static DeduplicatedOrderCreated Post([FromForm] string name) => new(Guid.NewGuid());
-}
-
-[WolverineIgnore]
-public static class BoundFormTypeDeduplicatedResponse
-{
-    [DeduplicatedWithResponse(DeduplicationScope.User)]
-    [WolverinePost("/declaration/form-type")]
-    public static DeduplicatedOrderCreated Post([FromForm] DeduplicatedFormBody body) => new(Guid.NewGuid());
-}
-
-public class DeduplicatedFormBody
-{
-    public string Name { get; set; } = string.Empty;
-}
-
-// Files bind through Middleware frames, so the request buffering still comes first: NOT refused.
-[WolverineIgnore]
-public static class FileUploadDeduplicatedResponse
-{
-    [DeduplicatedWithResponse(DeduplicationScope.User)]
-    [WolverinePost("/declaration/file")]
-    public static DeduplicatedOrderCreated Post(IFormFile file) => new(Guid.NewGuid());
 }
 
 // Authorized, so the anonymous-User-scope warning must NOT fire for it.

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
@@ -53,10 +54,10 @@ public class DatabaseSagaSchema<T, TId> : IDatabaseSagaSchema<TId, T> where T : 
         // Wolverine table sets from colliding inside the one database file.
         var tableName = TablePrefixing.Apply(settings.SchemaName, definition.TableName);
 
-        _insertSql = $"insert into {tableName} ({DatabaseConstants.Id}, {DatabaseConstants.Body}, {DatabaseConstants.Version}) values (@id, @body, 1)";
+        _insertSql = $"insert into {tableName} ({DatabaseConstants.Id}, {DatabaseConstants.Body}, {DatabaseConstants.Version}, last_modified, {SagaTableIndexes.CompletedAtColumn}) values (@id, @body, 1, @last_modified, @completed_at)";
         _updateSql =
-            $"update {tableName} set {DatabaseConstants.Body} = @body, {DatabaseConstants.Version} = @version + 1, last_modified = datetime('now') where {DatabaseConstants.Id} = @id and {DatabaseConstants.Version} = @version";
-        _loadSql = $"select body, version from {tableName} where {DatabaseConstants.Id} = @id";
+            $"update {tableName} set {DatabaseConstants.Body} = @body, {DatabaseConstants.Version} = @version + 1, last_modified = @last_modified, {SagaTableIndexes.CompletedAtColumn} = @completed_at where {DatabaseConstants.Id} = @id and {DatabaseConstants.Version} = @version";
+        _loadSql = $"select body, version, last_modified from {tableName} where {DatabaseConstants.Id} = @id";
 
         _deleteSql = $"delete from {tableName} where id = @id";
 
@@ -66,6 +67,15 @@ public class DatabaseSagaSchema<T, TId> : IDatabaseSagaSchema<TId, T> where T : 
         table.AddColumn(DatabaseConstants.Version, "INTEGER").DefaultValue(1).NotNull();
         table.AddColumn("created", "TEXT").NotNull().DefaultValueByExpression("(datetime('now'))");
         table.AddColumn("last_modified", "TEXT").NotNull().DefaultValueByExpression("(datetime('now'))");
+
+        // GH-5572: when a retained saga completed, as sortable UTC text like last_modified
+        table.AddColumn(SagaTableIndexes.CompletedAtColumn, "TEXT").AllowNulls();
+
+        // GH-5558: "sagas idle for more than N days" filters on last_modified
+        table.Indexes.Add(new IndexDefinition(SagaTableIndexes.LastModifiedIndexName(tableName, 128))
+        {
+            Columns = [SagaTableIndexes.LastModifiedColumn]
+        });
 
         Table = table;
     }
@@ -93,6 +103,23 @@ public class DatabaseSagaSchema<T, TId> : IDatabaseSagaSchema<TId, T> where T : 
                 await tx.CreateCommand(createSql)
                     .ExecuteNonQueryAsync(cancellationToken)
                     .ConfigureAwait(false);
+            }
+            else
+            {
+                // GH-5572: a table created before 7.0 has no completed_at column, and the insert and update need it
+                var hasCompletedAt = await tx.CreateCommand(
+                        $"select count(*) from pragma_table_info(@name) where name = '{SagaTableIndexes.CompletedAtColumn}'")
+                    .With("name", table.Identifier.Name)
+                    .ExecuteScalarAsync(cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (Convert.ToInt32(hasCompletedAt) == 0)
+                {
+                    await tx.CreateCommand(
+                            $"alter table {table.Identifier.Name} add column {SagaTableIndexes.CompletedAtColumn} TEXT")
+                        .ExecuteNonQueryAsync(cancellationToken)
+                        .ConfigureAwait(false);
+                }
             }
 
             HasChecked = true;
@@ -137,6 +164,8 @@ public class DatabaseSagaSchema<T, TId> : IDatabaseSagaSchema<TId, T> where T : 
 
     public async Task InsertAsync(T document, DbTransaction tx, CancellationToken cancellationToken)
     {
+        // GH-5345: the storage, not user code, owns LastModified. Set before the body is serialized.
+        document.LastModified = DateTimeOffset.UtcNow;
         await ensureStorageExistsAsync(tx, cancellationToken);
 
         var json = JsonSerializer.Serialize(document, _settings.SagaSerializerOptions);
@@ -150,6 +179,8 @@ public class DatabaseSagaSchema<T, TId> : IDatabaseSagaSchema<TId, T> where T : 
         await tx.CreateCommand(_insertSql)
             .With("id", id.ToString()!)
             .With("body", json)
+            .With("last_modified", formatTimestamp(document.LastModified))
+            .With("completed_at", document.CompletedAt.HasValue ? formatTimestamp(document.CompletedAt.Value) : DBNull.Value)
             .ExecuteNonQueryAsync(cancellationToken);
 
         document.Version = 1;
@@ -170,11 +201,21 @@ public class DatabaseSagaSchema<T, TId> : IDatabaseSagaSchema<TId, T> where T : 
 
         var body = await reader.GetFieldValueAsync<string>(0, cancellationToken);
         var version = await reader.GetFieldValueAsync<long>(1, cancellationToken);
+        var lastModified = await reader.GetFieldValueAsync<string>(2, cancellationToken);
 
         var document = JsonSerializer.Deserialize<T>(body, _settings.SagaSerializerOptions);
         if (document != null)
         {
             document.Version = (int)version;
+
+            // GH-5345: the column is written with the same value as the property, and it was already
+            // maintained (by datetime('now')) before 7.0, so reading it back also backfills sagas whose
+            // stored body predates the property
+            if (DateTimeOffset.TryParse(lastModified, CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed))
+            {
+                document.LastModified = parsed;
+            }
         }
 
         return document;
@@ -182,6 +223,8 @@ public class DatabaseSagaSchema<T, TId> : IDatabaseSagaSchema<TId, T> where T : 
 
     public async Task UpdateAsync(T document, DbTransaction tx, CancellationToken cancellationToken)
     {
+        // GH-5345: the storage, not user code, owns LastModified. Set before the body is serialized.
+        document.LastModified = DateTimeOffset.UtcNow;
         await ensureStorageExistsAsync(tx, cancellationToken);
 
         var json = JsonSerializer.Serialize(document, _settings.SagaSerializerOptions);
@@ -191,6 +234,8 @@ public class DatabaseSagaSchema<T, TId> : IDatabaseSagaSchema<TId, T> where T : 
             .With("id", id?.ToString() ?? throw new InvalidOperationException("Saga id cannot be null"))
             .With("body", json)
             .With("version", document.Version)
+            .With("last_modified", formatTimestamp(document.LastModified))
+            .With("completed_at", document.CompletedAt.HasValue ? formatTimestamp(document.CompletedAt.Value) : DBNull.Value)
             .ExecuteNonQueryAsync(cancellationToken);
 
         if (count == 0)
@@ -201,6 +246,11 @@ public class DatabaseSagaSchema<T, TId> : IDatabaseSagaSchema<TId, T> where T : 
 
         document.Version++;
     }
+
+    // Same shape as SQLite's own datetime('now'), which wrote this column before 7.0, plus milliseconds:
+    // values stay sortable as text and comparable with the column's older rows
+    internal static string formatTimestamp(DateTimeOffset value)
+        => value.UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture);
 
     public async Task DeleteAsync(T document, DbTransaction tx, CancellationToken cancellationToken)
     {

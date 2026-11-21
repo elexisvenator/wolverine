@@ -184,6 +184,14 @@ public partial class WolverineRuntime : IAgentRuntime
         var commands = await NodeController!.EvaluateAssignmentsAsync(nodes, assignments);
         var failures = await executeAgentCommandsAsync(commands, cancellationToken);
 
+        // GH-5458: Solo has no assignment grid, so the evaluation above issues no stop for a paused agent and no
+        // start for a released one. Carry the change out on this node now rather than leaving a pause to be
+        // ignored and a release to wait for the next CheckAssignmentPeriod.
+        if (Options.Durability.Mode == DurabilityMode.Solo && NodeController.HasStartedInSoloMode)
+        {
+            await NodeController.ApplySoloRestrictionsAsync();
+        }
+
         // The in-memory copy is otherwise only ever loaded at startup, but ListeningAgent reads it
         // on every start attempt to decide whether a listener is meant to stay paused — so without
         // this a listener paused through restrictions would keep restarting until the node did.
@@ -333,7 +341,9 @@ public partial class WolverineRuntime : IAgentRuntime
             // scheduled model: the schedule itself survives a restart (the agent re-establishes
             // the next occurrence from the registrations), but an occurrence inside the restart
             // window is lost and nothing dedupes — the startup warning in HostService names both.
-            if (Options.Schedules.Any())
+            // A lightweight run (codegen, describe, OpenAPI generation) only reads metadata, so it must
+            // not publish occurrences.
+            if (Options.Schedules.Any() && !Options.LightweightMode)
             {
                 InMemoryRecurringAgent = _container.GetAllInstances<IAgentFamily>()
                     .OfType<Recurring.RecurringMessageAgent>().FirstOrDefault();
@@ -363,7 +373,10 @@ public partial class WolverineRuntime : IAgentRuntime
                 // GH-4569: every Balanced node polls the scheduled rows of its stores whether or not it was
                 // assigned anything, and executes what comes due on itself. A warm-up node must never run a
                 // production message, so it does not poll at all; the serving nodes keep doing it.
-                if (Options.Durability.NodeRole == NodeRole.Serving)
+                //
+                // GH-5601: nor does a node without the Messaging workload. Its scheduled sends are persisted rows that
+                // a messaging node's poller runs.
+                if (Options.Durability.NodeRole == NodeRole.Serving && Options.Durability.Runs(NodeWorkloads.Messaging))
                 {
                     await startDurableScheduledJobs();
                 }

@@ -29,6 +29,20 @@ public class TrackedSessionConfiguration
     }
 
     /// <summary>
+    /// GH-5664. Use <paramref name="clock" /> as this session's virtual "now", which
+    /// <see cref="ITrackedSession.PlayScheduledMessagesAsync(TimeSpan, TimeSpan?, bool)" /> moves forward. Give it the clock the
+    /// application reads, so a saga sees the due time of the message it is handling. Without this, the session uses the
+    /// host's registered <see cref="TimeProvider" /> when it can move it, or else a clock of its own.
+    /// </summary>
+    /// <param name="clock">A clock with a public <c>Advance(TimeSpan)</c> method, such as <c>FakeTimeProvider</c></param>
+    /// <exception cref="ArgumentException">The clock cannot be moved forward</exception>
+    public TrackedSessionConfiguration UseClock(TimeProvider clock)
+    {
+        Session.clock = TrackedClock.Use(clock);
+        return this;
+    }
+
+    /// <summary>
     ///     GH-4931. Run the tracked work under this correlation id, which every message it causes carries on,
     ///     and which an event store with correlation ids enabled records on every event they append — so a
     ///     test can find what its act caused even across an asynchronous boundary the session does not see,
@@ -278,6 +292,35 @@ public class TrackedSessionConfiguration
 
         Session.AddCondition(condition);
 
+        return this;
+    }
+
+    /// <summary>
+    ///     Continue tracking until a message of type <typeparamref name="T" /> is moved to the dead letter queue.
+    ///     Use this for a message that is <em>meant</em> to fail for good: <see cref="WaitForMessageToBeReceivedAt{T}" />
+    ///     deliberately does not complete on a dead letter (it may be replayed), so on such a message it can only
+    ///     time out. Combine with <see cref="DoNotAssertOnExceptionsDetected" /> since the failure is expected.
+    /// </summary>
+    /// <typeparam name="T">The expected message type</typeparam>
+    /// <returns></returns>
+    public TrackedSessionConfiguration WaitForMessageToBeDeadLettered<T>()
+    {
+        Session.AddCondition(new WaitForMessageEventType<T>(MessageEventType.MovedToErrorQueue,
+            "to be moved to the dead letter queue"));
+        return this;
+    }
+
+    /// <summary>
+    ///     Continue tracking until a message of type <typeparamref name="T" /> is requeued. That is what a failure
+    ///     does when its error policy tries again later (<c>ScheduleRetry</c>, <c>Requeue</c>), and also what
+    ///     deferring or rescheduling a message does. The retry itself lies outside the session, so this lets a test
+    ///     prove a failure is retried rather than dead-lettered without waiting for the delay to pass.
+    /// </summary>
+    /// <typeparam name="T">The expected message type</typeparam>
+    /// <returns></returns>
+    public TrackedSessionConfiguration WaitForMessageToBeRequeued<T>()
+    {
+        Session.AddCondition(new WaitForMessageEventType<T>(MessageEventType.Requeued, "to be requeued"));
         return this;
     }
 

@@ -185,6 +185,24 @@ internal partial class TrackedSession : ITrackedSession
         
     }
 
+    private TrackedClock? _clock;
+
+    // GH-5664. Made on first use, so the session's own clock (when the application has none it can move) starts at
+    // the session's start rather than when the configuration was built
+    internal TrackedClock clock
+    {
+        get
+        {
+            if (_clock != null) return _clock;
+            Interlocked.CompareExchange(ref _clock, TrackedClock.For(_primaryHost.Services), null);
+            return _clock!;
+        }
+        set => _clock = value;
+    }
+
+    /// <inheritdoc />
+    public TimeProvider Clock => clock.Provider;
+
     // Actions to carry out first before execute and track
     public List<Func<IWolverineRuntime, CancellationToken, Task>> Befores { get; } = new();
 
@@ -372,7 +390,9 @@ internal partial class TrackedSession : ITrackedSession
         throw new Exception(description);
     }
 
-    public Task<ITrackedSession> PlayScheduledMessagesAsync(TimeSpan timeout)
+    public Task<ITrackedSession> PlayScheduledMessagesAsync(TimeSpan timeout) => PlayScheduledMessagesAsync(timeout, false);
+
+    public Task<ITrackedSession> PlayScheduledMessagesAsync(TimeSpan timeout, bool playInline)
     {
         var serviceName = _primaryHost.GetRuntime().Options.ServiceName;
         var recordsInOrder = _envelopes.SelectMany(x => x.Records).Where(x => x.MessageEventType == MessageEventType.Scheduled || x.Envelope!.Status == EnvelopeStatus.Scheduled || x.WasScheduled).ToArray();
@@ -390,57 +410,245 @@ internal partial class TrackedSession : ITrackedSession
         replayed.AssertNoExceptions = AssertNoExceptions;
         replayed.AssertNoTimeout = AssertNoTimeout;
         replayed._otherHosts.AddRange(_otherHosts);
+        replayed.clock = clock;
         
-        return trackedSessionConfiguration.ExecuteAndWaitAsync(c => ReplayAll(c, records));
+        return trackedSessionConfiguration.ExecuteAndWaitAsync(c => ReplayAll(c, records, playInline));
     }
 
-    internal async Task ReplayAll(IMessageContext context, EnvelopeRecord[] records)
+    // GH-5664. Scheduled envelopes an earlier window left for later, carried from session to session, and the ones
+    // this session has played, so neither a carried nor a newly recorded envelope plays twice
+    private IReadOnlyList<PendingScheduledMessage> _carried = [];
+    private readonly HashSet<Guid> _played = [];
+
+    internal sealed record PendingScheduledMessage(Envelope Envelope, DateTimeOffset DueAt, long Sequence);
+
+    public Task<ITrackedSession> PlayScheduledMessagesAsync(TimeSpan advanceBy, TimeSpan? timeout = null,
+        bool playInline = false)
+        => PlayScheduledMessagesAsync(advanceBy, timeout ?? Timeout, null, playInline);
+
+    /// <summary>
+    /// GH-5664. As the public overload, with <paramref name="clock" /> taking over as the session's clock: Bobcat passes
+    /// its ambient clock, so the time a spec moves is the time the application reads. What is still scheduled keeps
+    /// how long it has left to wait.
+    /// </summary>
+    internal async Task<ITrackedSession> PlayScheduledMessagesAsync(TimeSpan advanceBy, TimeSpan timeout, TimeProvider? clock,
+        bool playInline = false)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(advanceBy, TimeSpan.Zero);
+
+        var current = this.clock;
+        var pending = pendingScheduled();
+
+        if (clock != null && !ReferenceEquals(clock, current.Provider))
+        {
+            var next = TrackedClock.Use(clock);
+            var shift = next.Now - current.Now;
+            pending = pending.Select(x => x with { DueAt = x.DueAt + shift }).ToList();
+            current = next;
+        }
+
+        var windowEnd = current.Now + advanceBy;
+
+        var configuration = _primaryHost.TrackActivity().Timeout(timeout).As<TrackedSessionConfiguration>();
+        var replayed = configuration.Session;
+        replayed.AlwaysTrackExternalTransports = AlwaysTrackExternalTransports;
+        replayed.AssertAnyFailureAcknowledgements = AssertAnyFailureAcknowledgements;
+        replayed.AssertNoExceptions = AssertNoExceptions;
+        replayed.AssertNoTimeout = AssertNoTimeout;
+        replayed._otherHosts.AddRange(_otherHosts);
+        replayed.clock = current;
+        replayed._carried = pending;
+
+        return await configuration.ExecuteAndWaitAsync(c => replayed.playWindowAsync(c, windowEnd, playInline));
+    }
+
+    private async Task playWindowAsync(IMessageContext context, DateTimeOffset windowEnd, bool playInline)
+    {
+        while (pendingScheduled().FirstOrDefault(x => x.DueAt <= windowEnd) is { } next)
+        {
+            _played.Add(next.Envelope.Id);
+
+            // The handler runs at the instant its message was due
+            clock.AdvanceTo(next.DueAt);
+            var inline = await replayAsync(context, next.Envelope, playInline);
+
+            // A message delivered to a queue, local or not, is handled there, so let that settle -- its retries,
+            // dead-lettering and compensation included -- before looking for what it scheduled within the window
+            if (!inline) await waitForInFlightWorkAsync();
+        }
+
+        clock.AdvanceTo(windowEnd);
+    }
+
+    /// <summary>
+    /// GH-5664. Everything still scheduled, on this session's clock and in due order: what earlier windows left, then
+    /// what the initial IHost scheduled during this session, less what this session has already played.
+    /// </summary>
+    internal List<PendingScheduledMessage> pendingScheduled()
+    {
+        var serviceName = _primaryLogger.Options.ServiceName;
+
+        var recorded = _envelopes
+            .ToArray()
+            .SelectMany(x => x.Records)
+            .Where(x => x.ServiceName == serviceName && x.Envelope != null)
+            .Where(x => x.MessageEventType == MessageEventType.Scheduled || x.Envelope!.Status == EnvelopeStatus.Scheduled || x.WasScheduled)
+            .Select(x => new PendingScheduledMessage(x.Envelope!, x.DueAt ?? clock.Now, x.Sequence));
+
+        return _carried
+            .Concat(recorded)
+            .Where(x => !_played.Contains(x.Envelope.Id))
+            .OrderBy(x => x.DueAt)
+            .ThenBy(x => x.Sequence)
+            .DistinctBy(x => x.Envelope.Id)
+            .ToList();
+    }
+
+    // When an envelope is due on the session's clock, or null when it is not scheduled. A delay counts from now. An
+    // absolute time is on the session's clock when the application reads that clock too, and otherwise came from the
+    // real clock, so it counts from now by however long it was from the real now
+    private DateTimeOffset? dueAtOf(Envelope envelope)
+    {
+        var inner = envelope.MessageType == TransportConstants.ScheduledEnvelope ? envelope.Message as Envelope : null;
+        var now = clock.Now;
+
+        if ((envelope.ScheduleDelay ?? inner?.ScheduleDelay) is { } delay)
+        {
+            return addWithoutOverflow(now, delay);
+        }
+
+        if ((envelope.ScheduledTime ?? inner?.ScheduledTime) is { } time)
+        {
+            if (clock.SharedWithApplication) return time;
+
+            // A time already in the past (DateTimeOffset.MinValue is a common "right away") is due now
+            var remaining = time - DateTimeOffset.UtcNow;
+            return remaining <= TimeSpan.Zero ? now : addWithoutOverflow(now, remaining);
+        }
+
+        return null;
+    }
+
+    // Schedules at the edges (DateTimeOffset.MinValue / MaxValue, TimeSpan.MaxValue) must never throw from the session's
+    // bookkeeping: an overdue message is due now, and a far-future one is due at the end of time
+    private static DateTimeOffset addWithoutOverflow(DateTimeOffset at, TimeSpan by)
+    {
+        if (by <= TimeSpan.Zero) return at;
+        return by >= DateTimeOffset.MaxValue - at ? DateTimeOffset.MaxValue : at + by;
+    }
+
+    internal async Task ReplayAll(IMessageContext context, EnvelopeRecord[] records, bool playInline = false)
     {
         var envelopes = records.Select(x => x.Envelope!).Distinct().ToArray();
-        var bus = context as MessageBus;
 
         foreach (var capturedEnvelope in envelopes)
         {
-            // Captured records for scheduled sends to non-native-scheduling
-            // transports are wrappers around the original envelope (see
-            // EnvelopeScheduleExtensions.ForScheduledSend). In production the
-            // durable scheduler eventually fires the wrapper through
-            // ScheduledSendEnvelopeHandler, which unwraps the inner and
-            // copies the wrapper's context-correlation fields onto it before
-            // forwarding. Replay doesn't go through that round-trip — there's
-            // no broker, no serialization — so we have to do the same unwrap
-            // and stamp here so the inner envelope's destination + tenant /
-            // correlation / user fields drive the replay. See GH-2571 / PR #2572.
-            var dispatched = capturedEnvelope;
-            if (capturedEnvelope.MessageType == TransportConstants.ScheduledEnvelope &&
-                capturedEnvelope.Message is Envelope inner)
-            {
-                inner.CopyContextCorrelationFrom(capturedEnvelope);
-                dispatched = inner;
-            }
+            await replayAsync(context, capturedEnvelope, playInline);
+        }
+    }
 
-            // The replay context is fresh — its bus.TenantId / CorrelationId /
-            // UserName start out null. Propagate the dispatched envelope's
-            // values onto the bus so the outgoing envelope that InvokeAsync /
-            // SendAsync builds picks them up via TrackEnvelopeCorrelation.
-            // Without this, a scheduled message published under
-            // TenantId="red" would replay under no tenant.
-            if (bus != null)
-            {
-                bus.TenantId = dispatched.TenantId;
-                bus.CorrelationId = dispatched.CorrelationId;
-                bus.UserName = dispatched.UserName;
-            }
+    private async Task waitForInFlightWorkAsync()
+    {
+        // Never the whole timeout, which would fail the window's own act
+        var stopwatch = Stopwatch.StartNew();
+        while (stopwatch.Elapsed < Timeout / 2 && !_envelopes.ToArray().All(x => x.IsComplete()))
+        {
+            await Task.Delay(25.Milliseconds());
+        }
+    }
 
-            if (dispatched.Destination!.Scheme == TransportConstants.Local)
+    // True when the message was handled inline, false when it was delivered to its queue
+    private async Task<bool> replayAsync(IMessageContext context, Envelope capturedEnvelope, bool playInline)
+    {
+        var bus = context as MessageBus;
+        // Captured records for scheduled sends to non-native-scheduling
+        // transports are wrappers around the original envelope (see
+        // EnvelopeScheduleExtensions.ForScheduledSend). In production the
+        // durable scheduler eventually fires the wrapper through
+        // ScheduledSendEnvelopeHandler, which unwraps the inner and
+        // copies the wrapper's context-correlation fields onto it before
+        // forwarding. Replay doesn't go through that round-trip — there's
+        // no broker, no serialization — so we have to do the same unwrap
+        // and stamp here so the inner envelope's destination + tenant /
+        // correlation / user fields drive the replay. See GH-2571 / PR #2572.
+        var dispatched = capturedEnvelope;
+        if (capturedEnvelope.MessageType == TransportConstants.ScheduledEnvelope &&
+            capturedEnvelope.Message is Envelope inner)
+        {
+            inner.CopyContextCorrelationFrom(capturedEnvelope);
+            dispatched = inner;
+        }
+
+        // The replay context is fresh — its bus.TenantId / CorrelationId /
+        // UserName start out null. Propagate the dispatched envelope's
+        // values onto the bus so the outgoing envelope that InvokeAsync /
+        // SendAsync builds picks them up via TrackEnvelopeCorrelation.
+        // Without this, a scheduled message published under
+        // TenantId="red" would replay under no tenant.
+        if (bus != null)
+        {
+            bus.TenantId = dispatched.TenantId;
+            bus.CorrelationId = dispatched.CorrelationId;
+            bus.UserName = dispatched.UserName;
+        }
+
+        // GH-5674: a saga timeout that replaces earlier ones is told apart by its headers, which the replay keeps
+        var options = Persistence.Sagas.SagaTimeouts.ReplayOptionsFor(dispatched);
+
+        if (playInline && dispatched.Destination!.Scheme == TransportConstants.Local)
+        {
+            if (options == null)
             {
                 await context.InvokeAsync(dispatched.Message!);
             }
             else
             {
-                await context.EndpointFor(dispatched.Destination).SendAsync(dispatched.Message);
+                await context.InvokeAsync(dispatched.Message!, options);
             }
+
+            return true;
         }
+
+        // GH-5700: delivered to its queue as if its time had come, so the endpoint's retries, dead-lettering and a
+        // saga's compensation apply to it as they would in production. It keeps the saga it was scheduled for
+        if (dispatched.SagaId.IsNotEmpty())
+        {
+            options ??= new DeliveryOptions();
+            options.SagaId = dispatched.SagaId;
+        }
+
+        if (dispatched.Destination!.Scheme == TransportConstants.Local && bus != null)
+        {
+            // A local queue runs it through its own pipeline in this async flow, so a test clock the session moved is
+            // the time the handler reads, whatever thread the queue's worker is on
+            var routed = new List<Envelope>();
+            bus.CapturedOutgoing = routed;
+            try
+            {
+                await context.EndpointFor(dispatched.Destination).SendAsync(dispatched.Message, options);
+            }
+            finally
+            {
+                bus.CapturedOutgoing = null;
+            }
+
+            foreach (var envelope in routed)
+            {
+                if (envelope.Sender is IPlaysScheduledMessages queue)
+                {
+                    await queue.PlayNowAsync(envelope);
+                }
+                else
+                {
+                    await envelope.StoreAndForwardAsync();
+                }
+            }
+
+            return true;
+        }
+
+        await context.EndpointFor(dispatched.Destination).SendAsync(dispatched.Message, options);
+        return false;
     }
 
     public RecordCollection Scheduled => new ScheduledActivityRecordCollection(MessageEventType.Scheduled, this);
@@ -682,6 +890,7 @@ internal partial class TrackedSession : ITrackedSession
             ServiceName = serviceName,
             UniqueNodeId = uniqueNodeId
         };
+        record.DueAt = dueAtOf(envelope);
 
         if (AlwaysTrackExternalTransports || _otherHosts.Any())
         {
@@ -751,7 +960,14 @@ internal partial class TrackedSession : ITrackedSession
             return _conditions.All(x => x.IsCompleted());
         }
 
-        return _envelopes.All(x => x.IsComplete());
+        // The envelope histories are a snapshot, so a handler can send cascading messages and then finish
+        // while this check runs. Histories are only ever added, so check again until none appeared meanwhile.
+        while (true)
+        {
+            var histories = _envelopes.ToArray();
+            if (!histories.All(x => x.IsComplete())) return false;
+            if (_envelopes.Count == histories.Length) return true;
+        }
     }
 
     public void LogException(Exception exception, string? serviceName, object? correlationId = null)

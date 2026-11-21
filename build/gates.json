@@ -12,6 +12,14 @@
       "tracks": []
     },
     {
+      "name": "BuildTests",
+      "path": "src/Testing/BuildTests/BuildTests.csproj",
+      "ciTargets": "CoreTests",
+      "workers": 1,
+      "services": [],
+      "tracks": []
+    },
+    {
       "name": "MessageRoutingTests",
       "path": "src/Testing/MessageRoutingTests/MessageRoutingTests.csproj",
       "ciTargets": "CIMessageRouting",
@@ -29,7 +37,7 @@
       "ciTargets": "CIPersistence",
       "workers": 1,
       "frameworks": [
-        "net9.0"
+        "net10.0"
       ],
       "postgres": "Shared",
       "sqlServer": "Shared",
@@ -47,14 +55,16 @@
     {
       "name": "PostgresqlTests",
       "path": "src/Persistence/PostgresqlTests/PostgresqlTests.csproj",
-      "ciTargets": "CIPersistence",
+      "ciTargets": "CIPersistence, CIPostgresql, CIPostgresqlFeatures",
       "workers": 1,
       "postgres": "Shared",
       "services": [
-        "postgresql"
+        "postgresql",
+        "rabbitmq"
       ],
       "tracks": [
-        "postgresql"
+        "postgresql",
+        "rabbitmq"
       ]
     },
     {
@@ -84,7 +94,7 @@
     {
       "name": "EfCoreTests",
       "path": "src/Persistence/EfCoreTests/EfCoreTests.csproj",
-      "ciTargets": "CIEfCore, CIEfCoreNet10",
+      "ciTargets": "CIEfCore",
       "workers": 1,
       "postgres": "Shared",
       "sqlServer": "Shared",
@@ -102,7 +112,7 @@
     {
       "name": "EfCoreTests.MultiTenancy",
       "path": "src/Persistence/EfCoreTests.MultiTenancy/EfCoreTests.MultiTenancy.csproj",
-      "ciTargets": "CIEfCoreNet10",
+      "ciTargets": "CIEfCoreMultiTenancy",
       "workers": 1,
       "postgres": "Shared",
       "sqlServer": "Shared",
@@ -234,7 +244,7 @@
       "ciTargets": "CIRavenDb",
       "workers": 1,
       "frameworks": [
-        "net9.0"
+        "net10.0"
       ],
       "services": [],
       "tracks": [
@@ -247,7 +257,7 @@
       "ciTargets": "CIRavenDb",
       "workers": 1,
       "frameworks": [
-        "net9.0"
+        "net10.0"
       ],
       "services": [],
       "tracks": [
@@ -397,14 +407,17 @@
       "name": "Wolverine.AzureServiceBus.Tests",
       "path": "src/Transports/Azure/Wolverine.AzureServiceBus.Tests/Wolverine.AzureServiceBus.Tests.csproj",
       "ciTargets": "CIAzureServiceBus, CIAzureServiceBusLeader, CIAzureServiceBusRouting",
-      "workers": 1,
+      "workers": 2,
+      "optIn": true,
       "postgres": "OwnDatabase",
       "services": [
         "postgresql",
-        "asb-emulator"
+        "asb-emulator",
+        "asb-emulator-2"
       ],
       "tracks": [
-        "asb-emulator"
+        "asb-emulator",
+        "asb-emulator-2"
       ]
     },
     {
@@ -425,21 +438,6 @@
       "name": "Wolverine.MQTT.Tests",
       "path": "src/Transports/MQTT/Wolverine.MQTT.Tests/Wolverine.MQTT.Tests.csproj",
       "ciTargets": "CIMQTT",
-      "workers": 1,
-      "postgres": "OwnDatabase",
-      "sqlServer": "OwnDatabase",
-      "services": [
-        "postgresql",
-        "sqlserver"
-      ],
-      "tracks": [
-        "mqtt-broker-ports"
-      ]
-    },
-    {
-      "name": "Wolverine.Mqtt5.Tests",
-      "path": "src/Transports/MQTT/Wolverine.Mqtt5.Tests/Wolverine.Mqtt5.Tests.csproj",
-      "ciTargets": "CIMQTT5",
       "workers": 1,
       "postgres": "OwnDatabase",
       "sqlServer": "OwnDatabase",
@@ -525,6 +523,14 @@
       "tracks": []
     },
     {
+      "name": "Wolverine.Aspire.Hosting.Tests",
+      "path": "src/Testing/Wolverine.Aspire.Hosting.Tests/Wolverine.Aspire.Hosting.Tests.csproj",
+      "ciTargets": "CIAspireHosting",
+      "workers": 1,
+      "services": [],
+      "tracks": []
+    },
+    {
       "name": "Wolverine.Http.Tests",
       "path": "src/Http/Wolverine.Http.Tests/Wolverine.Http.Tests.csproj",
       "ciTargets": "CIHttp",
@@ -533,6 +539,14 @@
       "services": [
         "postgresql"
       ],
+      "tracks": []
+    },
+    {
+      "name": "Wolverine.Http.Compat.Tests",
+      "path": "src/Http/Wolverine.Http.Compat.Tests/Wolverine.Http.Compat.Tests.csproj",
+      "ciTargets": "CIHttpCompat",
+      "workers": 1,
+      "services": [],
       "tracks": []
     },
     {
@@ -621,6 +635,41 @@
       "services": [
         "postgresql",
         "sqlserver"
+      ],
+      "tracks": []
+    },
+    {
+      "name": "SagaFaults.Specs",
+      "path": "src/Samples/SagaFaults/SagaFaults.Specs/SagaFaults.Specs.csproj",
+      "ciTargets": "CIBobcat",
+      "workers": 1,
+      "postgres": "OwnDatabase",
+      "services": [
+        "postgresql"
+      ],
+      "tracks": []
+    },
+    {
+      "name": "EventSourcedSagas.Specs",
+      "path": "src/Samples/EventSourcedSagas/EventSourcedSagas.Specs/EventSourcedSagas.Specs.csproj",
+      "ciTargets": "CIBobcat",
+      "workers": 1,
+      "postgres": "OwnDatabase",
+      "sqlServer": "OwnDatabase",
+      "services": [
+        "postgresql",
+        "sqlserver"
+      ],
+      "tracks": []
+    },
+    {
+      "name": "SagaWorkflows.Specs",
+      "path": "src/Samples/SagaWorkflows/SagaWorkflows.Specs/SagaWorkflows.Specs.csproj",
+      "ciTargets": "CIBobcat",
+      "workers": 1,
+      "postgres": "OwnDatabase",
+      "services": [
+        "postgresql"
       ],
       "tracks": []
     },

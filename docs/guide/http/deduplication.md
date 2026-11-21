@@ -5,7 +5,7 @@
 ::: tip
 This is the HTTP half of Wolverine's [logical message
 deduplication](/guide/durability/idempotency#logical-message-deduplication). Read that page first
-for the storage, the retention window, and why this is opt-in — everything here builds on it.
+for the storage, the retention window, and how to turn it off — everything here builds on it.
 :::
 
 A `POST` that creates something is the classic at-most-once problem. The user double-clicks; the
@@ -151,7 +151,8 @@ caller reading another's response, so it requires a scope.
 created. `[DeduplicatedWithResponse]` answers it instead:
 
 ```csharp
-// Program.cs
+// Program.cs. On by default since 7.0; set it to false, or call
+// opts.RestoreV6Defaults(), to provision no wolverine_deduplicated_responses table
 opts.Durability.EnableDeduplicatedResponses = true;
 
 [DeduplicatedWithResponse(DeduplicationScope.User | DeduplicationScope.Endpoint)]
@@ -167,7 +168,7 @@ For a given `Idempotency-Key`:
 | Request | Answer |
 |---|---|
 | The first | Runs normally |
-| The same request again | The first response: its status, body and `Location`. The endpoint does not run |
+| The same request again | The first response: its status, body and `Location` (no body with [`StoreBody = false`](#leaving-the-body-out)), [marked as a replay](#marking-a-replay). The endpoint does not run |
 | A different request | **422** with a `ProblemDetails` body. Send a new key for a new request |
 | The same request while the first is still running | **409** with a `ProblemDetails` body. With [`ClaimInTransaction`](#claiming-inside-the-transaction), it runs too ([see below](#claiming-inside-the-transaction)) |
 | No key | **400**, unless `Required = false` |
@@ -182,7 +183,8 @@ with `[Deduplicated]` on the same endpoint.
 
 ### Scope
 
-The scope is required, and decides whose requests share a key:
+The scope is required, on the attribute or from [`DeduplicateWithResponse()`](#applying-it-to-every-endpoint), and
+decides whose requests share a key:
 
 | Flag | The key is unique within |
 |---|---|
@@ -209,6 +211,158 @@ body — never by the bound message, and the key itself is always the caller's. 
 same bytes: a client that reorders JSON properties, changes whitespace or reserializes the body gets
 a 422. A key reused on another endpoint is a different request even when the scope leaves the endpoint
 out.
+
+Forms are the exception. A client picks a new boundary whenever it builds the request again, so
+the same upload sent twice is two different byte streams. A `multipart/*` body is compared by its parts
+instead: each part's headers and content, in the order sent. A retry with a new boundary is the same
+request; a different file, file name or field value is still a 422. A body that cannot be read as multipart,
+or that has more parts than `FormOptions.ValueCountLimit`, is compared by its bytes.
+
+An `application/x-www-form-urlencoded` body is compared by its fields, by name. If middleware read the
+form before the endpoint ran, as `UseAntiforgery()` does for a token sent as a form field, the form it read is
+compared the same way, along with its files. In every case the antiforgery token field
+(`AntiforgeryOptions.FormFieldName`) is left out, because a browser that loads the page again is given a new
+token for the same request.
+
+### Leaving the body out
+
+A stored response is a copy of whatever the endpoint answered, kept for the whole window. For an endpoint
+that returns a one-time secret, that is a plaintext copy of the secret in the database. A newly created
+API key is one example. So is anything else the server generates and returns once: an OAuth client
+secret, a webhook signing secret, a temporary password, a one-time token. Set `StoreBody = false` to keep
+it out:
+
+<!-- snippet: sample_deduplicated_with_response_without_storing_the_body -->
+<a id='snippet-sample_deduplicated_with_response_without_storing_the_body'></a>
+```cs
+// The secret is in the first response and is never stored. A repeat gets the 201 and Location, with no body
+[DeduplicatedWithResponse(DeduplicationScope.User, StoreBody = false)]
+[WolverinePost("/deduplicated-response/secret-result")]
+public static Created<DeduplicatedSecret> PostSecretResult(DeduplicatedOrder request)
+{
+    var created = run(request);
+    return TypedResults.Created($"/deduplicated-response/orders/{created.Id}",
+        new DeduplicatedSecret(created.Id, Guid.NewGuid().ToString()));
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/Wolverine.Http.Tests/deduplicated_with_response.cs#L1020-L1030' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_deduplicated_with_response_without_storing_the_body' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+The body is never serialized or written. The claim still stores the status and `Location`, so a repeat
+is answered with those and no body, and the caller follows `Location` to the resource. The secret is not
+shown again.
+
+This fits an endpoint that answers with a `Location`, such as `Created`. One that sets no `Location`
+answers a repeat with the bare status and the [replay header](#marking-a-replay), and nothing else.
+
+### Applying it to every endpoint <Badge type="tip" text="7.0" />
+
+An API that takes an `Idempotency-Key` on every POST doesn't need the attribute on each endpoint. Call
+`DeduplicateWithResponse()` when you map the endpoints instead:
+
+<!-- snippet: sample_deduplicate_with_response_on_every_post -->
+<a id='snippet-sample_deduplicate_with_response_on_every_post'></a>
+```cs
+// Every POST endpoint that returns a resource is deduplicated on its
+// Idempotency-Key header, as if it had
+// [DeduplicatedWithResponse(DeduplicationScope.User | DeduplicationScope.Endpoint)]
+opts.DeduplicateWithResponse(DeduplicationScope.User | DeduplicationScope.Endpoint);
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/Wolverine.Http.Tests/deduplicated_with_response_from_options.cs#L52-L59' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_deduplicate_with_response_on_every_post' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+That covers every POST endpoint. Pass a filter over the `HttpChain` to choose others, and set the rest of
+the attribute's options — `Source` and `Key`, `Required`, `Window`, `ClaimInTransaction` and `StoreBody` — in
+the last argument:
+
+<!-- snippet: sample_deduplicate_with_response_with_a_filter -->
+<a id='snippet-sample_deduplicate_with_response_with_a_filter'></a>
+```cs
+// The PUT endpoints too, with a key that is optional and a one hour window
+opts.DeduplicateWithResponse(DeduplicationScope.User,
+    chain => chain.HttpMethods.Contains("PUT"),
+    x =>
+    {
+        x.Required = false;
+        x.Window = 1.Hours();
+    });
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/Wolverine.Http.Tests/deduplicated_with_response_from_options.cs#L61-L72' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_deduplicate_with_response_with_a_filter' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+The scope is required here, as it is on the attribute.
+
+An endpoint with its own `[DeduplicatedWithResponse]` keeps every setting it makes, and takes only the ones it
+leaves unset from `DeduplicateWithResponse()`. `Source` and `Key` count as one setting. Leave the scope off the
+attribute to change one setting and inherit the rest, the scope included:
+
+<!-- snippet: sample_deduplicated_with_response_inheriting_the_scope -->
+<a id='snippet-sample_deduplicated_with_response_inheriting_the_scope'></a>
+```cs
+// The scope, key and window come from DeduplicateWithResponse()
+[DeduplicatedWithResponse(StoreBody = false)]
+[WolverinePost("/dedup-options/inheriting")]
+public static DeduplicatedOrderCreated Post(DeduplicatedOrder request) => new(Guid.NewGuid());
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/Wolverine.Http.Tests/deduplicated_with_response_from_options.cs#L400-L407' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_deduplicated_with_response_inheriting_the_scope' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+An attribute with no scope that no `DeduplicateWithResponse()` call covers is refused at startup. When more
+than one call matches an endpoint, the first one fills in its settings.
+
+An endpoint the attribute would refuse is skipped instead of failing startup: one that returns no resource,
+one with `[Deduplicated]`, and one whose response is written as text, as a bare status code or by its own
+`WriteResponse` method rather than as JSON. A custom `IResourceWriterPolicy` isn't seen here, so an endpoint
+it writes is still refused when it's compiled. Leave that one out with the filter.
+
+To leave out any other endpoint, mark it, or its class, with `[DisableDeduplicatedWithResponse]`. It gets no
+refusal codes in its OpenAPI metadata either:
+
+<!-- snippet: sample_disable_deduplicated_with_response -->
+<a id='snippet-sample_disable_deduplicated_with_response'></a>
+```cs
+// Left out of DeduplicateWithResponse()
+[DisableDeduplicatedWithResponse]
+[WolverinePost("/dedup-options/opted-out")]
+public static DeduplicatedOrderCreated PostOptedOut(DeduplicatedOrder request) => new(Guid.NewGuid());
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/Wolverine.Http.Tests/deduplicated_with_response_from_options.cs#L378-L385' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_disable_deduplicated_with_response' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+### Marking a replay
+
+By default, Wolverine marks every replayed response with an `Idempotent-Replayed: true` header. The first
+response, and the 409 and 422 refusals, never carry it.
+
+A browser on another origin can read the header only if your CORS policy exposes it, for example with
+`WithExposedHeaders("Idempotent-Replayed")`.
+
+Rename the header, or turn it off, application-wide:
+
+```csharp
+app.MapWolverineEndpoints(opts =>
+{
+    opts.DeduplicatedReplayHeaderName = "X-Idempotent-Replay";
+
+    // or send no header at all
+    opts.MarkDeduplicatedReplays = false;
+});
+```
+
+### Metrics and tracing
+
+Each request that carries a key is counted once on the `wolverine.http.deduplication.outcomes` counter, tagged by
+`http.route`, `http.request.method`, `source` (the service name) and `wolverine.deduplication.outcome`:
+
+| Outcome | The request was |
+|---|---|
+| `claimed` | the first with its key: its work is done, and its claim is kept for repeats |
+| `replayed` | a repeat, answered with the stored response |
+| `mismatched` | a different request under a key already used, refused with 422 |
+| `in_progress` | a repeat while the first is still running, or of a claim with no stored response, refused with 409 |
+
+A request without a key is not counted, and neither is a first request that fails and gives its claim back. The
+same outcome is added to the request's span as a `wolverine.deduplication.{outcome}` event.
 
 ### The window
 
@@ -262,9 +416,10 @@ request's claim and answers from it.
   claim-and-release.
 
 An endpoint that asks for `ClaimInTransaction` but cannot take it — another store, database per tenant, a
-message store in another database, no commit through the middleware — keeps claim-and-release, and the
-host logs a warning naming it. The database check is repeated at runtime, so pre-generated code built
-against a different configuration fails loudly rather than writing claims where they are never read.
+message store in another database, no commit through the middleware — keeps claim-and-release, and
+Wolverine logs a warning naming it once its code is generated. The database check is repeated at runtime,
+so pre-generated code built against a different configuration fails loudly rather than writing claims
+where they are never read.
 
 Don't call `SaveChangesAsync` yourself in such an endpoint as well. Your own commit writes the work
 before the middleware's commit writes the claim, so a crash between them, or a concurrent repeat, runs
@@ -282,7 +437,7 @@ endpoint in your application, set `DefaultClaimInTransaction` when you map the e
 // writes its claim inside its own transaction where it can
 opts.DefaultClaimInTransaction = true;
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/Wolverine.Http.Tests/Marten/deduplicated_with_response_claim_in_transaction_default.cs#L53-L59' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_default_claim_in_transaction' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/Wolverine.Http.Tests/Marten/deduplicated_with_response_claim_in_transaction_default.cs#L56-L62' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_default_claim_in_transaction' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 An endpoint that doesn't set `ClaimInTransaction` takes that default. An endpoint that sets it, either
@@ -303,12 +458,30 @@ public static DeduplicatedOrderCreated PostUnset(DeduplicatedOrder request, IDoc
 public static DeduplicatedOrderCreated PostOff(DeduplicatedOrder request, IDocumentSession session)
     => store(request, session);
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/Wolverine.Http.Tests/Marten/deduplicated_with_response_claim_in_transaction_default.cs#L146-L160' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_override_default_claim_in_transaction' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/Wolverine.Http.Tests/Marten/deduplicated_with_response_claim_in_transaction_default.cs#L167-L181' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_override_default_claim_in_transaction' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 Endpoints that can't claim inside their transaction keep claim-and-release, as above. When they only
 inherited the default instead of asking for it, Wolverine logs that at debug level rather than as a
 warning.
+
+To fail instead of logging, set `ThrowWhenClaimInTransactionFallsBack`. It is off by default. When it is
+on, generating the code for an endpoint that would fall back to claim-and-release throws an
+`InvalidOperationException` naming the endpoint and the reason. That applies whether the endpoint set
+`ClaimInTransaction = true` itself or inherited `DefaultClaimInTransaction`:
+
+<!-- snippet: sample_throw_when_claim_in_transaction_falls_back -->
+<a id='snippet-sample_throw_when_claim_in_transaction_falls_back'></a>
+```cs
+opts.ThrowWhenClaimInTransactionFallsBack = true;
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/Wolverine.Http.Tests/Marten/deduplicated_with_response_claim_in_transaction_default.cs#L240-L244' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_throw_when_claim_in_transaction_falls_back' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+It throws when the endpoint's code is generated: inside `MapWolverineEndpoints` when `WarmUpRoutes` is
+`RouteWarmup.Eager`, and otherwise on the first request to that endpoint. Pre-generated code
+(`TypeLoadMode.Static`, or `TypeLoadMode.Auto` once the generated code exists) is not generated at
+runtime, so nothing throws there. Run `codegen write` with the option on to check it.
 
 #### Claim-and-release
 
@@ -334,17 +507,27 @@ releasing it with a rolled-back transaction.
 
 ### Requirements and limits
 
-- `Durability.EnableDeduplicatedResponses`, and the PostgreSQL, SQL Server, MySQL or SQLite message store
+- `Durability.EnableDeduplicatedResponses` (on by default since 7.0), and the PostgreSQL, SQL Server, MySQL or SQLite message store
   (including Marten's). With a database per tenant, claims are kept in the main database. Without them
   the host logs a warning at startup and the endpoint throws at its first request.
-- The endpoint must return a resource, written as JSON by System.Text.Json; any other response writer is
-  refused when the endpoint is first compiled.
+- The endpoint must return a resource, written as JSON by System.Text.Json, or an `IResult` (below); any
+  other response writer is refused when the endpoint is first compiled.
+- An endpoint can also return an ASP.NET Core `IResult`. `Ok`, `Created`, `Accepted` (each with or without
+  a value), `NoContent`, `StatusCodeHttpResult` and `Results.Empty` are replayed with their status, JSON
+  value and `Location`, the value serialized as ASP.NET Core writes it. A `Results<...>` union is replayed
+  when the arm it answers with is one of these. An arm with a status of 400 or above, or a challenge or
+  forbid result, gives the key back as any failure does. Any other result, such as text, files, redirects,
+  `JsonHttpResult` or `CreatedAtRoute`, is not stored: the key is kept unanswered, so repeats get 409 until
+  it expires, and an error is logged. An endpoint whose declared return type can never be one of the
+  replayed results is refused at startup.
 - The request body is buffered to compute the fingerprint, and the resource is serialized a second
-  time to store it.
-- Only the status, body and `Location` are replayed; other response headers are not.
-- Form-encoded requests are not supported: the fingerprint has to re-read the body after binding, and
-  the form read consumes it first. An endpoint that binds a form value is refused at startup. File and
-  multipart uploads are unaffected.
-- Response bodies are stored for the whole window, in a `wolverine_deduplicated_responses` table of their
-  own. It is only provisioned when the setting is on, so nothing changes for anyone else; with
-  `AutoCreate.None`, create it before turning the setting on.
+  time to store it, unless [`StoreBody = false`](#leaving-the-body-out).
+- Only the status, body and `Location` are replayed; other response headers are not. The replay adds
+  its own [replay header](#marking-a-replay).
+- Form posts and file uploads are supported, whether the endpoint binds `[FromForm]` values, an
+  `IFormFile`, an `IFormCollection` or a `MultipartReader`, and whether the antiforgery token is sent in
+  the request header or as a form field.
+- Responses are stored for the whole window, in a `wolverine_deduplicated_responses` table of their own,
+  with their bodies unless [`StoreBody = false`](#leaving-the-body-out). The table is only provisioned when
+  the setting is on, so nothing changes for anyone else; with `AutoCreate.None`, create it before turning
+  the setting on.

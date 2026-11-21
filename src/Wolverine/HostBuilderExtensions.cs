@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
 using JasperFx.CodeGeneration;
 using JasperFx.CodeGeneration.Commands;
@@ -107,9 +108,11 @@ public static class HostBuilderExtensions
         // harness whose hosts are built by a shared helper in another assembly it pinned the HELPER's assembly,
         // and every later host in the process scanned that assembly for handlers instead of its own. Seed the pin
         // with the assembly this registration was actually made from. ??= leaves an existing pin alone.
-        if (registeredFrom != null)
+        if (registeredFrom != null &&
+            Interlocked.CompareExchange(ref JasperFxOptions.RememberedApplicationAssembly, registeredFrom, null) == null)
         {
-            JasperFxOptions.RememberedApplicationAssembly ??= registeredFrom;
+            // GH-3521: noted, so a host that turns RememberApplicationAssembly off can take it back
+            options.SeededRememberedApplicationAssembly = registeredFrom;
         }
 
         return AddWolverine(services, options, discovery, configure);
@@ -139,6 +142,18 @@ public static class HostBuilderExtensions
         }
 
         services.AddJasperFx();
+
+        // GH-3576: in a Wolverine host, Wolverine owns the application-assembly reuse warning. JasperFx detects
+        // the same divergence one level down and Marten/Polecat/Fisher log JasperFx's copy at startup, so a
+        // host running both used to warn twice -- and JasperFx's copy is a false positive whenever
+        // IHostBuilder.UseWolverine() is registered in one assembly and built in another (jasperfx#1179).
+        // Registered after AddJasperFx() above, so this runs after the PostConfigure that computes JasperFx's
+        // warning and before any store reads it.
+        services.PostConfigure<JasperFxOptions>(options.ClaimApplicationAssemblyReuseWarning);
+
+        // GH-5523 (7.0): pre-generated code by default in the Production profile, for Wolverine hosts only
+        options.ApplyProductionCodeGenerationDefault(services);
+
         services.AddSingleton<MessageStoreCollection>();
 
         // GH-4180. The single service that generated logical-deduplication code resolves, in message
@@ -185,13 +200,15 @@ public static class HostBuilderExtensions
         services.AddSingleton(s =>
         {
             var jasperfx = s.GetRequiredService<JasperFxOptions>();
+            var environment = s.GetService<IHostEnvironment>();
 
+            // GH-5667: ahead of ReadJasperFxOptions, so the application the host names outranks a guessed pin
+            options.ReadHostEnvironment(environment, jasperfx);
             options.ReadJasperFxOptions(jasperfx);
-            
+
             var extensions = s.GetServices<IWolverineExtension>();
             options.ApplyExtensions(extensions.ToArray());
 
-            var environment = s.GetService<IHostEnvironment>();
             var directory = environment?.ContentRootPath ?? AppContext.BaseDirectory;
 
             // Don't correct for the path if it's already been set (from JasperFxOptions or user)
@@ -237,6 +254,17 @@ public static class HostBuilderExtensions
         });
 
         services.AddSingleton<IWolverineRuntime, WolverineRuntime>();
+
+        // GH-5572. Sweeps retained, completed sagas. It has no agents unless a saga type is retained.
+        services.AddSingleton<IAgentFamily, Wolverine.Persistence.Sagas.SagaRetentionAgentFamily>();
+
+#if NET11_0_OR_GREATER
+        // GH-5148. Registered unconditionally because budgets may be declared after UseWolverine()
+        // (ConfigureWolverine); the validator returns at once when none are. Registered only as
+        // IAsyncStartupValidator: a custom IStartupValidator would suppress every async validator.
+        services.TryAddEnumerable(ServiceDescriptor
+            .Singleton<Microsoft.Extensions.Options.IAsyncStartupValidator, ConnectionBudgetStartupValidator>());
+#endif
 
         // GH-3988: the Wolverine-derived Event Model source. GH-4152: a plain append, because the source
         // now declares EventModelProvenance.Derived and the merge resolves on that ladder rather than on
@@ -337,6 +365,13 @@ public static class HostBuilderExtensions
         }
 
         configure?.Invoke(options);
+
+        if (!options.RememberApplicationAssembly)
+        {
+            // GH-3521: neither record nor reuse the process-wide application assembly, here or in JasperFx
+            options.ForgetSeededRememberedApplicationAssembly();
+            services.Configure<JasperFxOptions>(x => x.RememberApplicationAssembly = false);
+        }
 
         if (options.Discovery.IncludeHandlerModules)
         {

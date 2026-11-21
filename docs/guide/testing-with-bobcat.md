@@ -173,6 +173,7 @@ captured on `LastAct`, so a refusal can be asserted afterwards.
 | `WhenReceived(message, configureTracking?, options?)` | `message` arrives at the application through Wolverine, and the scenario waits for everything it caused to settle: cascades, forwarded events, local queues. `options` is Wolverine's `DeliveryOptions`, so `new DeliveryOptions { TenantId = "red" }` sends it for a tenant |
 | `WhenPublished(message, configureTracking?, options?)` | published to every subscriber, and the scenario waits for what it caused |
 | `WhenScheduledMessagesAreExecuted(timeout?)` | the messages the last act scheduled for later are executed now, and this is the new act. See [Scheduled messages](#scheduled-messages) |
+| `WhenTimePasses(duration, timeout?)` | `duration` passes on the spec's clock, and the scheduled messages that come due within it are executed in due order, as the new act. See [Letting time pass](#letting-time-pass) |
 | `WhenTracked(description, act, configureTracking?)` | any act that reaches the application from outside (an HTTP call, a client SDK, a hosted service poke) run inside the tracked session. What the act reaches sends or schedules is what the act caused. It cannot tell the act's events from its cascades' and never records a refusal: see [HTTP without WolverineFx.Bobcat.Http](#http-without-wolverinefx-bobcat-http) |
 | `WhenTracked(description, bus => …, configureTracking?)` | an act of your own, handed the tracked session's `IMessageBus`. What it sends, publishes or schedules through `bus` is the act's **own** message, exactly as `WhenReceived`'s message is: never counted as sent, and when only scheduled, caught by the [only-scheduled guard](#the-only-scheduled-guard) |
 | `WhenActing(description, services => …)` | any act at all, handed a fresh service scope. In a `WolverineScenario` it runs inside the tracked session too, so it waits for what it caused and carries the messages it sent. A message its own code sends through an `IMessageBus` or `IMessageContext` it resolves from `services` is its own message, as for the `bus` overload above |
@@ -214,14 +215,62 @@ await WhenScheduledMessagesAreExecuted();                // the new act: the tim
 ThenMessageSent<EscalateLateShipment>();
 ```
 
-`WhenScheduledMessagesAreExecuted(TimeSpan? timeout = null)` executes every message the last act scheduled, a local
-one inline and any other sent to its destination, and becomes the new act: `LastAct` is what the replay did, so the
+`WhenScheduledMessagesAreExecuted(TimeSpan? timeout = null, bool playInline = false)` executes every message the last
+act scheduled, and becomes the new act. A local message goes through its queue as if its time had come, with the
+endpoint's retries, dead-lettering and a saga's compensation, and any other message is sent to its destination. Pass
+`playInline: true` to run a local message inline instead, where its first failure fails the act. The new act: `LastAct` is what the replay did, so the
 Then steps after it judge the scheduled messages' handlers (a saga's timeout, a `DelayedFor` reminder, a
 `TimeoutMessage` sent with `WhenReceived`). `timeout` is how long it waits for everything the replay caused to settle,
 `Timeout` by default. The replay keeps the scheduled messages' correlation id, so `ThenEventuallyCaused` still finds
 what they caused. With no act before it, or an act that scheduled nothing, the step fails and stops the scenario,
 saying what the last act did instead. It stamps nothing on the Event Model: which messages are scheduled is only
 known at run time.
+
+#### Letting time pass {#letting-time-pass} <Badge type="tip" text="7.0" />
+
+`WhenScheduledMessagesAreExecuted` runs everything at once, so a saga that schedules an hour's deadline at the start
+and a poll every five minutes would have the deadline fire together with the first poll. `WhenTimePasses` moves the
+spec's clock forward instead, and executes only what comes due on the way:
+
+```csharp
+GivenTheTimeIs(new DateTimeOffset(2026, 3, 2, 9, 0, 0, TimeSpan.Zero));
+await WhenReceived(new WatchReport(id));                 // schedules PollReport (5 min) and ReportDeadline (1 hour)
+
+await WhenTimePasses(5.Minutes());                       // the new act: the first poll runs, and schedules the next
+ThenHandled<PollReport>();
+ThenNotHandled<ReportDeadline>();
+
+await WhenTimePasses(55.Minutes());                      // the polls due on the way, then the deadline at the hour
+ThenHandled<ReportDeadline>();
+await ThenNoSaga<ReportWatch>(id);
+```
+
+`WhenTimePasses(TimeSpan duration, TimeSpan? timeout = null, bool playInline = false)` executes, in due order, every scheduled message that
+comes due within `duration`: what earlier acts scheduled and what is scheduled while the time passes, such as the
+saga's next poll. Everything due later stays scheduled for the next `WhenTimePasses`, and time passing with nothing
+due is not a failure. It is Wolverine's `ITrackedSession.PlayScheduledMessagesAsync(advanceBy:)` underneath, see
+[Letting time pass](/guide/testing#letting-time-pass).
+
+A message that fails is handled the way the endpoint handles any failure, so a spec can show a saga compensating
+when time passes and its poll fails:
+
+```csharp
+await WhenReceived(new StartExportPolling(id));
+
+TheExportServiceIsDown();
+await WhenTimePasses(5.Minutes());                       // the poll fails three times, then the saga compensates
+
+ThenMessageSent(new ExportPollingGaveUp(id, "The export service is down"));
+await ThenNoSaga<ExportPolling>(id);
+```
+
+A played message goes through its local queue's pipeline, with its retries, dead-lettering and compensation, but it
+runs in the spec's own async flow, so the queue's ordering and parallelism settings don't apply to it. Pass
+`playInline: true` to keep the old inline behaviour.
+
+The clock that moves is the ambient `BobcatClock`, the one `GivenTheTimeIs` freezes. An application that reads it
+through `services.ShareClock()` sees each message's due time while handling it. In `CritterStackSpec` the same
+step only moves the clock, since there is no bus. With no act before it, the step fails and stops the scenario.
 
 #### The only-scheduled guard {#the-only-scheduled-guard}
 
@@ -247,7 +296,7 @@ message**, so the guard says nothing about it: after `WhenPosted(...)` to an end
 
 ### HTTP without WolverineFx.Bobcat.Http {#http-without-wolverinefx-bobcat-http}
 
-`WolverineFx.Bobcat.Http` depends on Alba 9 (currently 9.0.0-rc.2, see Bobcat's
+`WolverineFx.Bobcat.Http` depends on Alba 9 (9.0.0 or later, see Bobcat's
 [Compatibility](https://bobcat.jasperfx.net/compatibility) page), so a suite on Alba 8.x often acts over HTTP with
 `WhenTracked("…", () => host.Scenario(…))` instead. That works, but two verdicts differ from `WhenPosted` and the other
 HTTP acts:
@@ -446,6 +495,36 @@ so a green suite pays nothing for them, and each is capped at 200 rows with "…
 `bobcat run --verbose` (or `BOBCAT_VERBOSE_REPORTS=1`) writes them for passing specifications too. See
 [Custom Telemetry on Failure](https://bobcat.jasperfx.net/failure-telemetry).
 
+## Faults, dead letters and sagas across services {#faults-dead-letters-and-sagas} <Badge type="tip" text="7.0" />
+
+A specification about failures usually spans two services, each a host of its own in the test process. `AlsoTrack(host)`
+tracks the second one in every act, and `DeadLettersFailTheAct = false` makes a dead letter an outcome to judge rather
+than a failed act. Steps that take `by` name a service by its `ServiceName`. The
+[SagaFaults sample](https://github.com/JasperFx/wolverine/tree/main/src/Samples/SagaFaults) uses all of these.
+
+| Step | |
+|---|---|
+| `ThenDeadLettered<T>(by?)` / `ThenNotDeadLettered<T>(by?)` | a `T` was (not) moved to the error queue |
+| `ThenDeadLettered<T>(by, tagged)` | and its dead letter carries that [tag](/guide/durability/dead-letter-storage#dead-letter-tags), read back from the service's dead letter storage |
+| `ThenHandled<T>(by)` / `ThenNotHandled<T>(by)` | a `T` was (not) handled in that service |
+| `ThenAttempted<T>(count, by?)` | a `T` was attempted exactly `count` times, the first attempt and every retry |
+| `ThenTheSagaHandled<TSaga, TMessage>(id)` | the saga with that id handled a `TMessage` |
+| `GivenSaga<TSaga>(saga)`, `ThenSaga<TSaga>(id, expected?)`, `ThenNoSaga<TSaga>(id)` | arrange or check a saga through its own storage: a document store, the lightweight saga tables, or memory |
+| `ThenTheSagaStatusIs<TSaga>(id, status)` | a `CompensatingSaga`'s status |
+| `ThenTheSagaCompensated<TSaga, TMessage, TException>(id)` / `ThenTheSagaFailedToCompensate<…>(id)` | its compensation log has that entry: the failed message, the thrown exception or a subclass of it, and the outcome |
+| `ThenWaitingInTheOutbox<T>(by, to)` / `ThenNothingWaitingInTheOutbox<T>(by)` | a `T` to the service named `to` is (not) waiting in the durable outbox of `by` |
+| `ThenStillInTheInbox<T>(by)` | a `T` is still in the durable inbox of `by`, to be tried again |
+
+Some failures can only be arranged from inside Wolverine, so these steps go through test hooks in it:
+
+| Step | Arranges |
+|---|---|
+| `GivenTheServiceCrashesAfterItsNextDeadLetter(service)` | the service stops right after its next dead-letter move commits, so the faults written with the dead letter stay in its outbox |
+| `WhenTheServiceRestarts(service)` | a new act: what the service owned in its inbox and outbox is released and recovered, as for a node that went away, and the act waits until what the crash left behind is handled |
+| `GivenTheNextDeadLetterMoveFails(service)` | the next dead-letter move fails before it commits and rolls back. The act waits until the message is handed back to the inbox |
+| `WhileCompensatingTheSagaIsChanged<TSaga>(id, onEveryAttempt)` | another message saves the saga while it is being compensated, once or on every attempt |
+| `WhileCompensatingTheSagaIsCompleted<TSaga>(id)` | another message completes the saga just before it is compensated |
+
 ## Dynamic Consistency Boundaries {#dynamic-consistency-boundaries}
 
 For a decision whose consistency boundary is a tag query rather than one stream:
@@ -532,13 +611,15 @@ after the daemons.
 
 Three things it needs from you:
 
-- **The store has to record correlation ids**, which Marten, Polecat and Fisher all leave off by default; on Marten,
-  `Events.MetadataConfig.CorrelationIdEnabled = true`. When it doesn't, the step fails and says how to turn them on.
+- **The store has to record correlation ids.** Marten 10, Polecat 6 and Fisher 2 do by default; on Marten they are
+  off again if you set `Events.MetadataConfig.CorrelationIdEnabled = false` or call `RestoreV9Defaults()`. When the
+  store doesn't record them, the step fails and says how to turn them on.
 - **Every hop has to carry the id.** Wolverine's handlers do. An event subscription or a projection's side effect that
   publishes a message has to pass the event's `CorrelationId` on itself, as in
   `bus.PublishAsync(message, new DeliveryOptions { CorrelationId = e.CorrelationId })`.
-- **An HTTP act sends the id as the `X-Correlation-ID` header.** For Wolverine.HTTP to apply it, turn on
-  `WolverineHttpOptions.ApplyCorrelationIdHeaderToAllEndpoints`.
+- **An HTTP act sends the id as the `X-Correlation-ID` header.** For Wolverine.HTTP to apply it,
+  `WolverineHttpOptions.ApplyCorrelationIdHeaderToAllEndpoints` has to be on, which it is by default from Wolverine
+  7.0.
 
 An act sent for a tenant is looked for within that tenant: filtered by it on a conjoined store, and in the tenant's
 own database on a store that spreads its tenants across several. An act with no tenant on such a store is looked for

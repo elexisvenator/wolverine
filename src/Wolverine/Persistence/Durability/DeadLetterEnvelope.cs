@@ -58,6 +58,21 @@ public class DeadLetterEnvelope
     public string? FailureTitle { get; set; }
 
     /// <summary>
+    /// GH-5557. The saga id the failed envelope carried (<see cref="Envelope.SagaId"/>), so one saga
+    /// instance's dead letters can be found with <see cref="DeadLetterManagement.DeadLetterEnvelopeQuery.SagaId"/>.
+    /// Null when the message had nothing to do with a saga, or was dead lettered before this was recorded
+    /// </summary>
+    public string? SagaId { get; set; }
+
+    /// <summary>
+    /// GH-5556. Why Wolverine dead lettered the message, when it has more to say than the exception: a saga's
+    /// own handler that failed and was then compensated is tagged <c>compensated</c>, <c>compensation-failed</c>
+    /// or <c>compensation-saga-missing</c>, and a fault whose compensation failed is tagged <c>compensation-failed</c>.
+    /// Null for an ordinary dead letter. Filter on it with <see cref="DeadLetterManagement.DeadLetterEnvelopeQuery.Tag"/>
+    /// </summary>
+    public string? Tag { get; set; }
+
+    /// <summary>
     /// When the message was moved to dead letter storage this time
     /// </summary>
     public DateTimeOffset? FailedAt { get; set; }

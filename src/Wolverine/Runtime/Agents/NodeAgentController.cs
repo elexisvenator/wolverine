@@ -293,7 +293,9 @@ public partial class NodeAgentController
         {
             try
             {
-                if (_persistence.HasLeadershipLock())
+                // CancellationToken.None: this is the teardown path, and a cancelled probe must not skip
+                // the release.
+                if (await _persistence.HasLeadershipLockAsync(CancellationToken.None))
                 {
                     await _persistence.ReleaseLeadershipLockAsync();
                 }
@@ -396,6 +398,9 @@ public partial class NodeAgentController
 
             await evictForRestartAsync(agentUri, existing);
         }
+
+        // GH-5601: before anything is marked as starting, so a refused agent leaves nothing behind
+        assertRunsWorkloadFor(agentUri);
 
         _startingAgents[agentUri] = default;
         try

@@ -71,6 +71,36 @@ public interface IPolicies : IEnumerable<IWolverinePolicy>, IWithFailurePolicies
     void AlwaysMakeScheduledMessagesDurable();
 
     /// <summary>
+    ///     GH-5572. Keep completed sagas for <paramref name="retention" /> instead of deleting them, so finished
+    ///     instances can still be read and queried. A retained saga is marked completed
+    ///     (<see cref="Saga.CompletedAt" />), and a later message for it is treated as a message for a saga that does
+    ///     not exist: it goes to <c>NotFound</c>, never to <c>Handle</c>. A node agent deletes retained sagas once
+    ///     they are older than the retention period. Applies to every saga type whose storage supports retention
+    ///     (the lightweight database tables, Marten, Polecat, Fisher, EF Core, RavenDB and CosmosDB);
+    ///     <see cref="RetainWhenCompletedAttribute" /> sets a different period for one saga type. Off by default.
+    /// </summary>
+    /// <param name="retention">How long to keep a completed saga</param>
+    void RetainCompletedSagas(TimeSpan retention);
+
+    /// <summary>
+    ///     GH-5674. What every saga does with a message that arrives after the saga is gone -- completed, timed out or
+    ///     never started -- when it has no <c>NotFound</c> method for the message. The default is
+    ///     <see cref="SagaMissingBehavior.Throw" />: <c>UnknownSagaException</c>, as before.
+    ///     <see cref="SagaMissingBehavior.Discard" /> logs the message at Information and drops it.
+    ///     <see cref="SagaMissingAttribute" /> on a saga type, or <see cref="DiscardIfSagaMissingAttribute" /> on a
+    ///     message type or a saga's <c>Handle()</c> method, wins over this.
+    /// </summary>
+    void WhenSagaIsMissing(SagaMissingBehavior behavior);
+
+    /// <summary>
+    ///     GH-5665. Record a message history for every saga kept as a document or a row, as if each saga type carried
+    ///     <see cref="RecordSagaHistoryAttribute" />: one row per handled message, with its outcome and the messages the
+    ///     saga sent, kept in the message store and read through <c>ISagaHistoryDiagnostics</c>. Event-sourced sagas are
+    ///     left alone, since their stream is their history. Off by default, because it writes a row per message.
+    /// </summary>
+    void RecordSagaHistory();
+
+    /// <summary>
     ///     Create a policy for all listening *non local* endpoints
     /// </summary>
     /// <param name="configure"></param>
@@ -235,7 +265,7 @@ public interface IPolicies : IEnumerable<IWolverinePolicy>, IWithFailurePolicies
 
     /// <summary>
     /// Override the log level for Wolverine's built in logging for messages
-    /// being completed successfully. This is Information by default
+    /// being completed successfully. This is Debug by default (it was Information before 6.21, GH-3490)
     /// </summary>
     /// <param name="logLevel"></param>
     void MessageSuccessLogLevel(LogLevel logLevel);
@@ -282,12 +312,6 @@ public interface IPolicies : IEnumerable<IWolverinePolicy>, IWithFailurePolicies
     /// routing conventions that are applied to the system
     /// </summary>
     void ConventionalLocalRoutingIsAdditive();
-
-    /// <summary>
-    /// Should Wolverine try to publish internal events about agent assignment, node
-    /// history, and endpoint events to the message bus? The default is false;
-    /// </summary>
-    bool PublishAgentEvents { get; set; }
 
     /// <summary>
     /// Automatically propagate the originating message's GroupId to the PartitionKey of outgoing

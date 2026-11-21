@@ -450,6 +450,19 @@ internal partial class OracleMessageStore
             }
         }
 
+        if (query.SagaId.IsNotEmpty())
+        {
+            builder.Append($" AND {DatabaseConstants.SagaId} = ");
+            builder.AppendParameter(query.SagaId);
+        }
+
+        // GH-5556
+        if (query.Tag.IsNotEmpty())
+        {
+            builder.Append($" AND {DatabaseConstants.Tag} = ");
+            builder.AppendParameter(query.Tag);
+        }
+
         switch (archived)
         {
             case DeadLetterArchiveFilter.Exclude:

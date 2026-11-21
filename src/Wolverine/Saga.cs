@@ -19,7 +19,7 @@ public abstract class Saga
     /// </summary>
     public bool IsCompleted()
     {
-        return _isCompleted;
+        return _isCompleted || CompletedAt.HasValue;
     }
 
     /// <summary>
@@ -41,6 +41,34 @@ public abstract class Saga
     /// sagas use the <see cref="int"/> revision.)
     /// </summary>
     public int Version { get; set; }
+
+    /// <summary>
+    /// When this saga instance was last inserted or updated, in UTC. Wolverine's saga persistence sets this
+    /// to <see cref="DateTimeOffset.UtcNow"/> every time it inserts or updates the saga, whatever the storage
+    /// provider, so any value user code assigns is overwritten on the next save. A saga row written before
+    /// Wolverine 7.0 reads back as <c>default(DateTimeOffset)</c> until its next update, unless its store can
+    /// supply its own modification timestamp (Marten maps it from <c>mt_last_modified</c>).
+    /// Useful for finding saga instances that have sat untouched for a long time.
+    /// </summary>
+    public DateTimeOffset LastModified { get; set; }
+
+    /// <summary>
+    /// GH-5572. When this saga completed, in UTC, for a saga type whose completed instances are kept for a while
+    /// (<c>opts.Policies.RetainCompletedSagas()</c> or <see cref="RetainWhenCompletedAttribute"/>). Null for a saga
+    /// that has not completed, and always null for a saga type that is not retained, because a completed saga of
+    /// that type is deleted. Wolverine's saga persistence sets it. A retained saga with a value here is never handed
+    /// to a <c>Handle</c> method again.
+    /// </summary>
+    public DateTimeOffset? CompletedAt { get; set; }
+
+    /// <summary>
+    /// GH-5674. The id of the latest timeout this saga scheduled under each key, for timeouts that replace earlier ones
+    /// (<see cref="ReplacesEarlierTimeoutsAttribute" /> or <see cref="TimeoutMessage.TimeoutKey" />). Wolverine sets it;
+    /// an earlier timeout whose id is not the latest is discarded when it fires. Null for a saga that never scheduled
+    /// one. Not mapped by EF Core unless the saga's entity mapping maps it.
+    /// </summary>
+    [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+    public Dictionary<string, Guid>? LatestTimeoutIds { get; set; }
 }
 
 #endregion

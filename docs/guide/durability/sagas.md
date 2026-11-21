@@ -22,6 +22,11 @@ in Wolverine consists of a couple parts:
 3. A saga persistence strategy registered in Wolverine that knows how to load and persist the saga state documents
 4. An identity for the saga state in order to save, load, or delete the current saga state
 
+::: tip
+To keep a saga's state as its own event stream in Marten, Polecat or Fisher, with its whole history and time travel,
+see [Event-Sourced Sagas](/guide/durability/event-sourced-sagas).
+:::
+
 ## Your First Saga
 
 *See the [OrderSagaSample](https://github.com/JasperFx/wolverine/tree/main/src/Samples/OrderSagaSample) project in GitHub for all the
@@ -425,7 +430,7 @@ public class Reservation : Saga
     }
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/WolverineWebApi/SagaExample.cs#L73-L98' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_reservation_saga' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/WolverineWebApi/SagaExample.cs#L91-L116' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_reservation_saga' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 and the handler that would start the new saga:
@@ -453,7 +458,7 @@ public class StartReservationHandler
     }
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/WolverineWebApi/SagaExample.cs#L51-L71' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_return_saga_from_handler' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Http/WolverineWebApi/SagaExample.cs#L69-L89' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_return_saga_from_handler' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 ## Method Conventions
@@ -476,6 +481,7 @@ name identically to the bare name:
 | `Consume`, `Consumes`                | `ConsumeAsync`, `ConsumesAsync`                    | Called only when the identified saga already exists |
 | `Orchestrate`, `Orchestrates`        | `OrchestrateAsync`, `OrchestratesAsync`           | Called only when the identified saga already exists |
 | `NotFound`                           | `NotFoundAsync`                                    | Only called if the identified saga does not already exist, and there is no matching `Start` handler for the incoming message |
+| `IdNotProvided` <Badge type="tip" text="7.0" /> | `IdNotProvidedAsync`                     | Only called if the incoming message carries no saga id at all, on the message or in the saga-id header. See [When a Message Has No Saga Id](#when-a-message-has-no-saga-id) |
 
 Pick whichever form reads better in your codebase. Mixing styles within a single saga is allowed
 but generally discouraged for readability.
@@ -499,9 +505,9 @@ public class OrderSaga : Saga
 }
 ```
 
-Note that only `Start` / `Starts` / `StartAsync` / `StartsAsync` and
-`NotFound` / `NotFoundAsync` methods can be static methods, because these
-methods logically assume that the identified `Saga` does not yet exist.
+Note that only `Start` / `Starts` / `StartAsync` / `StartsAsync`,
+`NotFound` / `NotFoundAsync` and `IdNotProvided` / `IdNotProvidedAsync` methods can be static methods, because these
+methods logically assume that the identified `Saga` does not yet exist. `IdNotProvided` has to be static.
 Wolverine as of 4.6 will assert that other named `Saga` methods are instance
 methods to try to head off confusion.
 
@@ -533,6 +539,421 @@ public static void NotFound(CompleteOrder complete, ILogger<Order> logger)
 Note that you will have to explicitly use `IMessageBus` as an argument to a `NotFound` method to send out any messages
 to potentially take action on a missing saga if you so wish.
 
+## When a Message Has No Saga Id <Badge type="tip" text="7.0" />
+
+A message that reaches a saga with no saga id -- none on the message, and no saga-id header on the envelope -- fails
+with an `IndeterminateSagaStateIdException`. That's usually right, but some messages legitimately show up without one.
+A reply from a handler that is sometimes used by a saga and sometimes not is the common case, and the `Fault<T>` of a
+message that wasn't sent by a saga is another.
+
+For those, write a static `IdNotProvided` method on the saga for that message type. It works like `NotFound`: it's
+matched by message type, it can take the usual handler arguments, and it can return cascading messages:
+
+<!-- snippet: sample_saga_IdNotProvided -->
+<a id='snippet-sample_saga_IdNotProvided'></a>
+```cs
+public class UnmatchedSaga : Saga
+{
+    public Guid Id { get; set; }
+    public int Nudges { get; set; }
+    public int Pokes { get; set; }
+
+    public static UnmatchedSaga Start(StartUnmatchedSaga command) => new() { Id = command.Id };
+
+    public void Handle(SagaNudge nudge) => Nudges++;
+
+    public void Handle(SagaPoke poke) => Pokes++;
+
+    // A SagaNudge that reached this saga with no saga id, instead of IndeterminateSagaStateIdException
+    public static UnmatchedNudge IdNotProvided(SagaNudge nudge) => new(nudge.Note);
+
+    public static UnmatchedPoke IdNotProvided(SagaPoke poke) => new();
+
+    // Only NotFound for SagaCheck: an existing saga has nothing to do with it
+    public static SagaWasGone NotFound(SagaCheck check) => new();
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Testing/CoreTests/Persistence/Sagas/saga_faults_and_IdNotProvided_5553.cs#L324-L345' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_saga_IdNotProvided' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+A message type without an `IdNotProvided` method behaves exactly as it did before.
+
+## Hearing About Failed Steps <Badge type="tip" text="7.0" />
+
+A saga usually sends messages to other handlers, often in other services, and needs to know when one of them fails
+for good. Declare a handler for `Fault<T>` on the saga, and Wolverine asks for the fault of every `T` the saga sends:
+
+<!-- snippet: sample_saga_that_hears_about_its_failed_steps -->
+<a id='snippet-sample_saga_that_hears_about_its_failed_steps'></a>
+```cs
+public class Order : Saga
+{
+    public Guid Id { get; set; }
+    public string Sku { get; set; } = "";
+    public int Quantity { get; set; }
+    public decimal Amount { get; set; }
+
+    public bool InventoryReserved { get; set; }
+    public bool Paid { get; set; }
+
+    public string? FailedStep { get; set; }
+    public string? FailureReason { get; set; }
+
+    public static (Order, ReserveInventory, ChargeCard) Start(PlaceOrder command)
+        => (new Order { Id = command.OrderId, Sku = command.Sku, Quantity = command.Quantity, Amount = command.Amount },
+            new ReserveInventory(command.Sku, command.Quantity),
+            new ChargeCard(command.Amount));
+
+    public void Handle(InventoryReserved reserved) => InventoryReserved = true;
+
+    public void Handle(CardCharged charged) => Paid = true;
+
+    // Declaring this is what has Wolverine ask for the fault of every ReserveInventory this saga sends: the
+    // wolverine.fault.reply-to header, worked out when the application starts. No routing rule for
+    // Fault<ReserveInventory> anywhere, and fault events can stay off in the inventory service.
+    public void Handle(Fault<ReserveInventory> fault)
+    {
+        FailedStep = nameof(ReserveInventory);
+        FailureReason = fault.Exception.Message;
+    }
+
+    // The same for a step in this service
+    public void Handle(Fault<ChargeCard> fault)
+    {
+        FailedStep = nameof(ChargeCard);
+        FailureReason = fault.Exception.Message;
+    }
+
+    // A Fault<ReserveInventory> with no saga id -- the ReserveInventory was not sent by an Order -- comes here
+    // instead of failing with IndeterminateSagaStateIdException
+    public static UnmatchedInventoryFailure IdNotProvided(Fault<ReserveInventory> fault) => new(fault.Message.Sku);
+
+    // IdNotProvided is not only for faults: any message that reaches the saga with no saga id comes to the one declared
+    // for its type. A card payment confirmed outside any order
+    public static UnmatchedPayment IdNotProvided(CardCharged charged) => new(charged.Amount);
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/SagaFaults/SagaFaults.Specs/Orders/FaultHandlingOrder.cs#L8-L55' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_saga_that_hears_about_its_failed_steps' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+Because the saga declares `Handle(Fault<ReserveInventory>)`, every `ReserveInventory` it sends carries a
+`wolverine.fault.reply-to` header with the saga service's own reply address. When that `ReserveInventory` is dead
+lettered, the receiving service sends the `Fault<ReserveInventory>` straight back, even though neither service turns on
+`PublishFaultEvents()` or has a routing rule for the fault. See
+[Sending a fault back to the sender](/guide/handlers/error-handling#sending-a-fault-back-to-the-sender) for the details.
+
+`Fault<T>` has no saga id member, so the fault finds its saga through the saga-id header that Wolverine copies from
+the failed message. A few more things to know:
+
+- It works the same for a step in the saga's own service, like `ChargeCard` above.
+- If the saga's service already routes `Fault<T>` to itself -- a routing rule for `Fault<T>` to anything other than a
+  local queue, or a listener with `DefaultIncomingMessage<Fault<T>>()` -- the saga doesn't ask for that fault. Your
+  routing already brings it, and asking as well would deliver it twice. Wolverine works this out when the application
+  starts.
+- The receiving service has to be on Wolverine 7.0 or later. An older receiver ignores the header, and only sends the
+  fault if its own routing does.
+- A `NotFound(Fault<T>)` method on its own also asks for the fault, and is called when the saga is gone by the time
+  the fault arrives.
+- An `IdNotProvided(Fault<T>)` method catches a fault of a `T` that some other handler sent with
+  `ReturnFaultToSender()`, so it has no saga id.
+
+## Compensating Failed Steps <Badge type="tip" text="7.0" />
+
+A saga can say what to do when a step fails, by the failed message and the exception type, with `Compensate` methods.
+They cover both kinds of failure: the saga's own handler failing, and a message the saga sent failing somewhere else.
+
+<!-- snippet: sample_saga_that_compensates -->
+<a id='snippet-sample_saga_that_compensates'></a>
+```cs
+public class Order : CompensatingSaga, IRevisioned
+{
+    public Guid Id { get; set; }
+    public string Sku { get; set; } = "";
+    public int Quantity { get; set; }
+    public decimal Amount { get; set; }
+
+    public bool InventoryReserved { get; set; }
+    public bool Paid { get; set; }
+    public bool Refunded { get; set; }
+
+    public static (Order, ReserveInventory) Start(PlaceOrder command)
+        => (new Order { Id = command.OrderId, Sku = command.Sku, Quantity = command.Quantity, Amount = command.Amount },
+            new ReserveInventory(command.Sku, command.Quantity));
+
+    public void Handle(InventoryReserved reserved) => InventoryReserved = true;
+
+    // The saga's own handler. It fails when the ledger is down (retried, then compensated) or when the amount is wrong
+    // (a terminal failure: compensated at once)
+    public void Handle(PaymentReceived payment, Ledger ledger)
+    {
+        if (payment.Amount != Amount) throw new PaymentAmountMismatchException(Amount, payment.Amount);
+
+        ledger.Record(Id, payment.Amount);
+        Paid = true;
+    }
+
+    // ReserveInventory failed in the inventory service with OutOfStockException, or a subclass, after that service's
+    // retries. Only an ExceptionInfo crosses the wire, so a failure in another service is a RemoteFailure<TException>,
+    // matched through the exception's type hierarchy (GH-5555)
+    public object[] Compensate(ReserveInventory failed, RemoteFailure<OutOfStockException> failure)
+        => [new CancelOrder(Id), new NotifyCustomer(Id, $"{failed.Sku} is out of stock")];
+
+    // Any other failure of that step, local or remote
+    public RefundPayment Compensate(ReserveInventory failed, ExceptionInfo ex) => new(Id, Amount);
+
+    // The saga's own handler failed, in this service: the live exception
+    public RefundPayment Compensate(PaymentReceived failed, PaymentAmountMismatchException ex)
+        => Refunded ? throw new RefundAlreadyIssuedException(Id) : new RefundPayment(Id, failed.Amount);
+
+    public RefundPayment Compensate(PaymentReceived failed, LedgerUnavailableException ex) => new(Id, failed.Amount);
+
+    // The saga is gone (completed or deleted) when a fault of its ReserveInventory arrives
+    public static OrderAlreadyClosed NotFound(Fault<ReserveInventory> fault) => new(fault.Message.Sku);
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/SagaFaults/SagaFaults.Specs/Orders/CompensatingOrder.cs#L16-L62' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_saga_that_compensates' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+A `Compensate` method takes the failed message first, then the exception, in one of three forms:
+
+| Second parameter | Matches |
+|---|---|
+| an exception type, like `LedgerUnavailableException` | a failure of the saga's own handler, in this service, of that type or a subclass |
+| `RemoteFailure<TException>` | a failure of that type or a subclass, here or in another service, matched by the exception's type hierarchy |
+| `ExceptionInfo` | any failure of that message |
+
+When more than one matches, the most specific exception type wins, then the most specific message type, then an
+exception parameter over `RemoteFailure<T>` over `ExceptionInfo`. A method can also take `IMessageContext`, `Envelope`,
+`CancellationToken` or a singleton service. What it returns is sent like any cascading message.
+
+**The saga's own handler.** When `Handle(PaymentReceived)` fails, Wolverine first applies the usual error policies.
+Once the retries are used up, it compensates: it loads the saga again in a new transaction, calls the matching
+`Compensate`, saves the saga and sends what the method returned. Then the original message is dead lettered anyway,
+tagged with how the compensation went:
+
+| Tag | When |
+|---|---|
+| `compensated` | the compensation succeeded |
+| `compensation-failed` | the compensation failed after its own retries |
+| `compensation-saga-missing` | the saga was gone (completed or deleted) before it could be compensated |
+
+The tag is in `DeadLetterEnvelope.Tag`, and `DeadLetterEnvelopeQuery.Tag` filters on it. A failure that no
+`Compensate` method matches is retried and dead lettered as before, with no tag.
+
+**A step that failed somewhere else.** Declaring a `Compensate` for `ReserveInventory` asks for the fault of every
+`ReserveInventory` the saga sends, as a `Handle(Fault<ReserveInventory>)` would (see
+[Hearing About Failed Steps](#hearing-about-failed-steps)). When the fault arrives, the saga is loaded, the matching
+`Compensate` runs, and the saga is saved. A saga can't have both `Handle(Fault<T>)` and `Compensate(T, ...)` for the same
+`T`. `NotFound(Fault<T>)` still handles a fault for a saga that is gone.
+
+**Retries.** A compensation is a handler chain of its own, the saga's chain for `Fault<T>`, so the global error policies,
+and error handling attributes like `[RetryNow]` on the `Compensate` methods, apply to it. A concurrency conflict when the compensated saga is saved is retried the same
+way. When the compensation gives up, Wolverine loads the saga again and saves only its status and a failed log entry,
+once, without retrying. If that fails too, the dead letter is the only record. A compensation is never compensated.
+
+**Terminal failures.** An exception type marked with `[TerminalFailure]` or `ITerminalFailure` skips the retries, so
+the saga compensates right away. This works for any handler, not only sagas: see
+[Terminal failures](/guide/handlers/error-handling#terminal-failures).
+
+### Compensation status and log
+
+Any `Saga` can declare `Compensate` methods. Derive from `CompensatingSaga` instead of `Saga` to also keep the saga's
+compensation state:
+
+- `Status`: `Active`, `Compensating` (during a sequential unwind), `Compensated` or `CompensationFailed`
+- `CompensationLog`: one entry per compensation, with the failed message type, the type of the exception that was
+  actually thrown, the outcome and the time
+
+Both are saved with the saga, so document stores and the lightweight saga tables need no schema change. A concurrency
+conflict when the compensated saga is saved needs the storage to check the saga's version: the lightweight saga tables
+always do, and on Marten the saga implements `IRevisioned`, as the `Order` above does.
+
+With EF Core, map the two members with `MapCompensatingSaga()`. The log is stored as JSON in one text column:
+
+<!-- snippet: sample_mapping_a_compensating_saga_with_ef_core -->
+<a id='snippet-sample_mapping_a_compensating_saga_with_ef_core'></a>
+```cs
+public class CompensatedSagaDbContext : DbContext
+{
+    public CompensatedSagaDbContext(DbContextOptions<CompensatedSagaDbContext> options) : base(options)
+    {
+    }
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<CompensatedSaga>(map =>
+        {
+            map.ToTable("CompensatedSaga", "saga_compensation");
+            map.HasKey(x => x.Id);
+
+            // The saga's compensation status and log
+            map.MapCompensatingSaga();
+        });
+    }
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/EfCoreTests/Sagas/saga_compensation_5556.cs#L12-L31' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_mapping_a_compensating_saga_with_ef_core' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+Compensation runs when a message is processed from a queue. A failure of `InvokeAsync()` is thrown to the caller and is
+not compensated.
+
+### The undo stack <Badge type="tip" text="7.0" />
+
+A `CompensatingSaga` also keeps an undo stack, so a saga doesn't have to track what it has done in flags of its own.
+`PushUndo()` records the message that undoes a step, tagged with an optional step name, and a `Compensate` method
+decides how much of the stack a failure unwinds:
+
+- `UndoMessages()` sends every undo message on the stack, newest first, together
+- `UndoMessagesSince("car")` and `UndoMessages(entry => ...)` unwind part of it
+- `UndoSequentially()` sends the newest undo message, waits for it to be confirmed, then sends the next. The saga is
+  `Compensating` while it unwinds, then `Compensated` when the stack is empty. An undo message that fails for good
+  leaves the saga `CompensationFailed` with the rest of the stack still there
+
+Nothing unwinds by itself: a failure no `Compensate` method matches leaves the stack alone. The catch-all is one line,
+`public OutgoingMessages Compensate(object failed, ExceptionInfo ex) => UndoMessages();`. A catch-all covers every
+message the saga's methods return, as their signatures show them.
+
+**`[CompletesSaga]`.** Put `[CompletesSaga]` on the method that finishes the saga, like the trip's
+`Handle(HotelBooked)` below, and a catch-all leaves out what that method returns. The trip's `TripBooked` is what the
+saga says when it's done, not a step that can fail and be compensated. The attribute doesn't complete the saga for
+you, so the method still calls `MarkCompleted()`. Wolverine doesn't guess which method completes the saga: without the
+attribute, the catch-all covers that method's messages like any other's. `[Compensates]` still names a message to
+cover either way. Here is Restate's trip booking example as a saga:
+
+<!-- snippet: sample_undo_stack_trip -->
+<a id='snippet-sample_undo_stack_trip'></a>
+```cs
+public class Trip : CompensatingSaga, IRevisioned
+{
+    public Guid Id { get; set; }
+    public string CustomerId { get; set; } = "";
+
+    public static (Trip, BookFlight) Start(BookTrip command)
+    {
+        var trip = new Trip { Id = command.TripId, CustomerId = command.CustomerId };
+        trip.PushUndo(new CancelFlight(trip.Id, trip.CustomerId), "flight", confirmedBy: typeof(FlightCancelled));
+        return (trip, new BookFlight(trip.Id, trip.CustomerId));
+    }
+
+    public BookCar Handle(FlightBooked booked)
+    {
+        PushUndo(new CancelCar(Id, CustomerId), "car", confirmedBy: typeof(CarCancelled));
+        return new BookCar(Id, CustomerId);
+    }
+
+    public BookHotel Handle(CarBooked booked)
+    {
+        PushUndo(new CancelHotel(Id, CustomerId), "hotel");
+        return new BookHotel(Id, CustomerId);
+    }
+
+    // TripBooked is what the trip says when it's finished, so the catch-all below doesn't cover it
+    [CompletesSaga]
+    public TripBooked Handle(HotelBooked booked)
+    {
+        MarkCompleted();
+        return new TripBooked(Id);
+    }
+
+    // A refusal, wherever the provider runs: cancel everything, newest first, each one confirmed before the next
+    public UndoSequence Compensate(object failed, RemoteFailure<BookingRefusedException> refused) => UndoSequentially();
+
+    // No cars at all: the trip can't happen. Cancel everything one at a time as above, then close the trip
+    public UndoSequence Compensate(BookCar failed, RemoteFailure<NoCarsException> noCars)
+        => UndoSequentially(completeWhenDone: true);
+
+    // No rooms: give the car back too, all at once, but keep the flight
+    public OutgoingMessages Compensate(BookHotel failed, RemoteFailure<NoRoomsException> noRooms) => UndoMessagesSince("car");
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/SagaWorkflows/SagaWorkflows.Specs/TripBooking/Trip.cs#L11-L54' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_undo_stack_trip' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+**Push before the step.** An undo pushed in a handler that also sends a message is *pending*: that message is its step,
+and the step's reply confirms it. Wolverine ties the reply to the step for you. An unwind includes pending entries by
+default (pass `includePending: false` to skip them), so a step whose outcome is unknown, say a booking that failed but
+may have gone through on the provider's side, is undone too. Keep undo messages idempotent.
+
+**Pushing after the step.** Wolverine can't tell an undo pushed *after* a step from one pushed *before* the next step
+when the same handler sends that next step. Such an undo counts as pending until the next step replies. That only
+matters if an unwind skips pending entries; call `ConfirmUndo("withdrawal")` in the same handler to mark it confirmed
+straight away. An undo pushed in a handler that sends nothing is confirmed at once, and `ConfirmUndo(step)` also covers
+any reply Wolverine can't tie to its step.
+
+**Confirming a sequential unwind.** Each undo message is sent asking for Wolverine's acknowledgement, which its handler
+sends once it succeeds. Push it with `confirmedBy: typeof(FlightCancelled)` to have the handler's own reply confirm it
+instead. Either way, no `Handle(FlightCancelled)` method is needed. By default the saga stays open after the unwind;
+`UndoSequentially(completeWhenDone: true)` completes it once the last undo message is confirmed (an event-sourced saga
+gets a `SagaCompleted` event). Don't call `MarkCompleted()` while the saga unwinds: the confirmations would find no saga
+and the unwind would stop.
+
+**Saying why.** A `Compensate` method can return the undo sequence in a tuple with whatever else it has to say: an
+event for an event-sourced saga's stream, a message to send, or both. The unwind is exactly the same as returning the
+undo sequence alone:
+
+<!-- snippet: sample_compensate_returns_an_event_with_the_undo_sequence -->
+<a id='snippet-sample_compensate_returns_an_event_with_the_undo_sequence'></a>
+```cs
+public class EventSourcedTripThatSaysWhy : EventSourcedSaga
+{
+    public Guid Id { get; set; }
+    public string CustomerId { get; set; } = "";
+
+    public static (TripStarted, SagaUndoPushed, OutgoingMessages) Start(BookTrip command)
+        => (new TripStarted(command.TripId, command.CustomerId),
+            PushedUndo(new CancelFlight(command.TripId, command.CustomerId), "flight", confirmedBy: typeof(FlightCancelled)),
+            [new BookFlight(command.TripId, command.CustomerId)]);
+
+    public OutgoingMessages Handle(FlightBooked booked)
+    {
+        PushUndo(new CancelCar(Id, CustomerId), "car", confirmedBy: typeof(CarCancelled));
+        return [new BookCar(Id, CustomerId)];
+    }
+
+    public OutgoingMessages Handle(CarBooked booked)
+    {
+        PushUndo(new CancelHotel(Id, CustomerId), "hotel");
+        return [new BookHotel(Id, CustomerId)];
+    }
+
+    public (SagaCompleted, OutgoingMessages) Handle(HotelBooked booked) => (new SagaCompleted(), [new TripBooked(Id)]);
+
+    // A refusal: the event, then the unwind. The trip stays open, Compensated
+    [Compensates(typeof(BookFlight), typeof(BookCar), typeof(BookHotel))]
+    public (TripUnwindStarted, UndoSequence) Compensate(object failed, RemoteFailure<BookingRefusedException> refused)
+        => (new TripUnwindStarted("A provider refused a booking"), UndoSequentially());
+
+    // No cars: the unwind first this time, and the trip closes once the last cancellation is confirmed
+    public (UndoSequence, TripUnwindStarted) Compensate(BookCar failed, RemoteFailure<NoCarsException> noCars)
+        => (UndoSequentially(completeWhenDone: true), new TripUnwindStarted("No cars"));
+
+    // No rooms: the event, the unwind, and a message for the traveller
+    public (TripUnwindStarted, UndoSequence, OutgoingMessages) Compensate(BookHotel failed,
+        RemoteFailure<NoRoomsException> noRooms)
+        => (new TripUnwindStarted("No rooms"), UndoSequentially(completeWhenDone: true),
+            [new NotifyTraveller(Id, "No rooms")]);
+
+    public void Apply(TripStarted e)
+    {
+        Id = e.TripId;
+        CustomerId = e.CustomerId;
+    }
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/SagaWorkflows/SagaWorkflows.Specs/TripBooking/TripsThatSayWhy.cs#L17-L63' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_compensate_returns_an_event_with_the_undo_sequence' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+**How undo messages are kept.** The stack is saved with the saga's state. Each undo message is stored as
+System.Text.Json and its .NET type name, and read back the same way when it is sent, so an undo message must round trip
+through System.Text.Json. An event-sourced saga keeps its stack as Wolverine's own events on its stream
+(`wolverine_saga_undo_pushed`, `wolverine_saga_undo_sent` and so on), and its `Start` returns `PushedUndo(...)` among its
+events, since there is no saga yet to call `PushUndo()` on. With EF Core, `MapCompensatingSaga()` maps the stack as JSON
+too.
+
+Each entry of the compensation log also records the failed message's envelope id and the undo messages the compensation
+sent, with their step tags.
+
 ## Marking a Saga as Complete
 
 When a `Saga` workflow is complete, call the `MarkCompleted()` method as shown in the following method
@@ -552,6 +973,264 @@ public void Handle(CompleteOrder complete, ILogger<Order> logger)
 ```
 <sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/OrderSagaSample/OrderSaga.cs#L35-L45' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_using_saga_mark_completed' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
+
+## Keeping Completed Sagas <Badge type="tip" text="7.0" />
+
+By default a saga is deleted as soon as it calls `MarkCompleted()`. That leaves nothing to look at afterward, so you
+can't answer "what happened to order 123 yesterday?" from the saga itself. You can opt into keeping completed sagas
+for a while instead, either for one saga type with an attribute:
+
+<!-- snippet: sample_retain_when_completed -->
+<a id='snippet-sample_retain_when_completed'></a>
+```cs
+// Keep each shipment for two days after it completes
+[RetainWhenCompleted(Days = 2)]
+public class ShipmentSaga : Saga
+{
+    public string Id { get; set; } = string.Empty;
+    public bool Delivered { get; set; }
+
+    public static ShipmentSaga Start(ShipmentRequested command) => new() { Id = command.ShipmentId };
+
+    public void Handle(ShipmentDelivered command)
+    {
+        Delivered = true;
+        MarkCompleted();
+    }
+
+    // A message for a shipment that already completed comes here, never to Handle()
+    public static void NotFound(ShipmentDelivered command, ILogger<ShipmentSaga> logger)
+    {
+        logger.LogInformation("Shipment {Id} was already delivered", command.ShipmentId);
+    }
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/PostgresqlTests/Sagas/saga_retention_policy_5572.cs#L37-L61' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_retain_when_completed' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+or for every saga type in the application:
+
+<!-- snippet: sample_retain_completed_sagas_policy -->
+<a id='snippet-sample_retain_completed_sagas_policy'></a>
+```cs
+// Keep every completed saga for 3 days before deleting it
+opts.Policies.RetainCompletedSagas(3.Days());
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/PostgresqlTests/Sagas/saga_retention_policy_5572.cs#L79-L84' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_retain_completed_sagas_policy' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+The attribute takes `Days`, `Hours` and `Minutes`, adds them up, and wins over the global policy for that saga type.
+
+A retained saga that completes is saved with `Saga.CompletedAt` set to the time it completed, and `IsCompleted()`
+returns true for it. From then on Wolverine treats it like a saga that no longer exists:
+
+* A message for it goes to the saga's `NotFound` method for that message type, never to `Handle`
+* A `TimeoutMessage` for it is ignored
+* With no `NotFound` method, the message fails with `UnknownSagaException`, the same as for a deleted saga
+* A `StartOrHandle` message for it does not start a new saga over the completed one, which keeps its id. The message
+  is logged and not handled
+
+A saga that completes in its `Start` method is kept as well.
+
+Retained sagas are deleted once they have been completed for longer than the retention period. A node agent does that,
+one per saga store, so only one node in the cluster sweeps each store. It runs every hour by default; change that with
+`opts.Durability.CompletedSagaSweepInterval`. The agent needs Wolverine's node coordination, so it runs in the
+`Balanced` and `Solo` durability modes, but not with `MediatorOnly` or `Serverless`.
+
+In a cluster with [node workloads](/guide/durability/node-roles), the sweep only runs on a node with the `Durability`
+workload. If no node runs `Durability`, nothing deletes your retained sagas.
+
+The saga diagnostics on `IWolverineRuntime.SagaStorage` leave completed sagas out of `QuerySagasAsync()` and
+`ListSagaInstancesAsync()`, so you see the same instances you did before turning retention on. Pass
+`includeCompleted: true` to `QuerySagasAsync()` to see them too. `ReadSagaAsync()` reads a completed saga by its id
+either way, and idle saga queries never count a completed saga.
+
+Retention works with these saga storages:
+
+| Saga storage | How completed sagas are kept |
+|---|---|
+| Lightweight tables (PostgreSQL, SQL Server, MySQL, SQLite, Oracle) | A nullable `completed_at` column, added to existing tables by the usual migration. The sweep covers every tenant database under database-per-tenant storage |
+| Marten, Polecat, Fisher | `CompletedAt` on the saga document. The sweep reads the default tenant |
+| EF Core | `CompletedAt` as a mapped column on your saga entity, which needs a migration. If you `Ignore()` it, retaining that saga type is refused at startup |
+| RavenDB | `CompletedAt` on the saga document |
+| CosmosDB | `CompletedAt` on the saga document. Saga documents carry no type marker, so with several retained saga types the sweep keeps every completed saga for the longest of their retention periods |
+| In memory | Not retained: completed sagas are deleted as before |
+| Redis, Azure Blob Storage, Amazon S3 | Not supported. `[RetainWhenCompleted]` on a saga stored there is refused at startup, and the global policy skips it |
+
+If one of your saga types already has its own `CompletedAt`, it hides the one on `Saga` (compiler warning CS0108),
+and a retained saga would not be recognized as completed when it is loaded again. Wolverine refuses to start when
+retention is on for that saga type, by attribute or by the global policy, so remove or rename your property. With
+retention off for that saga type, Wolverine doesn't care.
+
+Turning retention off again leaves the sagas that were already kept in storage. They are no longer swept, and nothing
+stops a later message from reaching them. To clear them out, either delete them by hand, or turn retention back on
+for a little while so the sweep deletes them.
+
+## Recording a Saga's Message History <Badge type="tip" text="7.0" />
+
+A saga kept as a document or a row only has its current state. To see how it got there, you can have Wolverine record
+a row for every message the saga handles: the message's type and id, when it was handled, the saga method that handled
+it, the outcome, and the messages the saga sent while it did. It never records the saga's state. Opt in for one saga
+type with an attribute:
+
+<!-- snippet: sample_record_saga_history_attribute -->
+<a id='snippet-sample_record_saga_history_attribute'></a>
+```cs
+// Record a row for every message this saga handles
+[RecordSagaHistory]
+public class HistorySaga : Saga
+{
+    public string Id { get; set; } = string.Empty;
+    public int Advances { get; set; }
+
+    public static (HistorySaga, HistorySagaTimeout) Start(StartHistorySaga command)
+        => (new HistorySaga { Id = command.Id }, new HistorySagaTimeout(command.Id));
+
+    public HistorySagaAdvanced Handle(AdvanceHistorySaga command)
+    {
+        Advances++;
+        return new HistorySagaAdvanced(Id);
+    }
+
+    public void Handle(FinishHistorySaga command) => MarkCompleted();
+
+    public void Handle(FailHistorySaga command) => throw new InvalidOperationException("You shall not pass");
+
+    public void Handle(HistorySagaTimeout timeout) => MarkCompleted();
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Testing/Wolverine.ComplianceTests/Sagas/SagaHistoryCompliance.cs#L28-L51' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_record_saga_history_attribute' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+or for every saga in the application:
+
+<!-- snippet: sample_record_saga_history_for_every_saga -->
+<a id='snippet-sample_record_saga_history_for_every_saga'></a>
+```cs
+opts.Policies.RecordSagaHistory();
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/SagaFaults/SagaFaults.Specs/TwoServices.cs#L207-L209' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_record_saga_history_for_every_saga' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+It's off by default, because every message the saga handles writes one more row.
+
+Each row has one of these outcomes:
+
+| Outcome | When |
+|---|---|
+| `Started` | The message started the saga |
+| `Continued` | The message was handled and the saga is still running |
+| `Completed` | The message completed the saga |
+| `Compensated` | The message was a `Fault<T>` that one of the saga's `Compensate` methods handled (see [compensating failed steps](#compensating-failed-steps)) |
+| `NotFound` | The message reached a retained saga that had already completed, and went to its `NotFound` method |
+
+A failed attempt is not recorded. The saga's dead letters carry its saga id, so a monitoring tool can put them on the
+same timeline.
+
+### Where the history is kept
+
+The rows go in a `wolverine_saga_history` table in Wolverine's message store, keyed by the saga type and the saga id.
+The table is only created once some saga records its history. It's written in the same transaction as the saga itself,
+through the same outbox enlistment Wolverine uses for the messages the saga sends, so a message whose handling fails or
+rolls back leaves no row behind.
+
+| Saga storage | How the history is written |
+|---|---|
+| Lightweight tables (PostgreSQL, SQL Server, MySQL, SQLite) | In the saga's own transaction, in the same database |
+| Marten, Polecat, Fisher | In the session that saves the saga, in that store's Wolverine message store |
+| EF Core | In the `DbContext`'s transaction, in the message store's database |
+| In memory, with a relational message store | Written on its own, as a best effort, before the saga is saved |
+| RavenDB, CosmosDB, Oracle | Not supported. Those message stores keep no saga history; a warning is logged once and nothing is recorded |
+
+Under database-per-tenant message storage, each tenant's history lands in that tenant's database, next to that tenant's
+sagas, and is read back from it.
+
+### How long the history is kept
+
+The history lives exactly as long as the saga:
+
+* A saga that is deleted when it completes takes its history with it, in the same transaction. Without retention you
+  see the history of running sagas only.
+* A saga kept by [`[RetainWhenCompleted]` or `RetainCompletedSagas()`](#keeping-completed-sagas) keeps its history,
+  including the `Completed` row and any late `NotFound` messages, until the same sweep that deletes the saga deletes
+  its history too.
+
+### Reading the history
+
+The history is read through `ISagaHistoryDiagnostics`, which is how CritterWatch reads the stream of an
+[event-sourced saga](/guide/durability/event-sourced-sagas), so both kinds of saga show up as one timeline:
+
+```cs
+var history = (ISagaHistoryDiagnostics)host.GetRuntime().SagaStorage;
+var page = await history.ReadSagaHistoryAsync(typeof(OrderSaga).FullName!, orderId,
+    new SagaHistoryPageRequest(Page: 1, PageSize: 50, TenantId: "acme"), cancellationToken);
+```
+
+Each entry is one handled message: `Version` is its position in the history, `EventTypeName` is Wolverine's name for
+the message type, and `Data` holds the whole row, outcome and sent messages included. Name the tenant to read from
+that tenant's database; without one, every message store is read. `SagaDescriptor.HistoryKind` is `MessageLog` for
+these sagas, and since the history holds no saga state, `ReadSagaAtAsync()` refuses them.
+
+An event-sourced saga needs none of this: its stream is its history, so `[RecordSagaHistory]` is ignored there.
+
+## Last Modified Time <Badge type="tip" text="7.0" />
+
+Every `Saga` has a `LastModified` property, a `DateTimeOffset` in UTC. Wolverine sets it whenever it inserts or
+updates the saga, whichever storage you use, so you can order saga instances by it or look for the ones that have not
+changed in a long time. It's set by Wolverine's saga persistence, not by your code: a value your handler assigns is
+overwritten on the next save.
+
+Sagas saved before Wolverine 7.0 get a value from the store's own modification timestamp where there is one (Marten's
+`mt_last_modified`, or the lightweight saga table's `last_modified` column on PostgreSQL, SQL Server, MySQL and SQLite),
+and otherwise read back as `default(DateTimeOffset)` until their next update. With EF Core the property is a mapped
+column on your saga entity, so it needs a migration; see the [7.0 migration guide](/guide/migration#saga-lastmodified-is-set-by-every-saga-store).
+
+The lightweight saga tables (PostgreSQL, SQL Server, MySQL, SQLite and Oracle) index `last_modified`, so finding the
+sagas that have been idle for a while does not scan the table. With EF Core, add the index to your own model; see
+[the EF Core saga docs](/guide/durability/efcore/sagas#the-lastmodified-column). With Marten, add Marten's last-modified
+index to the saga's document mapping; see [the Marten saga docs](/guide/durability/marten/sagas#indexing-lastmodified-for-idle-sagas).
+
+### Finding Idle Sagas <Badge type="tip" text="7.0" />
+
+A saga that has not been written for days is usually stuck waiting for a message that is never coming. The saga
+diagnostics on `IWolverineRuntime.SagaStorage` also implement `ISagaIdleDiagnostics`, which counts and lists the
+instances of a saga type by `LastModified`. Monitoring tools like CritterWatch use it for idle saga counts and alerts,
+and you can call it yourself:
+
+```cs
+var idle = (ISagaIdleDiagnostics)host.GetRuntime().SagaStorage;
+var sagaType = typeof(OrderSaga).FullName!;
+
+if (idle.SupportsIdleQueries(sagaType))
+{
+    var twoDaysAgo = DateTimeOffset.UtcNow.AddDays(-2);
+
+    // How many OrderSaga instances have not been written for two days?
+    var count = await idle.CountIdleSagasAsync(sagaType, twoDaysAgo, tenantId: null, cancellationToken);
+
+    // And which are they, least recently modified first, 50 at a time?
+    var page = await idle.QuerySagasByLastModifiedAsync(sagaType,
+        SagaLastModifiedRange.Before(twoDaysAgo), new DocumentQueryOptions(1, 50), cancellationToken);
+}
+```
+
+`SagaLastModifiedRange` takes a modified-after bound (inclusive) and a modified-before bound (exclusive), and either can
+be left open. Completed sagas are either deleted or, when [they are kept](#keeping-completed-sagas), left out, so every
+instance these calls find is still open.
+
+Which saga storage answers depends on where the saga lives:
+
+| Saga storage | Idle saga queries |
+|---|---|
+| Lightweight tables (PostgreSQL, SQL Server, MySQL, SQLite, Oracle) | Yes, over the indexed `last_modified` column. Under database-per-tenant message storage, pass the tenant id to read that tenant's database |
+| Marten, Polecat, Fisher | Yes, over the saga document's `LastModified`, for the default tenant. On Marten that is the `mt_last_modified` column, which `IndexLastModified()` indexes |
+| EF Core | Yes, when `LastModified` is mapped (not `Ignore()`d) in your `DbContext`, for the `DbContext` the container resolves |
+| RavenDB | Yes, over the saga document's `LastModified`, for the registered document store's database. The calls wait up to 15 seconds for RavenDB's index to catch up with the latest writes, so the count includes them |
+| CosmosDB | Yes, over the saga document's `LastModified`, but only when that saga type is the only one your application stores in CosmosDB. Saga documents share the Wolverine container and carry no type marker, so with several saga types a count would mix them: `SupportsIdleQueries` returns false and the calls throw `NotSupportedException` instead |
+
+A tenant id a storage cannot scope the query to is refused with a `DocumentCriteriaNotSupportedException`, rather than
+answered from another tenant's sagas. Saga types are named as they are for the other saga diagnostics: the full type
+name, or the short name.
 
 ## Timeout Messages
 
@@ -607,6 +1286,142 @@ public void Handle(OrderTimeout timeout, ILogger<Order> logger)
 <sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/OrderSagaSample/OrderSaga.cs#L47-L58' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_handling_a_timeout_message' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
+## Drawing a Saga's Flow {#drawing-a-sagas-flow} <Badge type="tip" text="7.0" />
+
+A saga's steps are spread across its `Start`, `Handle`, `NotFound` and `Compensate` methods, so you follow it by
+message type rather than reading it top to bottom. Wolverine can draw the flow for you as a
+[Mermaid](https://mermaid.js.org/) diagram: each message in, the saga method that handles it, and what that method
+sends, schedules or appends.
+
+```bash
+# Every saga in the application, as Markdown
+dotnet run -- saga-flow
+
+# One saga, by its class name or full name
+dotnet run -- saga-flow ReportExport
+
+# Just the Mermaid source of one saga, written to a file
+dotnet run -- saga-flow ReportExport --mermaid-only --file docs/report-export.mmd
+```
+
+`dotnet run -- describe` prints the same diagrams in its "Saga Flows" section. The Markdown is a heading and a
+` ```mermaid ` block per saga, which GitHub, GitLab and Azure DevOps render as the diagram, so it pastes straight into
+a README. For a VitePress site like this one, add `vitepress-plugin-mermaid`. In code, the same diagram comes from
+`SagaFlowDiagram.ToMermaid(descriptor)` or `SagaFlowDiagram.ToMarkdown(descriptor)` over a `SagaDescriptor` from
+`ServiceCapabilities.ReadFrom()`.
+
+For this saga, which polls an export every five minutes under an hour's deadline:
+
+<!-- snippet: sample_saga_for_the_flow_diagram -->
+<a id='snippet-sample_saga_for_the_flow_diagram'></a>
+```cs
+public class ReportExport : Saga
+{
+    public Guid Id { get; set; }
+    public int Polls { get; set; }
+
+    public static (ReportExport, PollReportExport, ReportExportDeadline) Start(StartReportExport command)
+        => (new ReportExport { Id = command.ReportExportId }, new PollReportExport(command.ReportExportId),
+            new ReportExportDeadline(command.ReportExportId));
+
+    public PollReportExport Handle(PollReportExport poll)
+    {
+        Polls++;
+        return new PollReportExport(Id);
+    }
+
+    // What it sends is decided at run time, so the diagram can only say that there is more
+    public OutgoingMessages Handle(ReportExportReady ready)
+    {
+        MarkCompleted();
+        return [new DownloadReportExport(Id, ready.Download)];
+    }
+
+    public ReportExportAbandoned Handle(ReportExportDeadline deadline)
+    {
+        MarkCompleted();
+        return new ReportExportAbandoned(Id);
+    }
+
+    public void Handle(CancelReportExport command) => MarkCompleted();
+
+    // A cancellation that arrives after the export finished
+    public static ReportExportAlreadyClosed NotFound(CancelReportExport command) => new(command.ReportExportId);
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Testing/CoreTests/Acceptance/drawing_saga_flows_5670.cs#L551-L587' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_saga_for_the_flow_diagram' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+`saga-flow ReportExport` draws:
+
+```mermaid
+flowchart TD
+    %% The flow of ReportExport, drawn by Wolverine from its saga metadata
+    msg_StartReportExport(["StartReportExport"])
+    msg_CancelReportExport(["CancelReportExport"])
+    msg_PollReportExport{{"PollReportExport"}}
+    msg_ReportExportDeadline{{"ReportExportDeadline"}}
+    msg_ReportExportReady(["ReportExportReady"])
+    msg_ReportExportAlreadyClosed(["ReportExportAlreadyClosed"])
+    msg_ReportExportAbandoned(["ReportExportAbandoned"])
+    subgraph saga_ReportExport["ReportExport"]
+        Start_StartReportExport["Start(StartReportExport)"]
+        Handle_CancelReportExport["Handle(CancelReportExport)"]
+        NotFound_CancelReportExport["NotFound(CancelReportExport)"]
+        Handle_PollReportExport["Handle(PollReportExport)"]
+        Handle_ReportExportDeadline["Handle(ReportExportDeadline)"]
+        Handle_ReportExportReady["Handle(ReportExportReady)"]
+    end
+    runtime["more messages, decided at run time"]
+    msg_StartReportExport --> Start_StartReportExport
+    Start_StartReportExport -.->|"schedules"| msg_PollReportExport
+    Start_StartReportExport -.->|"schedules"| msg_ReportExportDeadline
+    msg_CancelReportExport --> Handle_CancelReportExport
+    msg_CancelReportExport -.->|"no saga, or completed"| NotFound_CancelReportExport
+    NotFound_CancelReportExport --> msg_ReportExportAlreadyClosed
+    msg_PollReportExport --> Handle_PollReportExport
+    Handle_PollReportExport -.->|"schedules"| msg_PollReportExport
+    msg_ReportExportDeadline --> Handle_ReportExportDeadline
+    Handle_ReportExportDeadline --> msg_ReportExportAbandoned
+    msg_ReportExportReady --> Handle_ReportExportReady
+    Handle_ReportExportReady -.-> runtime
+    subgraph legend["Legend"]
+        legend_text["Rounded: a message<br/>Hexagon: a message scheduled for later, such as a timeout<br/>Rectangle: a method of the saga<br/>Dashed: scheduled, a failure, or a message that finds no saga or a completed one<br/>A timeout that finds no saga, or a completed one, is dropped<br/>Messages a method sends through IMessageBus, rather than returns, are not shown"]
+    end
+    classDef message fill:#e8f1fb,stroke:#3b78c2,color:#10243e
+    classDef timeout fill:#fff4dd,stroke:#c98a00,color:#3d2a00
+    classDef event fill:#ffe2c6,stroke:#d9731a,color:#3d1f00
+    classDef method fill:#f4f4f4,stroke:#6b6b6b,color:#1c1c1c
+    classDef compensate fill:#fde8e8,stroke:#c53030,color:#3d0d0d
+    classDef legend fill:#ffffff,stroke:#b0b0b0,color:#333333
+    class msg_StartReportExport,msg_CancelReportExport,msg_ReportExportReady,msg_ReportExportAlreadyClosed,msg_ReportExportAbandoned message
+    class msg_PollReportExport,msg_ReportExportDeadline timeout
+    class Start_StartReportExport,Handle_CancelReportExport,NotFound_CancelReportExport,Handle_PollReportExport,Handle_ReportExportDeadline,Handle_ReportExportReady method
+    class legend_text legend
+```
+
+What the diagram shows:
+
+- **Rounded boxes** are messages, and **hexagons** are messages scheduled for later, such as a `TimeoutMessage`.
+- **Rectangles**, inside the saga's box, are its methods. A message points at the method that handles it.
+- A method points at what it **returns**: a solid arrow for a message it sends, a dashed "schedules" arrow for a
+  timeout or a `ScheduledMessage<T>`. A return type such as `OutgoingMessages`, `IEnumerable<object>` or `object`
+  only says that more is decided at run time.
+- A **dashed "no saga, or completed" arrow** leads to `NotFound`, which handles a message that finds no saga, or one
+  that has already completed. A timeout for a missing saga is dropped.
+- A **`Compensate` method** hangs off the message whose failure it compensates, with a dashed "fails" arrow, and
+  points at the undo messages it returns. See [Compensating Failed Steps](#compensating-failed-steps).
+- For an [event-sourced saga](/guide/durability/event-sourced-sagas), the slanted boxes are the **events** each method
+  appends to the saga's own stream.
+
+Only what the methods' signatures say can be drawn. A message a handler sends through `IMessageBus` or
+`IMessageContext`, rather than returning it, doesn't appear, and the diagram's legend says so. Prefer returning
+messages if you want them in the picture.
+
+The diagram is built from the same `SagaDescriptor` metadata that CritterWatch draws its saga view from, so the two
+pictures agree. Each `SagaMessageRole` lists the saga's `Methods` with what each returns, and `SagaDescriptor`
+carries `IsEventSourced` and the `Compensations`.
+
 ## Saga Concurrency
 
 Both the Marten and EF Core backed saga support has built in support for optimistic concurrency checks on persisting
@@ -646,7 +1461,7 @@ using var host = await Host.CreateDefaultBuilder()
         
         opts.PersistMessagesWithSqlServer(Servers.SqlServerConnectionString, "color_sagas");
         opts.Services.AddResourceSetupOnStartup();
-    }).StartAsync();
+    }).StartAsync(cancellationToken: TestContext.Current.CancellationToken);
 ```
 <sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/SqlServerTests/Sagas/configuring_saga_table_storage.cs#L22-L34' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_manually_adding_saga_types' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
@@ -738,21 +1553,14 @@ using var host = await Host.CreateDefaultBuilder()
 
 ## Multiple Sagas Handling the Same Message Type
 
-By default, Wolverine does not allow multiple saga types to handle the same message type and will throw an `InvalidSagaException` at startup if this is detected. However, there are valid architectural reasons to have multiple, independent saga workflows react to the same event — for example, an `OrderPlaced` event might start both a `ShippingSaga` and a `BillingSaga`.
+There are valid architectural reasons to have multiple, independent saga workflows react to the same event — for example, an `OrderPlaced` event might start both a `ShippingSaga` and a `BillingSaga`. Wolverine supports this with no configuration.
 
-To enable this, set `MultipleHandlerBehavior` to `Separated`:
+Wolverine creates an independent handler chain for each saga type, routed to its own local queue. Each saga independently manages its own lifecycle — loading, creating, updating, and deleting state — without interfering with the other. A saga and a plain handler class for the same message are separate chains as well.
 
-```cs
-using var host = await Host.CreateDefaultBuilder()
-    .UseWolverine(opts =>
-    {
-        opts.MultipleHandlerBehavior = MultipleHandlerBehavior.Separated;
-
-        // Your persistence configuration here (Marten, EF Core, etc.)
-    }).StartAsync();
-```
-
-When `Separated` mode is active, Wolverine creates an independent handler chain for each saga type, routed to its own local queue. Each saga independently manages its own lifecycle — loading, creating, updating, and deleting state — without interfering with the other.
+::: info
+Before Wolverine 7.0, several saga types for one message type threw an `InvalidSagaException` at startup unless you set
+`MultipleHandlerBehavior.Separated`. 7.0 removed that setting and always behaves this way.
+:::
 
 Here is an example with two sagas that both start from an `OrderPlaced` message but complete independently:
 
@@ -808,7 +1616,7 @@ public class BillingSaga : Saga
 When an `OrderPlaced` message is published, both sagas will be started independently. Completing one saga (e.g., by sending `OrderShipped`) does not affect the other.
 
 ::: warning
-In `Separated` mode, messages routed to multiple sagas must be **published** (via `SendAsync` or `PublishAsync`), not **invoked** (via `InvokeAsync`). `InvokeAsync` bypasses message routing and will not reach the separated saga endpoints.
+Publish (via `SendAsync` or `PublishAsync`) a message that several sagas react to, so each saga handles it on its own queue. `InvokeAsync(message)` runs every saga's chain inline, one after another, each in its own transaction; the first failure stops the run and throws `HandlerInvocationException`, and the sagas that already ran are not rolled back.
 :::
 
 ## Resequencer Saga
@@ -1055,11 +1863,13 @@ between load and save:
 public class QuoteCollection : Saga, IRevisioned
 {
     public Guid Id { get; set; }
-    public int Version { get; set; }
 
     // ... handlers as before
 }
 ```
+
+`IRevisioned.Version` is `Saga.Version`, so there is nothing to declare. Don't declare a `Version` of your own on a
+saga: it would hide `Saga.Version`, the revision the check reads, so Wolverine refuses a saga type that does at startup.
 
 Pair this with a retry policy on the handler chain to automatically retry on conflict:
 
@@ -1096,6 +1906,10 @@ routed to the same local queue partition, guaranteeing they are processed one at
 eliminates concurrency conflicts entirely for saga messages, at the cost of limiting parallelism
 per saga instance.
 
+Starting with Wolverine 7.0, a message a saga handles that has no saga identity member of its own -- a reply from
+another handler, or a `Fault<T>` -- is grouped by the saga-id envelope header instead, so it lands in the same
+partition as the rest of its saga's messages.
+
 ::: tip
 Partitioned sequential messaging is the recommended default strategy for sagas that use the
 scatter-gather pattern. It provides the strongest correctness guarantees with the least complexity.
@@ -1114,7 +1928,6 @@ In practice, you may want both:
 public class QuoteCollection : Saga, IRevisioned
 {
     public Guid Id { get; set; }
-    public int Version { get; set; }
 
     // Optimistic concurrency retry as a safety net
     public static void Configure(HandlerChain chain)
@@ -1298,6 +2111,11 @@ public async Task play_back_scheduled_timeout()
 
 The `PlayScheduledMessagesAsync()` method on `ITrackedSession` is the key here — it lets you "fast forward" scheduled messages in tests without waiting for real time to pass.
 
+When a saga schedules more than one timeout, such as a recurring poll under an overall deadline, play them as time
+passes instead of all at once: `PlayScheduledMessagesAsync(advanceBy: 1.Hours())` plays only what comes due within the
+hour, in due order, and keeps a virtual clock the saga can read through `TimeProvider`. See
+[Letting time pass](/guide/testing#letting-time-pass).
+
 ### Testing the NotFound Path
 
 Wolverine sagas support a static `NotFound()` method that handles messages when no matching saga state exists. This is a common pattern for handling race conditions or out-of-order message delivery:
@@ -1347,7 +2165,7 @@ var allMessages = tracked.Sent.AllMessages().ToArray();
 | Feature | NServiceBus | Rebus | Wolverine |
 |---------|-------------|-------|-----------|
 | **Testing API** | `SagaScenarioTestingLibrary` with virtual storage | `SagaFixture<T>` with in-memory storage | `TrackedSession` + real or in-memory persistence |
-| **Virtual time** | Built-in time advancement | Manual timeout delivery | `PlayScheduledMessagesAsync()` on `ITrackedSession` |
+| **Virtual time** | Built-in time advancement | Manual timeout delivery | `PlayScheduledMessagesAsync(advanceBy:)` on `ITrackedSession` |
 | **Message assertions** | Saga-specific assert methods | `fixture.AssertSagaData()` | `tracked.Sent.SingleMessage<T>()`, `tracked.Executed.MessagesOf<T>()` |
 | **State inspection** | Via virtual saga storage | Via `SagaFixture.Data` | Load state directly from persistence (in-memory, Marten, EF Core, etc.) |
 | **External messages** | Separate test transport | Separate fake transport | `DisableAllExternalWolverineTransports()` + `tracked.Sent` inspection |

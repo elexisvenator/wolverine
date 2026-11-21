@@ -152,11 +152,13 @@ public partial class CosmosDbMessageStore : IDeadLetters
         if (query.PageNumber <= 0) query.PageNumber = 1;
         var skip = (query.PageNumber - 1) * query.PageSize;
 
-        var pagedQueryText =
-            $"SELECT * FROM c WHERE {whereClause} ORDER BY c.sentAt OFFSET @skip LIMIT @take";
-        var pagedQuery = RebuildQueryDef(pagedQueryText, query)
-            .WithParameter("@skip", skip)
-            .WithParameter("@take", query.PageSize);
+        // A PageSize of 0 means "no paging", as it does for the relational stores and RavenDB. `LIMIT 0`
+        // would return nothing at all.
+        var pagedQuery = query.PageSize > 0
+            ? RebuildQueryDef($"SELECT * FROM c WHERE {whereClause} ORDER BY c.sentAt OFFSET @skip LIMIT @take", query)
+                .WithParameter("@skip", skip)
+                .WithParameter("@take", query.PageSize)
+            : RebuildQueryDef($"SELECT * FROM c WHERE {whereClause} ORDER BY c.sentAt", query);
 
         var messages = new List<DeadLetterMessage>();
         using var pagedIterator = _container.GetItemQueryIterator<DeadLetterMessage>(pagedQuery,
@@ -184,7 +186,9 @@ public partial class CosmosDbMessageStore : IDeadLetters
     public DeadLetterCapabilities Capabilities => DeadLetterCapabilities.FailureGroups |
                                                   DeadLetterCapabilities.OperationCounts |
                                                   DeadLetterCapabilities.ArchiveAndRestore |
-                                                  DeadLetterCapabilities.ExceptionMessageMatching;
+                                                  DeadLetterCapabilities.ExceptionMessageMatching |
+                                                  DeadLetterCapabilities.SagaIds |
+                                                  DeadLetterCapabilities.Tags;
 
     public Task DiscardAsync(DeadLetterEnvelopeQuery query, CancellationToken token)
     {
@@ -434,6 +438,12 @@ public partial class CosmosDbMessageStore : IDeadLetters
                 : "c.failureGroup = @failureGroup");
         }
 
+        // GH-5557
+        if (query.SagaId.IsNotEmpty()) conditions.Add("c.sagaId = @sagaId");
+
+        // GH-5556
+        if (query.Tag.IsNotEmpty()) conditions.Add("c.tag = @tag");
+
         if (archived == DeadLetterArchiveFilter.Exclude)
         {
             conditions.Add(NotArchived);
@@ -467,6 +477,9 @@ public partial class CosmosDbMessageStore : IDeadLetters
                 ? queryDef.WithParameter("@legacyExceptionType", legacyType)
                 : queryDef.WithParameter("@failureGroup", query.FailureGroup);
         }
+
+        if (query.SagaId.IsNotEmpty()) queryDef = queryDef.WithParameter("@sagaId", query.SagaId);
+        if (query.Tag.IsNotEmpty()) queryDef = queryDef.WithParameter("@tag", query.Tag);
 
         return queryDef;
     }

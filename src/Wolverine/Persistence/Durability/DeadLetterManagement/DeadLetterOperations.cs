@@ -78,9 +78,21 @@ public enum DeadLetterCapabilities
     ExceptionMessageMatching = 16,
 
     /// <summary>
+    /// GH-5557. Dead letters record <see cref="DeadLetterEnvelope.SagaId"/> from <see cref="Envelope.SagaId"/>,
+    /// and <see cref="DeadLetterEnvelopeQuery.SagaId"/> filters on it
+    /// </summary>
+    SagaIds = 32,
+
+    /// <summary>
+    /// GH-5556. Dead letters record <see cref="DeadLetterEnvelope.Tag"/>, and <see cref="DeadLetterEnvelopeQuery.Tag"/>
+    /// filters on it
+    /// </summary>
+    Tags = 64,
+
+    /// <summary>
     /// Everything above
     /// </summary>
-    All = FailureGroups | OperationCounts | ArchiveAndRestore | ReplayHistory | ExceptionMessageMatching
+    All = FailureGroups | OperationCounts | ArchiveAndRestore | ReplayHistory | ExceptionMessageMatching | SagaIds | Tags
 }
 
 /// <summary>

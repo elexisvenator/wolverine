@@ -64,6 +64,12 @@ public abstract class TabHost : IAsyncLifetime
 
     protected virtual Task AfterStartAsync() => Task.CompletedTask;
 
+    /// <summary>
+    ///     GH-5390. What a Razor page, Minimal API or controller does: start a stream through the IDocumentSession the
+    ///     container gives it, which Wolverine did not open.
+    /// </summary>
+    public abstract Task CommitThroughAnInjectedSessionAsync(Guid id, string name);
+
     public async ValueTask InitializeAsync()
     {
         Host = await Microsoft.Extensions.Hosting.Host.CreateDefaultBuilder()
@@ -97,7 +103,18 @@ public sealed class MartenTabHost : TabHost
             m.Connection(Servers.PostgresConnectionString);
             m.DatabaseSchemaName = "bobcat_the_acts_own_events";
             m.DisableNpgsqlLogging = true;
+
+            // On by default since Marten 10; correlation_ids_off needs a store without them
+            m.Events.MetadataConfig.CorrelationIdEnabled = false;
         }).IntegrateWithWolverine();
+
+    public override async Task CommitThroughAnInjectedSessionAsync(Guid id, string name)
+    {
+        await using var scope = Host.Services.CreateAsyncScope();
+        var session = scope.ServiceProvider.GetRequiredService<global::Marten.IDocumentSession>();
+        session.Events.StartStream<Tab>(id, new TabOpened(name));
+        await session.SaveChangesAsync();
+    }
 }
 
 public sealed class PolecatTabHost : TabHost
@@ -107,10 +124,26 @@ public sealed class PolecatTabHost : TabHost
         {
             m.ConnectionString = Servers.SqlServerConnectionString;
             m.DatabaseSchemaName = "bobcat_the_acts_own_events";
+
+            // GH-5676: AfterStartAsync applies the whole schema. Left on, the first save checks the event store's
+            // schema against SQL Server's catalog again, inside the act, and in the database every Polecat fixture
+            // shares that catalog read can be the deadlock victim of another fixture's schema DDL
+            m.AutoCreateSchemaObjects = AutoCreate.None;
+
+            // On by default since Polecat 6; correlation_ids_off needs a store without them
+            m.Events.EnableCorrelationId = false;
         }).IntegrateWithWolverine();
 
     protected override Task AfterStartAsync()
         => ((global::Polecat.DocumentStore)Host.Services.GetRequiredService<PolecatStore>()).Database.ApplyAllConfiguredChangesToDatabaseAsync();
+
+    public override async Task CommitThroughAnInjectedSessionAsync(Guid id, string name)
+    {
+        await using var scope = Host.Services.CreateAsyncScope();
+        var session = scope.ServiceProvider.GetRequiredService<global::Polecat.IDocumentSession>();
+        session.Events.StartStream<Tab>(id, new TabOpened(name));
+        await session.SaveChangesAsync();
+    }
 }
 
 public sealed class FisherTabHost : TabHost
@@ -122,9 +155,20 @@ public sealed class FisherTabHost : TabHost
             {
                 o.Connection($"Data Source={_file}");
                 o.AutoCreateSchemaObjects = AutoCreate.All;
+
+                // On by default since Fisher 2; correlation_ids_off needs a store without them
+                o.Events.EnableCorrelationId = false;
             })
             .ApplyAllDatabaseChangesOnStartup()
             .IntegrateWithWolverine();
+
+    public override async Task CommitThroughAnInjectedSessionAsync(Guid id, string name)
+    {
+        await using var scope = Host.Services.CreateAsyncScope();
+        var session = scope.ServiceProvider.GetRequiredService<global::Fisher.IDocumentSession>();
+        session.Events.StartStream<Tab>(id, new TabOpened(name));
+        await session.SaveChangesAsync();
+    }
 }
 
 public abstract class the_acts_own_events<THost>(THost app) : WolverineSpec(app.Host)
@@ -189,6 +233,17 @@ public abstract class the_acts_own_events<THost>(THost app) : WolverineSpec(app.
 
         Scenario.LastAct.AllNewEvents.ShouldNotContain(x => x.Data is TabOpened);
         Scenario.LastAct.StartedStreams.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task then_emitted_sees_events_committed_through_an_injected_session()
+    {
+        // GH-5385 / GH-5390: the session was not opened by Wolverine, yet its events belong to the tracked act
+        var id = Guid.CreateVersion7();
+        await WhenTracked("a page opens a tab through its own session", () => app.CommitThroughAnInjectedSessionAsync(id, "the regulars"));
+
+        ThenEmitted(new TabOpened("the regulars"));
+        Scenario.LastAct.AllNewEvents.Count.ShouldBe(1);
     }
 
     [Fact]

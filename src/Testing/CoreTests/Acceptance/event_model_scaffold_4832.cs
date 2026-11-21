@@ -373,6 +373,22 @@ public class event_model_scaffold_4832
     }
 
     [Fact]
+    public void an_automation_reacting_to_several_events_is_one_handler_class_with_a_Handle_per_event()
+    {
+        // GH-5361
+        var result = plan(declared(m => m.Automation("NotifyOfNewLead")
+            .On("LeadCaptured").On("LeadContactAdded").On("LeadMessageReceived")
+            .Emits("LeadNotificationSent")));
+
+        result.Notices.ShouldNotContain(x => x.Kind == ScaffoldNoticeKind.UnknownTrigger);
+        var code = result.Files.Single(x => x.RelativePath == Path.Combine("Features", "NotifyOfNewLead.cs")).Code;
+        code.Split("public static class NotifyOfNewLeadHandler").Length.ShouldBe(2);
+        code.ShouldContain("Handle(LeadCaptured leadCaptured)");
+        code.ShouldContain("Handle(LeadContactAdded leadContactAdded)");
+        code.ShouldContain("Handle(LeadMessageReceived leadMessageReceived)");
+    }
+
+    [Fact]
     public void a_view_declared_by_name_gets_apply_methods_for_the_events_it_folds()
     {
         var result = plan(declared(m => m.View("AppointmentsQueue").From<AppointmentConfirmed>()));
@@ -600,6 +616,80 @@ public class event_model_scaffold_4832
         // IEventStream<T> erases the event types; the source generator reads AppendOne instead (GH-4914)
         code.ShouldNotContain("[Emits(");
         result.Notices.ShouldNotContain(x => x.Kind == ScaffoldNoticeKind.Warning);
+    }
+
+    [Fact]
+    public void events_of_a_slice_with_several_streams_are_not_planned_as_applies_on_every_stream()
+    {
+        // GH-5360: Emits<T>() has no stream, so deciding against one aggregate and starting another
+        // must not cross-product every event onto every aggregate
+        var result = plan(declared(m => m.Slice("ConvertLead").TriggeredBy(TriggerKind.MessageHandler)
+            .Command<ConfirmAppointmentRequest>().Against<Appointment>().StartsStream<HomeCheck>()
+            .Emits<AppointmentConfirmed>().Emits<AppointmentReminderScheduled>()));
+
+        result.Files.Select(x => x.RelativePath).ShouldNotContain(x => x.Contains("Appointment.cs") || x.Contains("HomeCheck.cs"));
+        var notice = result.Notices.Single(x => x.Code == ScaffoldNoticeCodes.EmittedEventStreamAmbiguous);
+        notice.Kind.ShouldBe(ScaffoldNoticeKind.Warning);
+        notice.Message.ShouldContain("Appointment, HomeCheck");
+        result.Notices.ShouldNotContain(x => x.Code == ScaffoldNoticeCodes.ApplyMethodsAdded
+                                             || x.Code == ScaffoldNoticeCodes.ApplyMethodsByHand);
+    }
+
+    [Fact]
+    public void each_emitted_event_is_planned_on_its_stream_lane()
+    {
+        // GH-5360, the Leads chapter of the CRM sample: the slice decides against Lead and starts Account, and the
+        // stream lanes (jasperfx#1203) say which stream each event goes to. Contact's stream is started by a slice
+        // of its own. Only the three right methods are planned, one per aggregate.
+        var result = plan(declared(m =>
+            {
+                m.Command<ConvertLeadToAccount>().TriggeredBy(TriggerKind.MessageHandler)
+                    .Against<Lead>()
+                    .StartsStream<Account>()
+                    .Emits<LeadConvertedToAccount>().OnStream<Lead>()
+                    .Emits<AccountCreated>().OnStream<Account>();
+
+                m.Command<AddContact>().TriggeredBy(TriggerKind.MessageHandler)
+                    .StartsStream<Contact>()
+                    .Emits<ContactCreated>();
+            }),
+            findSource: type => $"Domain/{type.Name}.cs");
+
+        var inserts = result.Files.Where(x => x.InsertInto is not null).ToDictionary(x => x.InsertInto!);
+        inserts.Keys.OrderBy(x => x).ShouldBe([nameof(Account), nameof(Contact), nameof(Lead)]);
+
+        inserts[nameof(Lead)].Code.ShouldContain("Apply(LeadConvertedToAccount e)");
+        inserts[nameof(Lead)].Code.ShouldNotContain(nameof(AccountCreated));
+        inserts[nameof(Lead)].Code.ShouldNotContain(nameof(ContactCreated));
+
+        inserts[nameof(Account)].Code.ShouldContain("(AccountCreated e)");
+        inserts[nameof(Account)].Code.ShouldNotContain(nameof(LeadConvertedToAccount));
+
+        inserts[nameof(Contact)].Code.ShouldContain("(ContactCreated e)");
+        inserts[nameof(Contact)].Code.ShouldNotContain(nameof(LeadConvertedToAccount));
+
+        result.Notices.ShouldNotContain(x => x.Code == ScaffoldNoticeCodes.EmittedEventStreamAmbiguous);
+    }
+
+    [Fact]
+    public void without_a_lane_an_event_goes_to_the_one_aggregate_that_already_applies_it()
+    {
+        // GH-5360's fallback: no lanes, but Prospect already applies ProspectConverted, so that event is Prospect's
+        // and nothing new is planned for it. Nothing says where CustomerOpened goes, so it gets no Apply anywhere.
+        var result = plan(declared(m => m.Command<ConvertProspect>().TriggeredBy(TriggerKind.MessageHandler)
+                .Against<Prospect>()
+                .StartsStream<Customer>()
+                .Emits<ProspectConverted>()
+                .Emits<CustomerOpened>()),
+            findSource: type => $"Domain/{type.Name}.cs");
+
+        result.Files.ShouldNotContain(x => x.InsertInto != null);
+
+        var notice = result.Notices.Single(x => x.Code == ScaffoldNoticeCodes.EmittedEventStreamAmbiguous);
+        notice.Kind.ShouldBe(ScaffoldNoticeKind.Warning);
+        notice.Message.ShouldContain(nameof(CustomerOpened));
+        notice.Message.ShouldNotContain(nameof(ProspectConverted));
+        notice.Message.ShouldContain(".OnStream<TAggregate>()");
     }
 
     [Fact]
@@ -1310,6 +1400,52 @@ public class HomeCheck
 }
 
 public class VolunteerApplication
+{
+    public Guid Id { get; set; }
+}
+
+// GH-5360: the Leads chapter of the CRM sample
+public record ConvertLeadToAccount(Guid LeadId);
+
+public record LeadConvertedToAccount(Guid LeadId);
+
+public record AccountCreated(Guid AccountId);
+
+public record AddContact(Guid ContactId);
+
+public record ContactCreated(Guid ContactId);
+
+public class Lead
+{
+    public Guid Id { get; set; }
+}
+
+public class Account
+{
+    public Guid Id { get; set; }
+}
+
+public class Contact
+{
+    public Guid Id { get; set; }
+}
+
+public record ConvertProspect(Guid ProspectId);
+
+public record ProspectConverted(Guid ProspectId);
+
+public record CustomerOpened(Guid CustomerId);
+
+public class Prospect
+{
+    public Guid Id { get; set; }
+
+    public void Apply(ProspectConverted e)
+    {
+    }
+}
+
+public class Customer
 {
     public Guid Id { get; set; }
 }

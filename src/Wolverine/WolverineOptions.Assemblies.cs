@@ -1,8 +1,10 @@
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
+using JasperFx;
 using JasperFx.Core;
 using JasperFx.Core.Reflection;
+using Microsoft.Extensions.Hosting;
 using Wolverine.Attributes;
 
 namespace Wolverine;
@@ -15,6 +17,41 @@ public sealed partial class WolverineOptions
     ///     that assuming that the IDE or test runner assembly is the application assembly
     /// </summary>
     public static Assembly? RememberedApplicationAssembly;
+
+    /// <summary>
+    ///     Clears <see cref="RememberedApplicationAssembly"/> and JasperFx's own
+    ///     <c>JasperFxOptions.RememberedApplicationAssembly</c>, so the next host to start without an explicit
+    ///     application assembly resolves its own again. For test fixtures that start several hosts in one process.
+    /// </summary>
+    public static void ResetRememberedApplicationAssembly()
+    {
+        RememberedApplicationAssembly = null;
+        JasperFxOptions.ResetRememberedApplicationAssembly();
+    }
+
+    /// <summary>
+    ///     Whether this host takes part in the process-wide <see cref="RememberedApplicationAssembly"/> (and JasperFx's
+    ///     twin). The default is true: the first host to start records its application assembly, and every later host
+    ///     that doesn't name one reuses it. Set this to false and the host neither records nor reuses the remembered
+    ///     assembly; without an explicit <see cref="ApplicationAssembly"/> it uses the assembly that called
+    ///     <c>UseWolverine()</c> or <c>AddWolverine()</c>. Useful in a test suite where handler discovery would
+    ///     otherwise depend on which test ran first (GH-3521).
+    /// </summary>
+    public bool RememberApplicationAssembly { get; set; } = true;
+
+    // GH-3521: the assembly this host's registration seeded JasperFxOptions.RememberedApplicationAssembly with, so a
+    // host that turns RememberApplicationAssembly off (which the registration can't see yet) can take it back
+    internal Assembly? SeededRememberedApplicationAssembly { get; set; }
+
+    internal void ForgetSeededRememberedApplicationAssembly()
+    {
+        var seeded = SeededRememberedApplicationAssembly;
+        if (seeded == null) return;
+
+        // Only if no other host has replaced it since
+        Interlocked.CompareExchange(ref JasperFxOptions.RememberedApplicationAssembly, null, seeded);
+        SeededRememberedApplicationAssembly = null;
+    }
 
     // GH-3521: a warning buffered during options configuration (before any logger exists) and emitted at
     // WolverineRuntime startup when an implicit host silently inherited a different host's scanned assembly.
@@ -209,6 +246,11 @@ public sealed partial class WolverineOptions
         {
             ApplicationAssembly ??= Assembly.Load(assemblyName);
         }
+        else if (!RememberApplicationAssembly)
+        {
+            // GH-3521: opted out of the process-wide pin, so use where this host was registered, and record nothing
+            ApplicationAssembly = RegistrationCallingAssembly ?? determineCallingAssembly();
+        }
         else if (RememberedApplicationAssembly != null)
         {
             // GH-3778: this branch adopts an assembly pinned by whichever host started FIRST in the
@@ -230,6 +272,87 @@ public sealed partial class WolverineOptions
         }
 
         HandlerGraph.Discovery.Assemblies.Fill(ApplicationAssembly);
+    }
+
+    /// <summary>
+    /// GH-5667. Adopts the assembly the host names through <see cref="IHostEnvironment.ApplicationName"/> when
+    /// nothing named the application assembly explicitly and JasperFx's answer is only a guess.
+    ///
+    /// <para>Under WebApplicationFactory (Alba) the entry assembly is the TEST project. When anything calls
+    /// AddJasperFx() before UseWolverine() -- AddMarten() in a typical web application -- JasperFx pins the
+    /// process-wide application assembly from its own resolution, which returns the entry assembly outright once
+    /// that references a JasperFx tool such as Marten. ReadJasperFxOptions then adopted the test project, handler
+    /// discovery found nothing, and every message failed with IndeterminateRoutesException. A pin left by an
+    /// earlier host in the same process did the same to a second WebApplicationFactory host.</para>
+    ///
+    /// <para>WebApplicationFactory sets ApplicationName to the application's assembly name, and ASP.NET Core finds
+    /// the application's MVC parts from the same value. It only counts here when it differs from the entry
+    /// assembly's name, which is its default everywhere else: a console host, <c>dotnet run</c> and the codegen
+    /// and describe commands all leave it alone, so the resolution they already had is unchanged.</para>
+    /// </summary>
+    internal void ReadHostEnvironment(IHostEnvironment? environment, JasperFxOptions jasperfx)
+    {
+        // Named explicitly on Wolverine, or through UseWolverine(assemblyName)
+        if (_applicationAssembly != null) return;
+
+        // Named explicitly on JasperFx, through CritterStackDefaults() or SetApplicationProject()
+        var entryAssembly = Assembly.GetEntryAssembly();
+        if (!IsGuessedApplicationAssembly(jasperfx.ApplicationAssembly, JasperFxOptions.RememberedApplicationAssembly,
+                entryAssembly))
+        {
+            return;
+        }
+
+        var named = AssemblyNamedByHost(environment?.ApplicationName, entryAssembly);
+        if (named != null)
+        {
+            ApplicationAssembly = named;
+        }
+    }
+
+    // GH-5667. Whether JasperFx's application assembly is a guess rather than an explicit choice. JasperFx doesn't
+    // record which it was, but a guess is always one of these: nothing yet, the process-wide pin (which the first
+    // host's guess set), the entry assembly (what JasperFx guesses when the entry assembly references a JasperFx
+    // tool), or a test runner. An explicit choice that happens to equal the pin is indistinguishable, and the host
+    // name only replaces it when the host names some other assembly.
+    internal static bool IsGuessedApplicationAssembly(Assembly? candidate, Assembly? pinned, Assembly? entry)
+    {
+        if (candidate == null) return true;
+        if (candidate == pinned || candidate == entry) return true;
+
+        return candidate.GetName().Name is { } name && IsTestRunnerAssembly(name);
+    }
+
+    // GH-5667. The assembly an IHostEnvironment.ApplicationName names, if the host named one deliberately: a name
+    // equal to the entry assembly's is just the default, and a name that loads no assembly (an application can set
+    // any display name it likes) is ignored. A test runner or generated assembly is never adopted, whatever its name.
+    internal static Assembly? AssemblyNamedByHost(string? applicationName, Assembly? entryAssembly)
+    {
+        if (applicationName.IsEmpty()) return null;
+
+        if (entryAssembly != null &&
+            string.Equals(entryAssembly.GetName().Name, applicationName, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        Assembly assembly;
+        try
+        {
+            assembly = Assembly.Load(new AssemblyName(applicationName));
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+
+        var name = assembly.GetName().Name;
+        if (name == null || IsTestRunnerAssembly(name) || IsNeverAnApplicationAssembly(assembly))
+        {
+            return null;
+        }
+
+        return assembly;
     }
 
     // GH-3521: the assembly this host's *own* registration call stack resolves to, captured in the
@@ -294,6 +417,37 @@ public sealed partial class WolverineOptions
             $"The application assembly is a process-wide value pinned by whichever host started FIRST in this process (GH-3521), so handler discovery will NOT scan '{registered.GetName().Name}'. " +
             $"This typically only bites a test harness that stands up multiple Wolverine hosts across different assemblies. If handlers defined in '{registered.GetName().Name}' appear to be missing " +
             $"(e.g. \"No routes can be determined\"), set opts.ApplicationAssembly = typeof(SomeHandler).Assembly or opts.Discovery.IncludeAssembly(...) explicitly on this host.";
+    }
+
+    // GH-3576: Wolverine keeps its own detection rather than consolidating onto JasperFx's
+    // JasperFxOptions.ApplicationAssemblyReuseWarning. JasperFx's captures the registering assembly inside
+    // AddJasperFx, which IHostBuilder.UseWolverine() reaches only during Build() -- so a host registered in one
+    // assembly and built by a helper in another gets a false positive there, where Wolverine's entry-point
+    // capture (GH-3778) gets it right. JasperFx has no public way to accept the pre-captured assembly yet
+    // (jasperfx#1179). Revisit consolidation once it does.
+    //
+    // Until then, exactly one warning per host: Wolverine's. Marten, Polecat and Fisher log JasperFx's copy from
+    // their store activators, so in a Wolverine host it is cleared here before any store reads it. The setter is
+    // internal to JasperFx; no public alternative exists. If it ever disappears, this degrades to the old double
+    // warning rather than failing startup, and claiming_the_application_assembly_reuse_warning fails loudly.
+    private static readonly MethodInfo? _jasperFxReuseWarningSetter = typeof(JasperFxOptions)
+        .GetProperty(nameof(JasperFxOptions.ApplicationAssemblyReuseWarning), BindingFlags.Instance | BindingFlags.Public)
+        ?.GetSetMethod(nonPublic: true);
+
+    internal static bool CanClaimApplicationAssemblyReuseWarning => _jasperFxReuseWarningSetter != null;
+
+    // Runs as a PostConfigure<JasperFxOptions>, after the user's configure callback and before
+    // ReadJasperFxOptions, so a non-null _applicationAssembly here is an explicit choice.
+    [DynamicDependency("set_" + nameof(JasperFxOptions.ApplicationAssemblyReuseWarning), typeof(JasperFxOptions))]
+    internal void ClaimApplicationAssemblyReuseWarning(JasperFxOptions jasperfx)
+    {
+        if (jasperfx.ApplicationAssemblyReuseWarning == null) return;
+
+        // An explicit Wolverine ApplicationAssembly is honored silently, but the stores still adopt JasperFx's
+        // process pin. If the two differ, JasperFx's warning is the only one that speaks for the stores, so keep it.
+        if (_applicationAssembly != null && _applicationAssembly != jasperfx.ApplicationAssembly) return;
+
+        _jasperFxReuseWarningSetter?.Invoke(jasperfx, [null]);
     }
 
     internal void IncludeExtensionAssemblies(Assembly[] assemblies)

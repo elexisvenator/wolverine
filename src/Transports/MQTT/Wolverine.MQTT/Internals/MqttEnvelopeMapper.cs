@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Globalization;
 using JasperFx.Core;
 using MQTTnet;
 using MQTTnet.Packets;
@@ -59,7 +61,7 @@ public class MqttEnvelopeMapper : IMqttEnvelopeMapper
 
         if (envelope.SentAt != default(DateTimeOffset))
         {
-            message.UserProperties.Add(new MqttUserProperty(EnvelopeConstants.SentAtKey, envelope.SentAt.ToString()));
+            message.UserProperties.Add(new MqttUserProperty(EnvelopeConstants.SentAtKey, writeTimestamp(envelope.SentAt)));
         }
 
         if (envelope.AcceptedContentTypes != null)
@@ -97,7 +99,7 @@ public class MqttEnvelopeMapper : IMqttEnvelopeMapper
 
         if (envelope.DeliverBy.HasValue)
         {
-            message.UserProperties.Add(new MqttUserProperty(EnvelopeConstants.DeliverByKey, envelope.DeliverBy.ToString()));
+            message.UserProperties.Add(new MqttUserProperty(EnvelopeConstants.DeliverByKey, writeTimestamp(envelope.DeliverBy.Value)));
         }
 
         if (envelope.IsResponse)
@@ -106,10 +108,16 @@ public class MqttEnvelopeMapper : IMqttEnvelopeMapper
         }
     }
 
+    // The invariant round-trip format the other transports write, see EnvelopeMapper
+    private static string writeTimestamp(DateTimeOffset value)
+    {
+        return value.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
+    }
+
     public void MapIncomingToEnvelope(Envelope envelope, MqttApplicationMessage incoming)
     {
         envelope.ContentType = incoming.ContentType;
-        envelope.Data = incoming.PayloadSegment.ToArray();
+        envelope.Data = incoming.Payload.ToArray();
 
         envelope.MessageType = _topic.MessageTypeName;
         envelope.TopicName = incoming.Topic;

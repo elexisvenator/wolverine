@@ -1,21 +1,26 @@
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using ImTools;
 using JasperFx.Core;
 using JasperFx.Core.Reflection;
+using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Http.Headers;
+using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Http.Metadata;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Primitives;
 using Microsoft.Net.Http.Headers;
 using Wolverine.Http.Runtime;
 using Wolverine.Http.Runtime.MultiTenancy;
@@ -296,7 +301,16 @@ public abstract partial class HttpHandler
     
     private const int FingerprintBufferSize = 16 * 1024;
 
+    // MultipartReader's own default
+    private const int MultipartReaderBufferSize = 4 * 1024;
+
     private static readonly byte[] _fingerprintSeparator = [0];
+
+    // What follows the query string when the body is hashed as something other than the bytes sent. UTF-8 never
+    // encodes 0xFF, so neither the endpoint nor the query string can contain it, and a body hashed as its bytes
+    // (which follows the 0 separator) can never produce the same input as one hashed as its parts or its form.
+    private static readonly byte[] _multipartFingerprintMarker = [0xFF, (byte)'M'];
+    private static readonly byte[] _formFingerprintMarker = [0xFF, (byte)'F'];
 
     // Set once the endpoint's work is done: from then on its [DeduplicatedWithResponse] claim is kept.
     private static readonly object _deduplicatedWorkDone = new();
@@ -307,6 +321,10 @@ public abstract partial class HttpHandler
     // GH-5165. Set once the database commit of a claim-and-release endpoint succeeded, ahead of anything that can still
     // throw inside the commit call.
     private static readonly object _deduplicatedDatabaseCommitted = new();
+
+    // Set once a claim-and-release endpoint holds the claim on its key: its claim is kept as soon as its work is done.
+    // A claim written inside the transaction is not kept until its commit, so the work being done is not enough there.
+    private static readonly object _deduplicatedClaimHeld = new();
 
     /// <summary>
     /// GH-4742. Folds the <see cref="DeduplicationScope" /> parts into a <c>[DeduplicatedWithResponse]</c> key.
@@ -346,6 +364,15 @@ public abstract partial class HttpHandler
     /// GH-4742. SHA-256 of the method and path, the query string and the body bytes: what was sent, not the
     /// bound object. The endpoint is always included, so a key reused on another endpoint is a different request
     /// even when the scope leaves the endpoint out. Requires a buffered body; null when there is no key.
+    /// <para>
+    /// A multipart body is hashed as its parts, each part's headers and content, so the boundary is left out: a
+    /// client picks a new one whenever it builds the request again.
+    /// </para>
+    /// <para>
+    /// A form-encoded body is hashed as its fields, by name. A form that middleware read before the body was
+    /// buffered, as antiforgery validation does for a token sent as a form field, leaves no body to hash, so that form
+    /// is hashed the same way, with its files in the order sent. The antiforgery token field is always left out.
+    /// </para>
     /// </summary>
     public static async Task<string?> ComputeDeduplicationFingerprintAsync(HttpContext context,
         string? deduplicationId)
@@ -363,16 +390,43 @@ public abstract partial class HttpHandler
         hash.AppendData(Encoding.UTF8.GetBytes(endpointOf(request)));
         hash.AppendData(_fingerprintSeparator);
         hash.AppendData(Encoding.UTF8.GetBytes(request.QueryString.Value ?? string.Empty));
-        hash.AppendData(_fingerprintSeparator);
 
         var buffer = ArrayPool<byte>.Shared.Rent(FingerprintBufferSize);
         try
         {
-            request.Body.Position = 0;
-            int read;
-            while ((read = await request.Body.ReadAsync(buffer, context.RequestAborted).ConfigureAwait(false)) > 0)
+            if (await hashMultipartSectionsAsync(context, buffer).ConfigureAwait(false) is { } sections)
             {
-                hash.AppendData(buffer, 0, read);
+                hash.AppendData(_multipartFingerprintMarker);
+                hash.AppendData(sections);
+            }
+            else if (await readUrlEncodedFormAsync(context).ConfigureAwait(false) is { Count: > 0 } fields)
+            {
+                hash.AppendData(_formFingerprintMarker);
+                hash.AppendData(await hashFormAsync(context, fields, null, buffer).ConfigureAwait(false));
+            }
+            else
+            {
+                request.Body.Position = 0;
+                var read = await request.Body.ReadAsync(buffer, context.RequestAborted).ConfigureAwait(false);
+
+                if (read == 0 && formReadAhead(context) is { } form)
+                {
+                    // Hashed as a body read here would be, so a host that leaves the body readable after the form
+                    // read and one that does not give the same fingerprint for a form-encoded body
+                    hash.AppendData(_formFingerprintMarker);
+                    hash.AppendData(await hashFormAsync(context, form, form.Files, buffer).ConfigureAwait(false));
+                }
+                else
+                {
+                    // Unchanged from GH-4742, so a claim stored by an earlier version still matches its retry
+                    hash.AppendData(_fingerprintSeparator);
+                    hash.AppendData(buffer, 0, read);
+                    if (read > 0)
+                    {
+                        await appendToEndAsync(hash, request.Body, buffer, context.RequestAborted)
+                            .ConfigureAwait(false);
+                    }
+                }
             }
         }
         finally
@@ -382,6 +436,231 @@ public abstract partial class HttpHandler
         }
 
         return Convert.ToHexStringLower(hash.GetHashAndReset());
+    }
+
+    /// <summary>
+    /// A hash of each part's headers and content, in the order sent, or null when the body is not multipart,
+    /// cannot be read as multipart or has more parts than a form may have values, which the caller hashes as the
+    /// bytes sent.
+    /// </summary>
+    private static async Task<byte[]?> hashMultipartSectionsAsync(HttpContext context, byte[] buffer)
+    {
+        var request = context.Request;
+
+        if (!MediaTypeHeaderValue.TryParse(request.ContentType, out var mediaType) ||
+            !mediaType.MediaType.StartsWith("multipart/", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var boundary = HeaderUtilities.RemoveQuotes(mediaType.Boundary).Value;
+        if (string.IsNullOrWhiteSpace(boundary)) return null;
+
+        // The limits the endpoint's own read applies, so a request it accepts is one this can read
+        var options = context.RequestServices?.GetService<IOptions<FormOptions>>()?.Value ?? new FormOptions();
+        var limits = context.GetEndpoint()?.Metadata.GetMetadata<IFormOptionsMetadata>();
+
+        // The endpoint's form read refuses a longer boundary anyway
+        if (boundary.Length > (limits?.MultipartBoundaryLengthLimit ?? options.MultipartBoundaryLengthLimit))
+        {
+            return null;
+        }
+
+        var partsLimit = limits?.ValueCountLimit ?? options.ValueCountLimit;
+        var parts = 0;
+        var antiforgeryField = antiforgeryFieldOf(context);
+
+        using var sections = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using var part = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+
+        try
+        {
+            request.Body.Position = 0;
+
+            // The reader wants its buffer 128 bytes longer than the boundary, which a raised boundary limit can push
+            // past its default
+            var reader = new MultipartReader(boundary, request.Body,
+                Math.Max(MultipartReaderBufferSize, boundary.Length + 128))
+            {
+                HeadersCountLimit = limits?.MultipartHeadersCountLimit ?? options.MultipartHeadersCountLimit,
+                HeadersLengthLimit = limits?.MultipartHeadersLengthLimit ?? options.MultipartHeadersLengthLimit
+            };
+
+            while (await reader.ReadNextSectionAsync(context.RequestAborted).ConfigureAwait(false) is { } section)
+            {
+                if (++parts > partsLimit) return null;
+
+                if (isAntiforgeryToken(section, antiforgeryField))
+                {
+                    await section.Body.DrainAsync(context.RequestAborted).ConfigureAwait(false);
+                    continue;
+                }
+
+                appendHeaders(part, section.Headers ?? []);
+
+                await appendToEndAsync(part, section.Body, buffer, context.RequestAborted).ConfigureAwait(false);
+
+                // One fixed-size hash per part, so content cannot shift from one part into the next
+                sections.AppendData(part.GetHashAndReset());
+            }
+        }
+        catch (Exception e) when (e is InvalidDataException or IOException)
+        {
+            return null;
+        }
+
+        return sections.GetHashAndReset();
+    }
+
+    /// <summary>
+    /// The form, when something ahead of the endpoint read it before the body was buffered and left no body behind
+    /// </summary>
+    private static IFormCollection? formReadAhead(HttpContext context)
+    {
+        return context.Features.Get<IFormFeature>()?.Form is { } form && (form.Count > 0 || form.Files.Count > 0)
+            ? form
+            : null;
+    }
+
+    /// <summary>
+    /// The fields of a form-encoded body, or null when the body is not form-encoded or cannot be read as a form
+    /// within the limits the endpoint's own read applies, which the caller hashes as the bytes sent.
+    /// </summary>
+    private static async Task<Dictionary<string, StringValues>?> readUrlEncodedFormAsync(HttpContext context)
+    {
+        var request = context.Request;
+        if (!MediaTypeHeaderValue.TryParse(request.ContentType, out var mediaType) ||
+            !mediaType.MediaType.Equals("application/x-www-form-urlencoded", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var options = context.RequestServices?.GetService<IOptions<FormOptions>>()?.Value ?? new FormOptions();
+        var limits = context.GetEndpoint()?.Metadata.GetMetadata<IFormOptionsMetadata>();
+
+        try
+        {
+            request.Body.Position = 0;
+
+            using var reader = new FormReader(request.Body, mediaType.Encoding ?? Encoding.UTF8)
+            {
+                ValueCountLimit = limits?.ValueCountLimit ?? options.ValueCountLimit,
+                KeyLengthLimit = limits?.KeyLengthLimit ?? options.KeyLengthLimit,
+                ValueLengthLimit = limits?.ValueLengthLimit ?? options.ValueLengthLimit
+            };
+
+            return await reader.ReadFormAsync(context.RequestAborted).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is InvalidDataException or IOException or DecoderFallbackException)
+        {
+            return null;
+        }
+    }
+
+    // A form field of this name is left out of the fingerprint: a client that loads the page again is given a new
+    // antiforgery token for the same request
+    private static string? antiforgeryFieldOf(HttpContext context)
+        => context.RequestServices?.GetService<IOptions<AntiforgeryOptions>>()?.Value.FormFieldName;
+
+    private static bool isAntiforgeryToken(MultipartSection section, string? antiforgeryField)
+    {
+        return antiforgeryField != null &&
+               ContentDispositionHeaderValue.TryParse(section.ContentDisposition, out var disposition) &&
+               disposition.IsFormDisposition() &&
+               string.Equals(HeaderUtilities.RemoveQuotes(disposition.Name).Value, antiforgeryField,
+                   StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A hash of a form's fields by name, as a form keeps no order for them, and its files in the order sent,
+    /// leaving out the antiforgery token.
+    /// </summary>
+    private static async Task<byte[]> hashFormAsync(HttpContext context,
+        IEnumerable<KeyValuePair<string, StringValues>> form, IFormFileCollection? files, byte[] buffer)
+    {
+        var antiforgeryField = antiforgeryFieldOf(context);
+
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using var file = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+
+        var fields = form
+            .Where(x => antiforgeryField == null || !string.Equals(x.Key, antiforgeryField, StringComparison.Ordinal))
+            .OrderBy(x => x.Key, StringComparer.Ordinal)
+            .ToArray();
+
+        appendLength(hash, fields.Length);
+        foreach (var field in fields)
+        {
+            appendWithLength(hash, field.Key);
+            appendLength(hash, field.Value.Count);
+            foreach (var value in field.Value)
+            {
+                appendWithLength(hash, value ?? string.Empty);
+            }
+        }
+
+        files ??= new FormFileCollection();
+        appendLength(hash, files.Count);
+        foreach (var formFile in files)
+        {
+            appendWithLength(file, formFile.Name);
+            appendWithLength(file, formFile.FileName);
+            appendHeaders(file, formFile.Headers ?? (IEnumerable<KeyValuePair<string, StringValues>>)[]);
+
+            await using var content = formFile.OpenReadStream();
+            await appendToEndAsync(file, content, buffer, context.RequestAborted).ConfigureAwait(false);
+
+            // One fixed-size hash per file, so content cannot shift from one file into the next
+            hash.AppendData(file.GetHashAndReset());
+        }
+
+        return hash.GetHashAndReset();
+    }
+
+    // Counted and length-prefixed, so a header or one of its values cannot shift into the next one or into the
+    // content that follows
+    private static void appendHeaders(IncrementalHash hash, IEnumerable<KeyValuePair<string, StringValues>> headers)
+    {
+        var sorted = headers.OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase).ToArray();
+
+        appendLength(hash, sorted.Length);
+        foreach (var header in sorted)
+        {
+            appendWithLength(hash, header.Key.ToLowerInvariant());
+            appendLength(hash, header.Value.Count);
+            foreach (var value in header.Value)
+            {
+                appendWithLength(hash, value ?? string.Empty);
+            }
+        }
+    }
+
+    private static async Task<long> appendToEndAsync(IncrementalHash hash, Stream stream, byte[] buffer,
+        CancellationToken cancellation)
+    {
+        long length = 0;
+        int read;
+        while ((read = await stream.ReadAsync(buffer, cancellation).ConfigureAwait(false)) > 0)
+        {
+            hash.AppendData(buffer, 0, read);
+            length += read;
+        }
+
+        return length;
+    }
+
+    private static void appendWithLength(IncrementalHash hash, string value)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value);
+        appendLength(hash, bytes.Length);
+        hash.AppendData(bytes);
+    }
+
+    private static void appendLength(IncrementalHash hash, int length)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32LittleEndian(bytes, length);
+        hash.AppendData(bytes);
     }
 
     private static string endpointOf(HttpRequest request)
@@ -399,6 +678,7 @@ public abstract partial class HttpHandler
 
         if (claim.Fingerprint != fingerprint)
         {
+            recordDeduplicationOutcome(context, ClaimOutcome.Mismatched);
             await WriteProblems(StatusCodes.Status422UnprocessableEntity,
                 $"This '{keyName}' was already used for a different request; send a new key for a new request",
                 context, null).ConfigureAwait(false);
@@ -407,13 +687,21 @@ public abstract partial class HttpHandler
 
         if (claim.Response is not { } response)
         {
+            recordDeduplicationOutcome(context, ClaimOutcome.InProgress);
             await WriteProblems(StatusCodes.Status409Conflict,
                 $"A request with this '{keyName}' is still being processed; retry later", context, null)
                 .ConfigureAwait(false);
             return;
         }
 
+        recordDeduplicationOutcome(context, ClaimOutcome.Replayed);
+
         context.Response.StatusCode = response.StatusCode;
+
+        if (_options.MarkDeduplicatedReplays)
+        {
+            context.Response.Headers[_options.DeduplicatedReplayHeaderName] = "true";
+        }
 
         if (response.Location != null)
         {
@@ -465,6 +753,7 @@ public abstract partial class HttpHandler
                 logger?.LogWarning(failure,
                     "The commit for deduplicated id '{DeduplicationId}' failed after its claim was written; a retry will be answered from that claim",
                     deduplicationId);
+                recordDeduplicationOutcome(context, ClaimOutcome.Claimed);
                 return false;
             }
 
@@ -494,6 +783,8 @@ public abstract partial class HttpHandler
     {
         context.Items[_deduplicatedResponseCommitted] = true;
         releaseDeduplicatedRefusalWatch(context);
+
+        if (IsDeduplicatedWorkDone(context)) recordDeduplicationOutcome(context, ClaimOutcome.Claimed);
     }
 
     /// <summary>GH-5160. Has the commit of a <c>[DeduplicatedWithResponse]</c> claim written inside the transaction succeeded?</summary>
@@ -503,26 +794,41 @@ public abstract partial class HttpHandler
     /// <summary>
     /// GH-4742. Called once the endpoint has run, after any commit on claim-and-release and just before it when the
     /// claim is written inside the transaction: the response about to be written, for the claim to store, as
-    /// <see cref="WriteJsonAsync{T}" /> will write it, with the status and <c>Location</c> already set.
-    /// Unless that response is a failure (400 and up), the work is done and the claim is kept from here on. Null
-    /// records nothing.
+    /// <see cref="WriteJsonAsync{T}" /> will write it, with the status and <c>Location</c> already set; an
+    /// <see cref="IResult" /> is described from the result, before it executes. Unless that response is a failure
+    /// (400 and up), the work is done and the claim is kept from here on. Null records nothing.
     /// </summary>
     public DeduplicatedResponse? CompleteDeduplicatedRequest<T>(HttpContext context, string? deduplicationId,
         T? resource, int missingResourceStatusCode)
+        => CompleteDeduplicatedRequest(context, deduplicationId, resource, missingResourceStatusCode, true);
+
+    /// <summary>
+    /// As <see cref="CompleteDeduplicatedRequest{T}(HttpContext, string, T, int)" />. With
+    /// <paramref name="storeBody" /> false the body is never serialized, and the claim stores the status and
+    /// <c>Location</c> alone. See <see cref="DeduplicatedWithResponseRequirement.StoreBody" />.
+    /// </summary>
+    public DeduplicatedResponse? CompleteDeduplicatedRequest<T>(HttpContext context, string? deduplicationId,
+        T? resource, int missingResourceStatusCode, bool storeBody)
     {
         if (string.IsNullOrWhiteSpace(deduplicationId)) return null;
+
+        // By the declared type, which picked the response writer: an IResult returned as object is written as JSON
+        if (typeof(IResult).IsAssignableFrom(typeof(T)) && resource is IResult result)
+        {
+            return completeDeduplicatedResult(context, deduplicationId, result, storeBody);
+        }
 
         var status = resource is null ? missingResourceStatusCode : context.Response.StatusCode;
         if (status >= 400) return null;
 
-        context.Items[_deduplicatedWorkDone] = true;
+        markDeduplicatedWorkDone(context);
 
         var location = context.Response.Headers.Location;
 
         try
         {
             return new DeduplicatedResponse(status,
-                resource is null ? null : JsonSerializer.Serialize(resource, _jsonOptions),
+                resource is null || !storeBody ? null : JsonSerializer.Serialize(resource, _jsonOptions),
                 location.Count == 0 ? null : location.ToString());
         }
         catch (Exception e)
@@ -534,8 +840,149 @@ public abstract partial class HttpHandler
         }
     }
 
+    private static readonly HashSet<Type> _replayableResults =
+    [
+        typeof(Ok), typeof(Ok<>), typeof(Created), typeof(Created<>), typeof(Accepted), typeof(Accepted<>),
+        typeof(NoContent), typeof(StatusCodeHttpResult), typeof(EmptyHttpResult)
+    ];
+
+    private static readonly HashSet<Type> _resultUnions =
+        [typeof(Results<,>), typeof(Results<,,>), typeof(Results<,,,>), typeof(Results<,,,,>), typeof(Results<,,,,,>)];
+
+    private static bool isReplayableResult(Type type)
+        => _replayableResults.Contains(type.IsGenericType ? type.GetGenericTypeDefinition() : type);
+
+    private static bool isResultUnion(Type type)
+        => type.IsGenericType && _resultUnions.Contains(type.GetGenericTypeDefinition());
+
+    internal static bool CanReplayResultOf(Type resultType)
+    {
+        if (isResultUnion(resultType))
+        {
+            return resultType.GetGenericArguments().Any(CanReplayResultOf);
+        }
+
+        if (resultType.IsInterface)
+        {
+            var definition = resultType.IsGenericType ? resultType.GetGenericTypeDefinition() : resultType;
+            return _replayableResults.Any(replayable => replayable.GetInterfaces().Any(implemented =>
+                (implemented.IsGenericType ? implemented.GetGenericTypeDefinition() : implemented) == definition));
+        }
+
+        return isReplayableResult(resultType);
+    }
+
+    private static DeduplicatedResponse? completeDeduplicatedResult(HttpContext context, string deduplicationId,
+        IResult result, bool storeBody)
+    {
+        // Only ASP.NET Core's unions are known to write exactly what the arm they hold writes
+        while (isResultUnion(result.GetType()) && result is INestedHttpResult nested) result = nested.Result;
+
+        var status = (result as IStatusCodeHttpResult)?.StatusCode ?? context.Response.StatusCode;
+        if (status >= 400 || result is ChallengeHttpResult or ForbidHttpResult) return null;
+
+        markDeduplicatedWorkDone(context);
+
+        var type = result.GetType();
+
+        if (!isReplayableResult(type))
+        {
+            context.RequestServices.GetService<ILogger<DeduplicatedResponses>>()?.LogError(
+                "The {ResultType} answering deduplicated id '{DeduplicationId}' is not stored, because it writes more than a status, a JSON body and a Location",
+                type.FullNameInCode(), deduplicationId);
+            return null;
+        }
+
+        try
+        {
+            // Created.ExecuteAsync sets the header only when Location is not empty.
+            var location = readLocation(result, type);
+            if (string.IsNullOrEmpty(location)) location = context.Response.Headers.Location.ToString();
+
+            return new DeduplicatedResponse(status,
+                storeBody && result is IValueHttpResult { Value: { } value }
+                    ? serializeAsResultWrites(context, type, value)
+                    : null,
+                string.IsNullOrEmpty(location) ? null : location);
+        }
+        catch (Exception e)
+        {
+            context.RequestServices.GetService<ILogger<DeduplicatedResponses>>()?.LogError(e,
+                "Failed to serialize the response for deduplicated id '{DeduplicationId}' to store it", deduplicationId);
+            return null;
+        }
+    }
+
+    private static ImHashMap<Type, Func<IResult, string?>> _locationReaders =
+        ImHashMap<Type, Func<IResult, string?>>.Empty;
+
+    // ASP.NET Core has no interface for Location, so Created<T> and Accepted<T> get a getter built once per closed type
+    private static string? readLocation(IResult result, Type type)
+    {
+        switch (result)
+        {
+            case Created created: return created.Location;
+            case Accepted accepted: return accepted.Location;
+        }
+
+        if (!type.IsGenericType) return null;
+
+        if (!_locationReaders.TryFind(type, out var reader))
+        {
+            var definition = type.GetGenericTypeDefinition();
+            var name = definition == typeof(Created<>) ? nameof(readCreatedLocation)
+                : definition == typeof(Accepted<>) ? nameof(readAcceptedLocation)
+                : null;
+
+            reader = name == null
+                ? static _ => null
+                : (Func<IResult, string?>)typeof(HttpHandler)
+                    .GetMethod(name, System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!
+                    .MakeGenericMethod(type.GetGenericArguments()[0])
+                    .CreateDelegate(typeof(Func<IResult, string?>));
+
+            _locationReaders = _locationReaders.AddOrUpdate(type, reader);
+        }
+
+        return reader(result);
+    }
+
+    private static string? readCreatedLocation<T>(IResult result) => ((Created<T>)result).Location;
+    private static string? readAcceptedLocation<T>(IResult result) => ((Accepted<T>)result).Location;
+
+    // As ASP.NET Core's HttpResultsHelper.WriteResultAsJsonAsync writes Ok<T>, Created<T> and Accepted<T>: with its own
+    // JsonOptions, as the declared TValue unless the runtime type differs and TValue has no known polymorphism.
+    private static string serializeAsResultWrites(HttpContext context, Type resultType, object value)
+    {
+        var options = (context.RequestServices.GetService<IOptions<Microsoft.AspNetCore.Http.Json.JsonOptions>>()?.Value
+                       ?? new Microsoft.AspNetCore.Http.Json.JsonOptions()).SerializerOptions;
+
+        var declared = resultType.GetGenericArguments()[0];
+        var typeInfo = options.GetTypeInfo(declared);
+
+        return value.GetType() == declared || declared.IsSealed || declared.IsValueType ||
+               typeInfo.PolymorphismOptions != null
+            ? JsonSerializer.Serialize(value, typeInfo)
+            : JsonSerializer.Serialize<object>(value, options);
+    }
+
     /// <summary>GH-4742. Has the endpoint's work been done, so its claim must be kept?</summary>
     public static bool IsDeduplicatedWorkDone(HttpContext context) => context.Items.ContainsKey(_deduplicatedWorkDone);
+
+    // Both CompleteDeduplicatedRequest and KeepDeduplicatedClaimIfCommitted can get here in one request (the commit
+    // succeeds, then the flush throws), so only the first counts
+    private static void markDeduplicatedWorkDone(HttpContext context)
+    {
+        if (!context.Items.TryAdd(_deduplicatedWorkDone, true)) return;
+
+        if (context.Items.ContainsKey(_deduplicatedClaimHeld))
+        {
+            recordDeduplicationOutcome(context, ClaimOutcome.Claimed);
+        }
+    }
+
+    private static void recordDeduplicationOutcome(HttpContext context, ClaimOutcome outcome)
+        => context.RequestServices.GetService<DeduplicatedResponses>()?.RecordOutcome(context, outcome);
 
     /// <summary>
     /// GH-5165. The database commit of a claim-and-release <c>[DeduplicatedWithResponse]</c> endpoint succeeded. Called
@@ -557,7 +1004,7 @@ public abstract partial class HttpHandler
     {
         if (context.Items.ContainsKey(_deduplicatedDatabaseCommitted))
         {
-            context.Items[_deduplicatedWorkDone] = true;
+            markDeduplicatedWorkDone(context);
         }
     }
 
@@ -570,6 +1017,8 @@ public abstract partial class HttpHandler
         DeduplicatedResponses responses, string? deduplicationId, string claimToken, Type? ancillaryStoreMarker)
     {
         if (string.IsNullOrWhiteSpace(deduplicationId)) return;
+
+        context.Items[_deduplicatedClaimHeld] = true;
 
         context.Response.OnStarting(async () =>
         {

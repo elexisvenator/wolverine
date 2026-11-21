@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.ObjectPool;
 using Wolverine.ErrorHandling;
 using Wolverine.Logging;
+using Wolverine.Persistence.Sagas;
 using Wolverine.Runtime.Routing;
 using Wolverine.Transports;
 using Wolverine.Util;
@@ -60,6 +61,9 @@ internal class Executor : IExecutor
     // GH-5311. Tracking.RecordExceptionsOnSpans
     private readonly bool _recordExceptions;
 
+    // GH-5661. Stamped on each envelope this executor runs, so a requeue or reschedule logs at this handler's level
+    private readonly LogLevel _failureLogLevel;
+
     /// <summary>
     ///     The tracker this executor reports to. Exposed for tests asserting which traffic is
     ///     metrics-silent (CritterWatch GH-907).
@@ -90,7 +94,8 @@ internal class Executor : IExecutor
             LoggerMessage.Define<string, Guid, string>(handler.SuccessLogLevel, MessageSucceededEventId,
                 "Successfully processed message {Name}#{envelope} from {ReplyUri}");
 
-        _messageFailed = LoggerMessage.Define<string, Guid, string>(handler.FailureLogLevel, MessageFailedEventId,
+        _failureLogLevel = handler.FailureLogLevel;
+        _messageFailed = LoggerMessage.Define<string, Guid, string>(_failureLogLevel, MessageFailedEventId,
             "Failed to process message {Name}#{envelope} from {ReplyUri}");
 
         _messageTypeName = handler.MessageType.ToMessageTypeName();
@@ -239,12 +244,15 @@ internal class Executor : IExecutor
         _executionStarted(_logger, envelope!.CorrelationId!, _messageTypeName, envelope.Id, null);
 
         envelope.Attempts++;
+        envelope.HandlerFailureLogLevel = _failureLogLevel;
 
         // GH-4322: one linked source with CancelAfter replaces the previous timeout-CTS +
         // linked-CTS pair — the token still cancels on whichever of the execution timeout or the
         // caller's token fires first, at half the per-message allocations and registrations.
+        // Linked through a per-thread intermediate rather than straight to the receiver's token, which every
+        // message on every thread would otherwise register on: see CancellationShards
         using var cts = cancellation.CanBeCanceled
-            ? CancellationTokenSource.CreateLinkedTokenSource(cancellation)
+            ? CancellationTokenSource.CreateLinkedTokenSource(CancellationShards.For(cancellation))
             : new CancellationTokenSource();
         cts.CancelAfter(_timeout);
 
@@ -432,7 +440,7 @@ internal class Executor : IExecutor
         var handler = handlerGraph.HandlerFor(messageType);
         if (handler == null )
         {
-            var batching = runtime.Options.BatchDefinitions.FirstOrDefault(x => x.ElementType == messageType);
+            var batching = handlerGraph.BatchFor(messageType);
             if (batching != null)
             {
                 handler = batching.BuildHandler((WolverineRuntime)runtime);
@@ -448,6 +456,9 @@ internal class Executor : IExecutor
         var timeoutSpan = chain?.DetermineMessageTimeout(runtime.Options) ?? 5.Seconds();
         var rules = chain?.Failures.CombineRules(handlerGraph.Failures) ?? handlerGraph.Failures;
 
+        // GH-5556: a saga chain compensates after its retries
+        if (chain is SagaChain sagaChain) SagaCompensations.ApplyTo(sagaChain, rules, runtime);
+
         if (runtime.Options.InvokeTracing == InvokeTracingMode.Full)
         {
             return new TracingExecutor(contextPool, runtime, handler, rules, timeoutSpan);
@@ -462,6 +473,9 @@ internal class Executor : IExecutor
         var chain = (handler as MessageHandler)?.Chain;
         var timeoutSpan = chain?.DetermineMessageTimeout(runtime.Options) ?? 5.Seconds();
         var rules = chain?.Failures.CombineRules(handlerGraph.Failures) ?? handlerGraph.Failures;
+
+        // GH-5556: a saga chain compensates after its retries
+        if (chain is SagaChain sagaChain) SagaCompensations.ApplyTo(sagaChain, rules, runtime);
 
         var logger = runtime.LoggerFactory.CreateLogger(handler.MessageType);
 

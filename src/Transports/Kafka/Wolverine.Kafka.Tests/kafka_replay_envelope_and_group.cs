@@ -1,5 +1,5 @@
 using System.Collections.Concurrent;
-using Confluent.Kafka;
+using Dekaf.Consumer;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -9,8 +9,7 @@ using Wolverine.Kafka.Internals;
 
 namespace Wolverine.Kafka.Tests;
 
-// GH-3147 follow-up: a replayed envelope must look to the pipeline like one the live listener received,
-// and the throwaway replay consumer must join a group the broker lets the application use.
+// GH-3147 follow-up: a replayed envelope must look to the pipeline like one the live listener received.
 public class kafka_replay_envelope_and_group
 {
     [Fact]
@@ -56,11 +55,63 @@ public class kafka_replay_envelope_and_group
     }
 
     [Fact]
+    public async Task replays_can_reuse_one_requested_group_id()
+    {
+        var topic = Guid.NewGuid().ToString();
+
+        using var host = await WolverineHost.ForAsync(opts =>
+        {
+            opts.UseKafka(KafkaContainerFixture.ConnectionString).AutoProvision();
+            opts.PublishAllMessages().ToKafkaTopic(topic).SendInline();
+            opts.ListenToKafkaTopic(topic)
+                .ProcessInline()
+                .ConfigureConsumer(x =>
+                {
+                    x.GroupId = Guid.NewGuid().ToString();
+                    x.AutoOffsetReset = AutoOffsetReset.Earliest;
+                });
+            opts.Services.AddSingleton<ReplayProbeSink>();
+            opts.Discovery.DisableConventionalDiscovery().IncludeType<ReplayProbeHandler>();
+        });
+
+        var sink = host.Services.GetRequiredService<ReplayProbeSink>();
+        await host.SendAsync(new ReplayProbeMessage { Id = "live" });
+        await waitForAsync(() => sink.Destinations.Count >= 1);
+
+        // A broker that grants consumer groups by literal name only admits the one name it was told about,
+        // so every replay has to be able to run under that same group id (GH-5306)
+        var request = new KafkaReplayRequest { Topic = topic, FromOffset = 0, GroupId = $"{topic}-replay" };
+
+        var first = await host.ReplayKafkaTopicAsync(request, token: TestContext.Current.CancellationToken);
+        var second = await host.ReplayKafkaTopicAsync(request, token: TestContext.Current.CancellationToken);
+
+        first.RecordsReplayed.ShouldBe(1);
+        second.RecordsReplayed.ShouldBe(1);
+    }
+
+    [Fact]
+    public void the_replay_command_passes_the_group_id_flag_through()
+    {
+        var request = KafkaReplayCommand.BuildRequest(new KafkaReplayInput
+        {
+            Topic = "orders",
+            GroupIdFlag = "tenant-a-replay",
+            FromOffsetFlag = 1500,
+            PartitionsFlag = "0, 1"
+        });
+
+        request.Topic.ShouldBe("orders");
+        request.GroupId.ShouldBe("tenant-a-replay");
+        request.FromOffset.ShouldBe(1500);
+        request.Partitions.ShouldBe([0, 1]);
+    }
+
+    [Fact]
     public void the_live_listening_endpoint_of_a_directly_listened_topic_is_the_topic()
     {
         var (_, transport) = buildTransport();
         var topic = transport.Topics["orders"];
-        topic.ConsumerConfig = new ConsumerConfig { GroupId = "tenant-a-orders" };
+        topic.ConsumerConfig = new KafkaConsumerOptions { GroupId = "tenant-a-orders" };
 
         KafkaReplay.LiveListeningEndpointFor(topic, transport).Uri.ShouldBe(topic.Uri);
     }
@@ -89,7 +140,7 @@ public class kafka_replay_envelope_and_group
         // topic's own group id is a throwaway named after ServiceName, which is the one prefix the broker
         // ACL that motivated all of this refuses
         topic.IsHotTail = true;
-        topic.ConsumerConfig = new ConsumerConfig { GroupId = "OrderService-hot-tail-e6f1c2d3" };
+        topic.ConsumerConfig = new KafkaConsumerOptions { GroupId = "OrderService-hot-tail-e6f1c2d3" };
 
         KafkaReplay.ReplayGroupIdFor(topic, transport, options.ServiceName)
             .ShouldStartWith("tenant-a-replay-");
@@ -100,10 +151,20 @@ public class kafka_replay_envelope_and_group
     {
         var (options, transport) = buildTransport();
         var topic = transport.Topics["orders"];
-        topic.ConsumerConfig = new ConsumerConfig { GroupId = "tenant-a-orders" };
+        topic.ConsumerConfig = new KafkaConsumerOptions { GroupId = "tenant-a-orders" };
 
         KafkaReplay.ReplayGroupIdFor(topic, transport, options.ServiceName)
             .ShouldStartWith("tenant-a-orders-replay-");
+    }
+
+    [Fact]
+    public void replay_uses_a_requested_group_id_verbatim()
+    {
+        var (options, transport) = buildTransport(transportGroupId: "tenant-a");
+        var topic = transport.Topics["orders"];
+
+        KafkaReplay.ReplayGroupIdFor(topic, transport, options.ServiceName, "tenant-a-replay")
+            .ShouldBe("tenant-a-replay");
     }
 
     [Fact]
@@ -111,7 +172,7 @@ public class kafka_replay_envelope_and_group
     {
         var (options, transport) = buildTransport(transportGroupId: "tenant-a");
         options.ListenToKafkaTopics("payments", "orders");
-        transport.TopicGroups.Single().ConsumerConfig = new ConsumerConfig { GroupId = "tenant-a-billing" };
+        transport.TopicGroups.Single().ConsumerConfig = new KafkaConsumerOptions { GroupId = "tenant-a-billing" };
         var topic = transport.Topics["orders"];
 
         KafkaReplay.ReplayGroupIdFor(topic, transport, options.ServiceName)
@@ -123,7 +184,7 @@ public class kafka_replay_envelope_and_group
     {
         var (options, transport) = buildTransport(transportGroupId: "tenant-a");
         options.ListenToKafkaTopics("payments", "refunds");
-        transport.TopicGroups.Single().ConsumerConfig = new ConsumerConfig { GroupId = "tenant-a-billing" };
+        transport.TopicGroups.Single().ConsumerConfig = new KafkaConsumerOptions { GroupId = "tenant-a-billing" };
         var topic = transport.Topics["orders"];
 
         KafkaReplay.ReplayGroupIdFor(topic, transport, options.ServiceName)

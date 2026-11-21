@@ -16,6 +16,9 @@ public class LightweightSagaPersistenceFrameProvider : IPersistenceFrameProvider
     // AHEAD of Marten in OrderedPersistenceProviders and silently stealing sagas Marten should own.
     public bool IsCatchAll => true;
 
+    // GH-5572
+    public SagaRetentionSupport SagaRetentionSupportFor(Type sagaType, IServiceContainer container) => SagaRetentionSupport.Supported;
+
     // GH-4805: ApplyTransactionSupport no longer CLOSES a frame generic at all -- the frame is
     // non-generic now, because ILC would not generate code for a <Guid, TSaga> instantiation however
     // it was rooted. CanPersist still closes ISagaStorage<,>, which is safe and measured.
@@ -111,7 +114,8 @@ public class LightweightSagaPersistenceFrameProvider : IPersistenceFrameProvider
         Justification = "ISagaStorage<,> closed over runtime saga types during Dynamic codegen; AOT consumers register saga types explicitly. See AOT guide.")]
     public bool CanPersist(Type entityType, IServiceContainer container, out Type persistenceService)
     {
-        if (entityType.CanBeCastTo<Saga>())
+        // GH-5415: an event-sourced saga is a stream, which the lightweight saga tables cannot keep
+        if (entityType.CanBeCastTo<Saga>() && !entityType.CanBeCastTo<EventSourcedSaga>())
         {
             var idType = SagaChain.DetermineSagaIdMember(entityType, entityType)?.GetRawMemberType();
             if (idType == null)

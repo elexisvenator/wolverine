@@ -58,7 +58,6 @@ internal class FromFormAttributeUsage : IParameterStrategy
        if(IsClassOrNullableClassNotCollection(parameter.ParameterType)){
             chain.RequestType = parameter.ParameterType;
             chain.IsFormData = true;
-            chain.BindsFormValues = true; // GH-4742
             variable = new FormBindingFrame(parameter.ParameterType, chain).Variable;
             return true;
        }
@@ -140,6 +139,11 @@ internal class FormBindingFrame : SyncFrame
                 var formValueVariable =
                     chain.TryFindOrCreateFormValue(propertyInfo.PropertyType, propertyInfo.Name, formName);
 
+                if (formValueVariable is not null)
+                {
+                    formValueVariable.BoundParameter ??= new PropertyAsParameterInfo(propertyInfo);
+                }
+
                 if (formValueVariable?.Creator is IReadHttpFrame frame)
                 {
                     frame.AssignToProperty($"{Variable.Usage}.{propertyInfo.Name}");
@@ -169,6 +173,12 @@ internal class FormBindingFrame : SyncFrame
         foreach (var parameter in _parameters)
         {
             yield return parameter;
+        }
+
+        // The arranger never sees the property frames, which this frame emits inline
+        foreach (var variable in _props.OfType<Frame>().SelectMany(x => x.FindVariables(chain)))
+        {
+            yield return variable;
         }
     }
 }

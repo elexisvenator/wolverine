@@ -24,7 +24,7 @@ public interface IMartenOp : ISideEffect
     void Execute(IDocumentSession session);
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/Wolverine.Marten/IMartenOp.cs#L19-L28' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_imartenop' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/Wolverine.Marten/IMartenOp.cs#L20-L29' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_imartenop' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 The built in side effects can all be used from the `MartenOps` static class like this HTTP endpoint example:
@@ -152,7 +152,7 @@ public static class TodoListEndpoint
         CreateTodoListRequest request
     )
     {
-        var listId = CombGuidIdGeneration.NewGuid();
+        var listId = SequentialGuid.NextPostgresOrder();
         var result = new TodoListCreated(listId, request.Title);
         var startStream = MartenOps.StartStream<TodoList>(listId, result);
 
@@ -364,9 +364,13 @@ preventing the handler from running.
 ### Using Attributes
 
 The simplest way to declare data requirements is with the `[DocumentExists<T>]` and `[DocumentDoesNotExist<T>]`
-attributes on handler methods:
+attributes on handler methods. Since 7.0 they live in Wolverine core, in the `Wolverine.Persistence.Requirements`
+namespace, and the same attributes work with Marten, Polecat and Fisher. The store is the one the chain works with:
+a chain routed to an ancillary store with `[Storage]` or `[MartenStore]` checks that store.
 
 ```csharp
+using Wolverine.Persistence.Requirements;
+
 // Convention: looks for a property named "UserId" or "Id" on the command
 [DocumentExists<User>]
 public void Handle(PromoteUser command)
@@ -386,6 +390,12 @@ The identity property is resolved from the message/request type by convention:
 1. If a property name is specified explicitly in the attribute constructor, that is used
 2. Otherwise, Wolverine looks for a property named `{DocumentTypeName}Id` (e.g., `UserId` for `User`)
 3. As a fallback, Wolverine looks for a property named `Id`
+
+::: tip
+The Marten-specific copies in `Wolverine.Marten.Requirements` are `[Obsolete]` in 7.0 and will be removed in 8.0.
+`Wolverine.Marten.Requirements` also holds `IMartenDataRequirement`, so a file that uses both that and the attributes
+should refer to the attributes by their full name or move the `MartenOps.Document<T>()` requirements to a separate file.
+:::
 
 You can apply multiple attributes to a single handler method to check multiple documents:
 

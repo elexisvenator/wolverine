@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using Microsoft.Extensions.Logging;
+using Wolverine.Persistence.Durability;
 using Wolverine.Runtime;
 using Wolverine.Transports;
 using Wolverine.Transports.Local;
@@ -30,15 +31,11 @@ internal class MoveToErrorQueue : IContinuation
         IWolverineRuntime runtime,
         DateTimeOffset now, Activity? activity)
     {
-        // TODO -- at some point, we need a more systematic way of doing this
-        // Defensive: a malformed system envelope (no Destination) shouldn't NRE here before
-        // EnableAutomaticFailureAcks even gets a chance to short-circuit. The envelope itself is
-        // always present (the block below already relies on it); only Destination can be null. GH-3013.
-        var scheme = lifecycle.Envelope!.Destination?.Scheme;
-        var sendFailureAck = scheme is not null && runtime.Options.EnableAutomaticFailureAcks &&
-                             scheme != TransportConstants.Local && scheme != "external-table";
-
-        if (lifecycle.Envelope.Message != null)
+        // GH-5521: moving a message to the error queue no longer sends a failure acknowledgement to the
+        // sender. WolverineOptions.EnableAutomaticFailureAcks, off by default since 4.6, was removed in 7.0.
+        // Nothing here reads Envelope.Destination, so a malformed system envelope without one (GH-3013)
+        // is safe too.
+        if (lifecycle.Envelope!.Message != null)
         {
             lifecycle.Envelope.MessageType = lifecycle.Envelope.Message.GetType().ToMessageTypeName();
         }
@@ -46,6 +43,12 @@ internal class MoveToErrorQueue : IContinuation
         {
             lifecycle.Envelope.MessageType ??= $"unknown/{Exception.GetType().Name}";
         }
+
+        // GH-5554: where the faults go is worked out before the dead-letter move, and those for a durable
+        // destination are written in its transaction when the store can do that
+        var faults = await routeFaultsAsync(lifecycle, runtime, activity);
+        var deadLetterFaults = faults is null ? null : await prepareAsync(faults, runtime);
+        if (deadLetterFaults != null) lifecycle.Envelope.DeadLetterFaults = deadLetterFaults;
 
         try
         {
@@ -55,28 +58,27 @@ internal class MoveToErrorQueue : IContinuation
         {
             // The transport could not move the envelope and left the delivery with the broker, which delivers it
             // again. Nothing was dead lettered, so no fault, no completion -- that would settle, and so lose, the
-            // only copy -- and no error queue record. No failure ack either: the redelivery arrives as a new
-            // envelope that the latch on this one cannot see, so the sender would get one per redelivery
+            // only copy -- and no error queue record
             runtime.Logger.LogWarning(e,
                 "Could not move envelope {EnvelopeId} to the error queue; the transport left it to be delivered again",
                 lifecycle.Envelope.Id);
             lifecycle.CompletionTrackerFor(runtime).Requeued(lifecycle.Envelope);
             return;
         }
-        catch (Exception)
+        finally
         {
-            // Any other failure of the move ends this envelope's processing all the same, so the sender still
-            // hears about it
-            if (sendFailureAck) await sendFailureAckAsync(lifecycle);
-            throw;
+            lifecycle.Envelope.DeadLetterFaults = null;
         }
 
-        if (sendFailureAck) await sendFailureAckAsync(lifecycle);
-
-        // Auto-publish Fault<T> if opted in. The publish enrols in the active
-        // outbox transaction when one is open on the inbound MessageContext;
-        // otherwise it is a best-effort post-DLQ-move publish. Never throws.
-        await runtime.PublishFaultIfEnabledAsync(lifecycle, Exception, FaultTrigger.MovedToErrorQueue, activity);
+        if (faults is null)
+        {
+            // Not a message context: auto-publish Fault<T> if opted in, best-effort, after the move. Never throws.
+            await runtime.PublishFaultIfEnabledAsync(lifecycle, Exception, FaultTrigger.MovedToErrorQueue, activity);
+        }
+        else
+        {
+            await sendFaultsAsync(faults, deadLetterFaults, runtime);
+        }
 
         await lifecycle.CompleteAsync();
 
@@ -91,11 +93,86 @@ internal class MoveToErrorQueue : IContinuation
         lifecycle.CompletionTrackerFor(runtime).MovedToErrorQueue(lifecycle.Envelope, Exception);
     }
 
-    // Sent after the move rather than before it, so a move the transport hands back for redelivery sends none
-    private ValueTask sendFailureAckAsync(IEnvelopeLifecycle lifecycle)
+    // The faults of this dead letter, routed and stamped as the fault publisher would send them, but not sent yet.
+    // Null when the lifecycle is not a message context, which falls back to publishing after the move
+    private async Task<List<Envelope>?> routeFaultsAsync(IEnvelopeLifecycle lifecycle, IWolverineRuntime runtime,
+        Activity? activity)
     {
-        return lifecycle.SendFailureAcknowledgementAsync(
-            $"Moved message {lifecycle.Envelope!.Id} to the Error Queue.\n{Exception}");
+        if (lifecycle is not MessageContext context || runtime is not IWolverineRuntimeInternal) return null;
+
+        var captured = new List<Envelope>();
+        context.CapturedOutgoing = captured;
+        try
+        {
+            await runtime.PublishFaultIfEnabledAsync(lifecycle, Exception, FaultTrigger.MovedToErrorQueue, activity);
+        }
+        finally
+        {
+            context.CapturedOutgoing = null;
+        }
+
+        return captured;
+    }
+
+    private static async Task<DeadLetterFaults?> prepareAsync(List<Envelope> faults, IWolverineRuntime runtime)
+    {
+        var hooks = (runtime as WolverineRuntime)?.DeadLetterHooks;
+        var failMove = hooks?.TakeFailNextMove() ?? false;
+
+        var durable = faults.Where(x => x.Sender is { IsDurable: true }).ToArray();
+        if (durable.Length == 0 && !failMove) return null;
+
+        var deadLetterFaults = new DeadLetterFaults { FailBeforeCommit = failMove };
+        try
+        {
+            await deadLetterFaults.PersistAsync(durable);
+        }
+        catch (Exception e)
+        {
+            // Never stop the dead-letter move over a fault: fall back to sending it after the move
+            runtime.Logger.LogError(e, "Could not prepare the faults of a dead letter to be written with it");
+            await deadLetterFaults.RollbackAsync();
+        }
+
+        return deadLetterFaults;
+    }
+
+    private static async Task sendFaultsAsync(List<Envelope> faults, DeadLetterFaults? written,
+        IWolverineRuntime runtime)
+    {
+        var hooks = (runtime as WolverineRuntime)?.DeadLetterHooks;
+        if (hooks != null && hooks.TakeCrashAfterNextMove())
+        {
+            // Test seam: the service "crashed" right after the move committed, so nothing more is sent
+            hooks.Strand(faults);
+            return;
+        }
+
+        if (faults.Count == 0) return;
+
+        var persisted = written is { Written: true }
+            ? written.Outgoing.Concat(written.Incoming).ToHashSet()
+            : [];
+
+        foreach (var fault in faults)
+        {
+            try
+            {
+                // Written with the dead letter: only to be sent. Otherwise stored and sent as today, best-effort
+                if (persisted.Contains(fault) || fault.Sender is not { IsDurable: true })
+                {
+                    await fault.QuickSendAsync();
+                }
+                else
+                {
+                    await fault.StoreAndForwardAsync();
+                }
+            }
+            catch (Exception e)
+            {
+                runtime.Logger.LogError(e, "Failed to send the auto Fault<T> {EnvelopeId} of a dead letter", fault.Id);
+            }
+        }
     }
 
     public override string ToString()

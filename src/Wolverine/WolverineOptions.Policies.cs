@@ -32,15 +32,6 @@ public sealed partial class WolverineOptions : IPolicies
 {
     internal List<IWolverinePolicy> RegisteredPolicies { get; } = [new TagHandlerPolicy()];
 
-    internal bool PublishAgentEvents { get; set; } 
-    
-    bool IPolicies.PublishAgentEvents
-    {
-        get => PublishAgentEvents;
-        set => PublishAgentEvents = value;
-    }
-
-
     void IPolicies.AutoApplyTransactions()
     {
         RegisteredPolicies.Insert(0, new AutoApplyTransactions());
@@ -121,6 +112,29 @@ public sealed partial class WolverineOptions : IPolicies
     void IPolicies.AlwaysMakeScheduledMessagesDurable()
     {
         Durability.AlwaysMakeScheduledMessagesDurable = true;
+    }
+
+    void IPolicies.RetainCompletedSagas(TimeSpan retention)
+    {
+        if (retention <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(retention), "The retention period must be positive");
+        }
+
+        Durability.CompletedSagaRetention = retention;
+    }
+
+    void IPolicies.WhenSagaIsMissing(SagaMissingBehavior behavior)
+    {
+        SagaMissingDefault = behavior;
+    }
+
+    /// <summary>GH-5674. Set by <c>opts.Policies.WhenSagaIsMissing()</c></summary>
+    internal SagaMissingBehavior SagaMissingDefault { get; set; } = SagaMissingBehavior.Throw;
+
+    void IPolicies.RecordSagaHistory()
+    {
+        Durability.RecordSagaHistory = true;
     }
 
     void IPolicies.AllListeners(Action<ListenerConfiguration> configure)
@@ -305,7 +319,7 @@ public sealed partial class WolverineOptions : IPolicies
 
     /// <summary>
     /// Logger level for Wolverine to use to log the successful processing of a message. The
-    /// default is Information
+    /// default is Debug (it was Information before 6.21, GH-3490)
     /// </summary>
     /// <param name="logLevel"></param>
     void IPolicies.MessageSuccessLogLevel(LogLevel logLevel)
@@ -316,9 +330,16 @@ public sealed partial class WolverineOptions : IPolicies
 
     void IPolicies.MessageFailureLogLevel(LogLevel logLevel)
     {
+        MessageFailureLogLevel = logLevel;
         var policy = new LambdaHandlerPolicy(c => c.FailureLogLevel = logLevel);
         Policies.Add(policy);
     }
+
+    /// <summary>
+    /// GH-5661. The level given to <see cref="IPolicies.MessageFailureLogLevel"/>, if any. A requeue whose handler
+    /// chain cannot be determined logs at this level, or at Error without one
+    /// </summary>
+    internal LogLevel? MessageFailureLogLevel { get; private set; }
 
     /// <summary>
     /// Logger level for Wolverine to use for log messages marking the execution stop and finish for all

@@ -21,14 +21,30 @@ namespace Wolverine.Postgresql;
 ///     <see cref="DurabilityMode.ServerlessWithOutbox" />
 /// </summary>
 internal partial class PostgresqlMessageStore : IMessageStoreWithDurabilityPass, IStaleOutgoingSource,
-    IDurabilityPassInboxSource
+    IDurabilityPassInboxSource, IDurabilityPassLockIgnoredByGapDetection
 {
     /// <summary>
     ///     The advisory lock that keeps two overlapping durability passes against the same message schema from
     ///     sending the same rows twice. Derived from the schema name so that two Wolverine applications sharing
     ///     one database with their own schemas do not skip each other's passes
     /// </summary>
-    internal int DurabilityPassLockId => $"{SchemaName}:durability-pass".GetDeterministicHashCode();
+    internal int DurabilityPassLockId => DurabilityPassLockIdFor(SchemaName);
+
+    /// <summary>
+    ///     The durability pass lock key of the message store in <paramref name="schemaName" />
+    /// </summary>
+    internal static int DurabilityPassLockIdFor(string schemaName) =>
+        $"{schemaName}:durability-pass".GetDeterministicHashCode();
+
+    /// <summary>
+    ///     GH-5620. Set by the Marten integration once Marten's async daemon ignores this store's durability pass
+    ///     lock in its gap detection, so a transaction-scoped pass lock no longer holds asynchronous projections
+    ///     behind a sequence gap
+    /// </summary>
+    internal bool DurabilityPassLockIgnoredByGapDetection { get; set; }
+
+    bool IDurabilityPassLockIgnoredByGapDetection.DurabilityPassLockIgnoredByGapDetection =>
+        DurabilityPassLockIgnoredByGapDetection;
 
     public bool SupportsTransactionScopedDurabilityPassLock => true;
 
@@ -196,7 +212,8 @@ internal partial class PostgresqlMessageStore : IMessageStoreWithDurabilityPass,
 
     public async Task RestartStaleOutgoingAsync(IReadOnlyList<Envelope> envelopes, CancellationToken token)
     {
-        // The timestamp column only exists when OutboxStaleTime is set
+        // Only when OutboxStaleTime is set: the timestamp column is always there since 7.0 (GH-5193), unless
+        // AlwaysProvisionOptionalSchemaObjects is off, in which case only with OutboxStaleTime
         if (HasDisposed || envelopes.Count == 0 || !Durability.OutboxStaleTime.HasValue) return;
 
         var builder = new DbCommandBuilder(new NpgsqlCommand());
@@ -216,7 +233,8 @@ internal partial class PostgresqlMessageStore : IMessageStoreWithDurabilityPass,
     {
         builder.Append($" where {DatabaseConstants.OwnerId} = {TransportConstants.AnyNode}");
 
-        // The timestamp column only exists when OutboxStaleTime is set
+        // Only when OutboxStaleTime is set: the timestamp column is always there since 7.0 (GH-5193), unless
+        // AlwaysProvisionOptionalSchemaObjects is off, in which case only with OutboxStaleTime
         if (staleBefore.HasValue && Durability.OutboxStaleTime.HasValue)
         {
             builder.Append($" and {DatabaseConstants.Timestamp} <= ");
@@ -289,7 +307,8 @@ internal partial class PostgresqlMessageStore : IMessageStoreWithDurabilityPass,
     {
         builder.Append($" where {DatabaseConstants.Status} = '{EnvelopeStatus.Incoming}'");
 
-        // The timestamp column only exists when InboxStaleTime is set. A row owned by any node was never claimed
+        // Only when InboxStaleTime is set: the timestamp column is always there since 7.0 (GH-5193), unless
+        // AlwaysProvisionOptionalSchemaObjects is off, in which case only with InboxStaleTime. A row owned by any node was never claimed
         // by a live request, so it is recoverable at once, and a row a node claimed is once its stale clock runs out
         if (staleBefore.HasValue && Durability.InboxStaleTime.HasValue)
         {

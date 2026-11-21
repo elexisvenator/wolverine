@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using Bobcat.Resilience;
 using Bobcat.Supervisor;
 using Nuke.Common;
@@ -62,10 +63,10 @@ partial class Build
     /// </summary>
     void RunTestProject(string projectPath, string frameworkOverride = null,
         Func<WorkerTest, bool> testFilter = null, int workers = 1, bool postgresDatabasePerLane = false,
-        bool sqlServerDatabasePerLane = false)
+        bool sqlServerDatabasePerLane = false, string[] heal = null)
     {
         RunTestProjects([projectPath], frameworkOverride, testFilter, workers, postgresDatabasePerLane,
-            sqlServerDatabasePerLane);
+            sqlServerDatabasePerLane, heal);
     }
 
     /// <summary>
@@ -94,18 +95,36 @@ partial class Build
     /// One server, many databases — a fleet of SQL Server CONTAINERS is far past what a 4-vCPU/16GB
     /// hosted runner can carry (see the worker-clamp note in runSupervised).
     /// </param>
+    /// <param name="heal">
+    /// GH-5545: the services this run started fresh and may recreate mid-run when it degrades on them,
+    /// <c>sqlserver</c> and/or <c>asb</c> (build/ServiceHeal.cs). Ignored for a service this run did not start fresh.
+    /// </param>
     void RunTestProjects(string[] projectPaths, string frameworkOverride = null,
         Func<WorkerTest, bool> testFilter = null, int workers = 1, bool postgresDatabasePerLane = false,
-        bool sqlServerDatabasePerLane = false)
+        bool sqlServerDatabasePerLane = false, string[] heal = null)
     {
         var failedProjects = new List<string>();
         foreach (var projectPath in projectPaths)
         {
             foreach (var framework in frameworksBuiltFor(projectPath, frameworkOverride))
             {
-                if (!runSupervised(projectPath, framework, testFilter, TestWorkers ?? workers,
-                        postgresDatabasePerLane, sqlServerDatabasePerLane))
-                    failedProjects.Add($"{projectPath} ({framework})");
+                bool passed;
+                try
+                {
+                    passed = runSupervised(projectPath, framework, testFilter, TestWorkers ?? workers,
+                        postgresDatabasePerLane, sqlServerDatabasePerLane, heal);
+                }
+                catch (Exception e)
+                {
+                    // A supervisor that throws (a worker that never became usable, say) fails this
+                    // project, not every project after it: TestAllTransports lost Pulsar, RabbitMQ,
+                    // Redis and SignalR to one Pulsar worker that stalled at startup.
+                    Log.Error(e, "=== {Project} ({Framework}): the supervised run threw ===",
+                        Path.GetFileNameWithoutExtension(projectPath), framework);
+                    passed = false;
+                }
+
+                if (!passed) failedProjects.Add($"{projectPath} ({framework})");
             }
         }
 
@@ -114,7 +133,7 @@ partial class Build
     }
 
     bool runSupervised(string projectPath, string framework, Func<WorkerTest, bool> shardFilter,
-        int workers, bool postgresDatabasePerLane, bool sqlServerDatabasePerLane = false)
+        int workers, bool postgresDatabasePerLane, bool sqlServerDatabasePerLane = false, string[] heal = null)
     {
         // The committed per-target count is tuned on a developer machine; the machine actually
         // running decides what it can carry. A GitHub-hosted runner has 4 vCPUs and 16GB, and 4
@@ -141,6 +160,16 @@ partial class Build
         var supervisor = new Supervisor(factory) { MaxParallelWorkers = workers };
         configureSupervisor(supervisor, projectName, framework, shardFilter,
             message => Log.Information("  {Message}", message));
+
+        // GH-5545: recreate a service this run owns when the run degrades on it, then carry on. A recreated SQL Server
+        // has lost the lane databases, so they are created again before the run resumes.
+        if (heal is { Length: > 0 })
+        {
+            healDegradedServices(supervisor, projectName, heal, service =>
+                service == "sqlserver" && sqlServerDatabasePerLane
+                    ? _ => Task.Run(() => ensureSqlServerLaneDatabases(workers))
+                    : null);
+        }
 
         // Only under Actions: locally the run finishes and prints its summary, and `dotnet run --
         // --output Detailed` is the per-test view. In CI the summary is exactly what a wedged job
@@ -363,7 +392,7 @@ partial class Build
     /// <summary>
     /// The framework to build and run <paramref name="projectPath"/> for: the override, else the pinned
     /// <c>Framework</c> -- unless the project does not target it. The Alba-based test projects are
-    /// net10.0-only (Alba 9 has no net9.0 target), and every workflow passes <c>--framework net9.0</c>,
+    /// net10.0-only (Alba 9 has no net11.0 target), and a workflow may pass a <c>--framework</c> a project lacks,
     /// so such a project builds and runs at the highest framework it declares instead of failing
     /// NETSDK1005.
     /// </summary>

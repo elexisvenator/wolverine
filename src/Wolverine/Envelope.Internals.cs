@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json.Serialization;
 using JasperFx.Core;
+using Microsoft.Extensions.Logging;
 using Wolverine.Persistence.Durability;
 using Wolverine.Runtime;
 using Wolverine.Runtime.Serialization;
@@ -49,6 +50,14 @@ public partial class Envelope
         ReplyUri = agent.ReplyUri?.MaybeCorrectScheme(agent.Destination.Scheme);
     }
 
+    /// <summary>
+    /// GH-5167. The group id a message store keeps for this envelope. A message scheduled for an endpoint without
+    /// native scheduling is stored as a wrapper around the real envelope, and the group id is the real envelope's.
+    /// The wrapper itself carries none, so releasing it is not grouped or sharded under the business identifier.
+    /// </summary>
+    [JsonIgnore]
+    public string? StoredGroupId => GroupId ?? (Message as Envelope)?.GroupId;
+
     internal Envelope(object message, IMessageSerializer writer)
     {
         Message = message;
@@ -62,6 +71,14 @@ public partial class Envelope
     /// </summary>
     [JsonIgnore]
     public bool WasPersistedInInbox { get; set; }
+
+    /// <summary>
+    /// GH-5586. Set when this envelope's inbox row was written for any node because its durable local queue was full
+    /// (or latched) when the envelope joined a transaction. The flush after the commit leaves it in the inbox for
+    /// recovery instead of waiting for room in the queue.
+    /// </summary>
+    [JsonIgnore]
+    internal bool LeftInInboxForRecovery { get; set; }
 
     /// <summary>
     /// GH-4135. Guards against reporting IMessageTracker.Received more than once for a single
@@ -227,7 +244,7 @@ public partial class Envelope
     /// Returns the elapsed handler execution time in fractional milliseconds, or -1 if timing
     /// never started. Previously this truncated to whole milliseconds, which — combined with the
     /// callers' "only record positive values" guard — silently dropped every sub-millisecond
-    /// execution and biased the wolverine-execution-time histogram upward for fast handlers
+    /// execution and biased the wolverine.execution.time histogram upward for fast handlers
     /// (GH-3490).
     /// </summary>
     internal double StopTiming()
@@ -340,6 +357,19 @@ public partial class Envelope
     }
 
     /// <summary>
+    ///     GH-5138. A copy of a received envelope for one of several handler chains that each run it inline, so
+    ///     that each one has an envelope of its own: its own id, attempt count and response
+    /// </summary>
+    internal Envelope CloneForInlineInvocation()
+    {
+        var copy = (Envelope)MemberwiseClone();
+        copy.Id = IdGenerator();
+        copy.Attempts = 0;
+        copy.Response = null;
+        return copy;
+    }
+
+    /// <summary>
     ///     Create a new Envelope that is a response to the current
     ///     Envelope
     /// </summary>
@@ -370,6 +400,26 @@ public partial class Envelope
 
         return child;
     }
+
+    /// <summary>
+    /// GH-5556. On the Fault&lt;T&gt; that compensates a saga's own failed handler in this process: the live exception,
+    /// so a <c>Compensate(T, TException)</c> method can take it. Never serialized
+    /// </summary>
+    internal Exception? CompensatingException { get; set; }
+
+    /// <summary>
+    /// GH-5661. The FailureLogLevel of the handler executing this envelope, stamped by the executor before the
+    /// handler runs, so a requeue or reschedule logs at the level of the handler that actually failed. Asking the
+    /// handler graph for "the" handler of the message type instead throws for a message type handled by more
+    /// than one handler type (separated mode). Never serialized
+    /// </summary>
+    internal LogLevel? HandlerFailureLogLevel { get; set; }
+
+    /// <summary>
+    /// GH-5554. The durable faults to write in the same transaction as this envelope's dead-letter move, while it is
+    /// being moved. Never serialized
+    /// </summary>
+    internal DeadLetterFaults? DeadLetterFaults { get; set; }
 
     internal ValueTask StoreAndForwardAsync()
     {
@@ -521,6 +571,28 @@ public partial class Envelope
         }
     }
 
+    /// <summary>
+    ///     Serializes the message now when its serializer is an <see cref="IAsyncMessageSerializer" />, so that a
+    ///     later synchronous read of <see cref="Data" />, like the one every message store does when it writes the
+    ///     envelope, finds the bytes in place instead of blocking on the async serializer
+    /// </summary>
+    internal ValueTask SerializeAheadAsync()
+    {
+        return Serializer is IAsyncMessageSerializer && _message != null ? EnsureDataAsync() : ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    ///     Serializes the message unless the bytes already exist, awaiting an <see cref="IAsyncMessageSerializer" />
+    ///     where reading <see cref="Data" /> would block on it
+    /// </summary>
+    internal async ValueTask EnsureDataAsync()
+    {
+        if (MessagePayloadSize == null)
+        {
+            await GetDataAsync().ConfigureAwait(false);
+        }
+    }
+
     internal ValueTask PersistAsync(IEnvelopeTransaction transaction)
     {
         if (Sender is { IsDurable: true })
@@ -642,6 +714,10 @@ public partial class Envelope
 
         // Public / internal settable properties — runtime-only (Envelope.Internals.cs)
         WasPersistedInInbox = false;
+        CompensatingException = null;
+        HandlerFailureLogLevel = null;
+        DeadLetterFaults = null;
+        LeftInInboxForRecovery = false;
         WasTrackedAsReceived = false;
         Serializer = null;
         ResponseType = null;

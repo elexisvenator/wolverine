@@ -137,6 +137,16 @@ const config: UserConfig<DefaultTheme.Config> = {
                         {text: 'Heartbeats', link: '/guide/runtime/heartbeats'},
                         {text: 'Instrumentation and Metrics', link: '/guide/logging'},
                         {text: 'Diagnostics', link: '/guide/diagnostics'},
+                        {
+                            text: 'Analyzers', link: '/guide/analyzers/',
+                            collapsed: true,
+                            items: [
+                                {text: 'WOLV0001: Handler is not public', link: '/guide/analyzers/wolv0001'},
+                                {text: 'WOLV0002: Saga identity member not found', link: '/guide/analyzers/wolv0002'},
+                                {text: 'WOLV0003: Task in a cascading tuple', link: '/guide/analyzers/wolv0003'},
+                                {text: 'WOLV0004: IMessageBus from IHost.Services', link: '/guide/analyzers/wolv0004'},
+                            ]
+                        },
                         {text: 'Health Checks', link: '/guide/health-checks'},
                         {text: 'Serverless Hosting', link: '/guide/serverless'},          
                         {text: 'Test Automation Support', link: '/guide/testing'},
@@ -322,7 +332,9 @@ const config: UserConfig<DefaultTheme.Config> = {
                         {text: 'Durable Inbox and Outbox Messaging', link: '/guide/durability/'},
                         {text: 'Troubleshooting and Leadership Election', link: '/guide/durability/leadership-and-troubleshooting'},
                         {text: 'Connection Budgets', link: '/guide/durability/connection-budgets'},
+                        {text: 'Node Roles: HTTP, Messaging and Durability Nodes', link: '/guide/durability/node-roles'},
                         {text: 'Sagas', link: '/guide/durability/sagas'},
+                        {text: 'Event-Sourced Sagas', link: '/guide/durability/event-sourced-sagas'},
                         {text: 'Unit Testing Aggregate Handlers', link: '/guide/durability/unit-testing-aggregate-handlers'},
                         {text: 'Marten Integration', link: '/guide/durability/marten/',  collapsed: false, items: [
                                 {text: 'Transactional Middleware', link: '/guide/durability/marten/transactional-middleware'},
@@ -334,6 +346,7 @@ const config: UserConfig<DefaultTheme.Config> = {
                                 {text: 'Event Forwarding to Wolverine', link: '/guide/durability/marten/event-forwarding'},
                                 {text: 'Event Subscriptions', link: '/guide/durability/marten/subscriptions'},
                                 {text: 'Subscription/Projection Distribution', link: '/guide/durability/marten/distribution'},
+                                {text: 'Read Your Writes', link: '/guide/durability/marten/read-your-writes'},
                                 {text: 'Sagas', link: '/guide/durability/marten/sagas'},
                                 {text: 'Process Manager via Handlers', link: '/guide/durability/marten/process-manager-via-handlers'},
                                 {text: 'Multi-Tenancy and Marten', link: '/guide/durability/marten/multi-tenancy'},

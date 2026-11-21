@@ -77,10 +77,13 @@ public interface IListeningAgent : IListenerCircuit
     bool ReceiverHasFaulted => false;
 }
 
-public class ListeningAgent : IAsyncDisposable, IDisposable, IListeningAgent
+public class ListeningAgent : IAsyncDisposable, IListeningAgent
 {
     private readonly BackPressureAgent? _backPressureAgent;
     private readonly CircuitBreaker? _circuitBreaker;
+
+    /// <summary>Null unless the endpoint opted into a circuit breaker. Test seam.</summary>
+    internal CircuitBreaker? CircuitBreaker => _circuitBreaker;
     private readonly ILogger _logger;
     private readonly HandlerPipeline _pipeline;
     private readonly WolverineRuntime _runtime;
@@ -130,6 +133,9 @@ public class ListeningAgent : IAsyncDisposable, IDisposable, IListeningAgent
 
     public IListener? Listener { get; private set; }
 
+    /// <summary>Null unless the endpoint enforces back pressure. Test seam.</summary>
+    internal BackPressureAgent? BackPressure => _backPressureAgent;
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
@@ -151,22 +157,11 @@ public class ListeningAgent : IAsyncDisposable, IDisposable, IListeningAgent
         {
             await _circuitBreaker.DisposeAsync();
         }
-        
+
+        _semaphore.Dispose();
+
         Listener = null;
         _receiver = null;
-    }
-
-    public void Dispose()
-    {
-        if (_disposed)
-            return;
-        _disposed = true;
-
-        _receiver?.Dispose();
-        _circuitBreaker?.SafeDisposeSynchronously();
-        _backPressureAgent?.SafeDispose();
-        stopInboxRecovery();
-        _semaphore.Dispose();
     }
 
     // CritterWatch#942 — the receive block's own depth PLUS the members this listener has fed into
@@ -352,6 +347,41 @@ public class ListeningAgent : IAsyncDisposable, IDisposable, IListeningAgent
     /// </param>
     private async ValueTask StopAndDrainCoreAsync(bool latchBeforeDrain, bool drainCompanionQueue = false)
     {
+        // GH-4866. A back pressure resume must never run beside a stop. The stop drops _receiver before it drains,
+        // so for the length of the drain a too-busy listener reads TooBusy with a local count of 0, which is exactly
+        // what the sweep restarts on; and the stop does not hold _semaphore (PauseForInboxRecoveryAsync calls it
+        // with the semaphore held). Counted here, ResumeFromBackPressureAsync declines while any stop is under way,
+        // and a resume that was already starting the listener is waited out first, so the stop then finds the
+        // listener it built and stops that too.
+        Task? resuming;
+        lock (_backPressureGate)
+        {
+            _stopsInProgress++;
+            resuming = _backPressureResume;
+        }
+
+        try
+        {
+            if (resuming != null)
+            {
+#pragma warning disable VSTHRD003 // started by the resume, and waiting it out is the whole point
+                await resuming;
+#pragma warning restore VSTHRD003
+            }
+
+            await stopAndDrainAsync(latchBeforeDrain, drainCompanionQueue);
+        }
+        finally
+        {
+            lock (_backPressureGate)
+            {
+                _stopsInProgress--;
+            }
+        }
+    }
+
+    private async ValueTask stopAndDrainAsync(bool latchBeforeDrain, bool drainCompanionQueue)
+    {
         // GH-3590. Always tear the loop down first -- StartAsync() rebuilds it when this listener becomes
         // the active one again.
         stopInboxRecovery();
@@ -477,7 +507,12 @@ public class ListeningAgent : IAsyncDisposable, IDisposable, IListeningAgent
         await StartAsync();
     }
 
-    public async ValueTask StartAsync()
+    public ValueTask StartAsync()
+    {
+        return startAsync(CircuitBreakerResetReason.ExplicitStart);
+    }
+
+    private async ValueTask startAsync(CircuitBreakerResetReason reason)
     {
         if (Status == ListeningStatus.Accepting)
         {
@@ -490,7 +525,7 @@ public class ListeningAgent : IAsyncDisposable, IDisposable, IListeningAgent
         // endpoint. Without the lock, two overlapping starts both got past the Accepting check above, both built a
         // full listener set, and the second replaced Listener -- leaving the first set's broker consumers attached
         // to the queue with nothing that would ever stop them. No caller holds _semaphore when it calls this, and
-        // nothing under startAsync() calls back into this agent's locked methods.
+        // nothing under startListenerAsync() calls back into this agent's locked methods.
         await _semaphore.WaitAsync();
         try
         {
@@ -499,15 +534,82 @@ public class ListeningAgent : IAsyncDisposable, IDisposable, IListeningAgent
                 return;
             }
 
-            await startAsync();
+            await startListenerAsync();
         }
         finally
         {
             _semaphore.Release();
         }
+
+        // GH-5446. Outside the semaphore, so an observer that reaches back into this listener cannot deadlock it.
+        // Only a start that actually reached Accepting counts: one refused by an agent restriction leaves the
+        // breaker's reset pending for whichever start does get there.
+        if (Status == ListeningStatus.Accepting && _circuitBreaker != null)
+        {
+            await _circuitBreaker.ListenerResumedAsync(reason, _logger);
+        }
     }
 
-    private async ValueTask startAsync()
+    // GH-4866. Guards _stopsInProgress and _backPressureResume, so a stop and a back pressure resume each see the
+    // other: see StopAndDrainCoreAsync and ResumeFromBackPressureAsync.
+    private readonly object _backPressureGate = new();
+    private int _stopsInProgress;
+    private Task? _backPressureResume;
+
+    /// <summary>
+    /// GH-4866. The back pressure sweep's way back in. Unlike <see cref="StartAsync" /> it only restarts a listener
+    /// that back pressure paused and that nothing has stopped since: the sweep decides from <see cref="Status" /> and
+    /// <see cref="QueueCount" /> before it calls this, and a stop can land in between, or already be draining with the
+    /// receiver dropped (a count of 0). Restarting then put the listener, and a global partition slot's companion
+    /// queue, back to work on a slot this node had just given up. Answers whether it restarted the listener.
+    /// </summary>
+    internal async ValueTask<bool> ResumeFromBackPressureAsync()
+    {
+        TaskCompletionSource? resuming = null;
+
+        // Same semaphore as StartAsync and MarkAsTooBusyAndStopReceivingAsync, so the TooBusy read below cannot
+        // interleave with either of them
+        await _semaphore.WaitAsync();
+        try
+        {
+            lock (_backPressureGate)
+            {
+                if (Status != ListeningStatus.TooBusy || _stopsInProgress > 0)
+                {
+                    return false;
+                }
+
+                resuming = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _backPressureResume = resuming.Task;
+            }
+
+            await startListenerAsync();
+        }
+        finally
+        {
+            if (resuming != null)
+            {
+                lock (_backPressureGate)
+                {
+                    _backPressureResume = null;
+                }
+
+                resuming.SetResult();
+            }
+
+            _semaphore.Release();
+        }
+
+        // As in startAsync, outside the semaphore
+        if (Status == ListeningStatus.Accepting && _circuitBreaker != null)
+        {
+            await _circuitBreaker.ListenerResumedAsync(CircuitBreakerResetReason.ExplicitStart, _logger);
+        }
+
+        return true;
+    }
+
+    private async ValueTask startListenerAsync()
     {
         // GH-5257. A restarted listener's retries must not see the last stop's signal
         _pipeline.ResetStopping();
@@ -823,6 +925,12 @@ public class ListeningAgent : IAsyncDisposable, IDisposable, IListeningAgent
         // handler pipeline (e.g. via RateLimitContinuation → PauseListenerContinuation).
         // Pre-latching causes DrainAsync to wait for the ActionBlock to drain, which
         // deadlocks because the current message's execute frame is still on the call stack.
+
+        // GH-5446. Not the breaker's pause, so the start that ends it is not a breaker recovery -- even when it
+        // lands on a listener the breaker had paused first. The breaker's own pause goes through
+        // PauseWithDrainAsync and leaves its pending reset alone.
+        _circuitBreaker?.PauseSuperseded();
+
         await PauseCoreAsync(pauseTime, latchBeforeDrain: false);
     }
 
@@ -860,7 +968,7 @@ public class ListeningAgent : IAsyncDisposable, IDisposable, IListeningAgent
         // restarts race in StartAsync, and all but the last set of listeners they build are never stopped: their
         // consumers stay on the broker. The latest pause owns the restart, as in PauseForInboxRecoveryAsync.
         _restarter?.SafeDispose();
-        _restarter = new Restarter(this, pauseTime);
+        _restarter = new Restarter(() => startAsync(CircuitBreakerResetReason.PauseTimeElapsed), pauseTime);
     }
 
     private readonly SemaphoreSlim _semaphore = new(1, 1);
@@ -968,7 +1076,9 @@ internal class Restarter : IDisposable
     private readonly CancellationTokenSource _cancellation;
     private readonly Task<Task> _task;
 
-    public Restarter(IListenerCircuit parent, TimeSpan timeSpan)
+    // GH-5446. A callback rather than the circuit's StartAsync, so the circuit can tell the start a pause's own timer
+    // makes (a breaker recovering after PauseTime) from an explicit one
+    public Restarter(Func<ValueTask> restart, TimeSpan timeSpan)
     {
         _cancellation = new CancellationTokenSource();
         _task = Task.Delay(timeSpan, _cancellation.Token)
@@ -979,7 +1089,7 @@ internal class Restarter : IDisposable
                     return;
                 }
 
-                await parent.StartAsync();
+                await restart();
             }, TaskScheduler.Default);
     }
 
@@ -1084,11 +1194,18 @@ internal class RetryOnInlineChannelCallback : IListener
             _runtime.Logger.LogError(e, "Error trying to mark a message as handled in the transactional inbox");
         }
 
+        // GH-5363. A ParallelListener (ListenerCount > 1) forwards Complete/Defer to envelope.Listener, which is
+        // this callback, so forwarding would recurse forever. An envelope recovered from storage has no broker
+        // delivery on a ParallelListener to settle anyway.
+        if (_inner is ParallelListener) return;
+
         await _inner.CompleteAsync(envelope);
     }
 
     public ValueTask DeferAsync(Envelope envelope)
     {
+        if (_inner is ParallelListener) return ValueTask.CompletedTask;
+
         return _inner.DeferAsync(envelope);
     }
 

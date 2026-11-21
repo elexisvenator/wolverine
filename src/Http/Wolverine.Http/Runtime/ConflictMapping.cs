@@ -1,6 +1,7 @@
 using JasperFx;
 using JasperFx.CodeGeneration;
 using JasperFx.CodeGeneration.Model;
+using JasperFx.Events;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -12,51 +13,107 @@ namespace Wolverine.Http.Runtime;
 /// instead of letting them escape as an unhandled 500.
 ///
 /// <para>
-/// Every optimistic concurrency failure in the stack derives from <see cref="ConcurrencyException"/> --
-/// <c>EventStreamUnexpectedMaxEventIdException</c> from the event store, document revision/version
-/// violations, <c>DcbConcurrencyException</c>, and <c>SagaConcurrencyException</c> -- so this one handler
-/// covers all of them.
+/// GH-5459: this is the one conflict mapping for Marten, Polecat and Fisher alike, because all three throw the
+/// shared JasperFx.Events exception types (or subclasses of them):
 /// </para>
-///
-/// <para>
-/// It deliberately does <b>not</b> cover the store-specific exclusive-lock types, because
-/// <c>Marten.Exceptions.StreamLockedException</c> and <c>Polecat.Exceptions.StreamLockedException</c>
-/// derive from their own store's base exception rather than from <see cref="ConcurrencyException"/>, and
-/// neither type is referenceable from Wolverine.Http. Those are added by
-/// <c>MapMartenConcurrencyFailuresToConflict()</c> and <c>MapPolecatConcurrencyFailuresToConflict()</c> in
-/// the store integration packages, which is why a Marten or Polecat application should call one of those
-/// rather than this one directly.
-/// </para>
+/// <list type="bullet">
+/// <item>Everything deriving from <see cref="ConcurrencyException"/> -- <c>EventStreamUnexpectedMaxEventIdException</c>
+/// from the event store, document revision/version violations, <c>DcbConcurrencyException</c> and
+/// <c>SagaConcurrencyException</c>.</item>
+/// <item><see cref="StreamLockedException"/>, what <c>FetchForExclusiveWriting</c> throws on a contended stream.
+/// As of JasperFx 3.0 it derives from <see cref="ConcurrencyException"/> too; it keeps its own handler so the
+/// lock timeout stays mapped explicitly.</item>
+/// <item><see cref="ExistingStreamIdCollisionException"/>, what <c>StartStream</c> throws when the stream id is
+/// already taken. It is not a <see cref="ConcurrencyException"/>, but it is the same kind of failure from the
+/// client's side: the request conflicts with the current state of the resource.</item>
+/// <item><see cref="DuplicateNaturalKeyException"/>, what a commit throws when a second stream claims a natural key
+/// another stream already has. Not a <see cref="ConcurrencyException"/> either, and a conflict for the same
+/// reason.</item>
+/// </list>
 /// </summary>
 public static class ConcurrencyExceptionMiddleware
 {
-    public static ProblemDetails OnException(ConcurrencyException ex)
+    public static ProblemDetails OnException(ConcurrencyException ex, WolverineHttpOptions options)
     {
-        return ConflictMapping.ToProblemDetails(ex);
+        return ConflictMapping.ToProblemDetails(ex, options);
+    }
+
+    /// <summary>
+    /// GH-5142. The store-agnostic exclusive-lock failure. A lost race for the stream lock, so a 409 the
+    /// client can retry, exactly like an optimistic concurrency failure. A <see cref="ConcurrencyException"/>
+    /// since JasperFx 3.0; generated catch blocks are ordered most-specific first, so the two never collide.
+    /// </summary>
+    public static ProblemDetails OnException(StreamLockedException ex, WolverineHttpOptions options)
+    {
+        return ConflictMapping.ToProblemDetails(ex, options);
+    }
+
+    /// <summary>
+    /// GH-5459. <c>StartStream</c> with an id that already exists, on any of Marten, Polecat or Fisher. The
+    /// stream the client asked to create is already there, so a 409 rather than a 500.
+    /// </summary>
+    public static ProblemDetails OnException(ExistingStreamIdCollisionException ex, WolverineHttpOptions options)
+    {
+        return ConflictMapping.ToProblemDetails(ex, options);
+    }
+
+    /// <summary>
+    /// A second stream claiming a natural key that another stream already has, on any store. The key the client
+    /// asked for is taken, so a 409 rather than a 500.
+    /// </summary>
+    public static ProblemDetails OnException(DuplicateNaturalKeyException ex, WolverineHttpOptions options)
+    {
+        return ConflictMapping.ToProblemDetails(ex, options);
+    }
+
+    /// <summary>
+    /// A commit that fails several version checks at once (Marten's <c>SaveChangesAsync</c> with two
+    /// <c>[UseOptimisticConcurrency]</c> documents, say) throws an <see cref="AggregateException"/> carrying one
+    /// <see cref="ConcurrencyException"/> per failed check. Still a lost race, still the client's to retry.
+    /// </summary>
+    public static ProblemDetails OnException(AggregateException ex, WolverineHttpOptions options)
+    {
+        return ConflictMapping.ToProblemDetails(ex, options);
+    }
+
+    /// <summary>
+    /// Becomes <c>catch (AggregateException ex) when (...)</c>, so an aggregate with anything other than
+    /// concurrency failures in it is not swallowed here but falls through to the sibling catch clauses.
+    /// </summary>
+    public static bool OnExceptionFilter(AggregateException ex)
+    {
+        return ConflictMapping.IsConflict(ex);
     }
 }
 
 /// <summary>
-/// A second stream claiming a natural key another stream already has: the request conflicts with the
-/// state of the store, as a concurrency failure does. <see cref="JasperFx.Events.DuplicateNaturalKeyException"/>
-/// derives from <see cref="Exception"/> rather than <see cref="ConcurrencyException"/>, so the handler
-/// above does not see it. It is store-agnostic, which is why it is mapped here rather than per store.
-/// </summary>
-public static class DuplicateNaturalKeyMiddleware
-{
-    public static ProblemDetails OnException(JasperFx.Events.DuplicateNaturalKeyException ex)
-    {
-        return ConflictMapping.ToProblemDetails(ex);
-    }
-}
-
-/// <summary>
-/// GH-4512. The one place a conflict ProblemDetails is shaped, so the core middleware and the store-specific
-/// ones registered from Wolverine.Http.Marten / Wolverine.Http.Polecat cannot drift apart.
+/// GH-4512. The one place a conflict ProblemDetails is shaped.
 /// </summary>
 public static class ConflictMapping
 {
     public const int ConflictStatusCode = 409;
+
+    /// <summary>
+    /// True when the aggregate is non-empty and every leaf exception, however deeply nested, is a
+    /// <see cref="ConcurrencyException"/>.
+    /// </summary>
+    public static bool IsConflict(AggregateException ex)
+    {
+        var inner = ex.Flatten().InnerExceptions;
+        return inner.Count > 0 && inner.All(x => x is ConcurrencyException);
+    }
+
+    /// <summary>
+    /// Shape the conflict response, using the factory registered through
+    /// <see cref="WolverineHttpOptions.ConflictProblemDetailsFactory"/> when there is one and the default
+    /// otherwise.
+    /// </summary>
+    public static ProblemDetails ToProblemDetails(Exception ex, WolverineHttpOptions options)
+    {
+        var problem = options.ConflictProblemDetailsFactory?.Invoke(ex) ?? ToProblemDetails(ex);
+        problem.Status ??= ConflictStatusCode;
+        return problem;
+    }
 
     public static ProblemDetails ToProblemDetails(Exception ex)
     {

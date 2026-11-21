@@ -1,3 +1,4 @@
+using System.Data.Common;
 using FailureGroupSamples;
 using JasperFx.Core;
 using JasperFx.Resources;
@@ -179,6 +180,83 @@ public abstract class DeadLetterFailureGroupCompliance : IAsyncLifetime
 
         // ...and the same failure always produces the same key
         (await groupOf(Failures.CardDeclined("something else entirely"))).ShouldBe(cards[0].FailureGroup);
+    }
+
+    [Fact]
+    public async Task saga_id_is_recorded_and_filters_query_replay_and_discard()
+    {
+        if (!supports(DeadLetterCapabilities.SagaIds | DeadLetterCapabilities.OperationCounts)) return;
+
+        var sagaId = Guid.NewGuid().ToString();
+        var otherSagaId = Guid.NewGuid().ToString();
+
+        await deadLetters(3, i => Failures.CardDeclined(i.ToString()), e => e.SagaId = sagaId);
+        await deadLetters(2, i => Failures.CardDeclined(i.ToString()), e => e.SagaId = otherSagaId);
+        await deadLetters(2, i => Failures.OutOfStock(i.ToString()));
+
+        // Recorded from Envelope.SagaId, null when the message had no saga
+        var stored = await all();
+        stored.Count.ShouldBe(7);
+        stored.Count(x => x.SagaId == sagaId).ShouldBe(3);
+        stored.Count(x => x.SagaId == null).ShouldBe(2);
+
+        var byId = await theDeadLetters.DeadLetterEnvelopeByIdAsync(stored.First(x => x.SagaId == sagaId).Id);
+        byId!.SagaId.ShouldBe(sagaId);
+
+        // One saga's dead letters
+        var mine = await all(new DeadLetterEnvelopeQuery { SagaId = sagaId });
+        mine.Count.ShouldBe(3);
+        mine.ShouldAllBe(x => x.SagaId == sagaId);
+
+        // Combines with the other criteria
+        (await all(new DeadLetterEnvelopeQuery { SagaId = sagaId, MessageType = "nonexistent" })).ShouldBeEmpty();
+
+        // And drives the bulk operations
+        var replayed = await theDeadLetters.ReplayMatchingAsync(new DeadLetterEnvelopeQuery { SagaId = sagaId },
+            CancellationToken.None);
+        replayed.Affected.ShouldBe(3);
+        (await all(new DeadLetterEnvelopeQuery { Replayable = true })).ShouldAllBe(x => x.SagaId == sagaId);
+
+        var discarded = await theDeadLetters.DiscardMatchingAsync(
+            new DeadLetterEnvelopeQuery { SagaId = otherSagaId }, CancellationToken.None);
+        discarded.Affected.ShouldBe(2);
+        (await all()).Count.ShouldBe(5);
+
+        (await all(new DeadLetterEnvelopeQuery { SagaId = "no-such-saga" })).ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task tag_is_recorded_and_filters_query_and_discard()
+    {
+        if (!supports(DeadLetterCapabilities.Tags | DeadLetterCapabilities.OperationCounts)) return;
+
+        // GH-5556: written from the dead-letter tag header a saga's compensation stamps
+        await deadLetters(2, i => Failures.CardDeclined(i.ToString()),
+            e => e.Headers[DeadLetterQueueConstants.DeadLetterTagHeader] = DeadLetterQueueConstants.CompensatedTag);
+        await deadLetters(1, i => Failures.CardDeclined(i.ToString()),
+            e => e.Headers[DeadLetterQueueConstants.DeadLetterTagHeader] = DeadLetterQueueConstants.CompensationFailedTag);
+        await deadLetters(2, i => Failures.OutOfStock(i.ToString()));
+
+        var stored = await all();
+        stored.Count.ShouldBe(5);
+        stored.Count(x => x.Tag == DeadLetterQueueConstants.CompensatedTag).ShouldBe(2);
+        stored.Count(x => x.Tag == null).ShouldBe(2);
+
+        var byId = await theDeadLetters.DeadLetterEnvelopeByIdAsync(
+            stored.First(x => x.Tag == DeadLetterQueueConstants.CompensationFailedTag).Id);
+        byId!.Tag.ShouldBe(DeadLetterQueueConstants.CompensationFailedTag);
+
+        var compensated = await all(new DeadLetterEnvelopeQuery { Tag = DeadLetterQueueConstants.CompensatedTag });
+        compensated.Count.ShouldBe(2);
+        compensated.ShouldAllBe(x => x.Tag == DeadLetterQueueConstants.CompensatedTag);
+
+        (await all(new DeadLetterEnvelopeQuery { Tag = DeadLetterQueueConstants.CompensatedTag, MessageType = "nonexistent" }))
+            .ShouldBeEmpty();
+
+        var discarded = await theDeadLetters.DiscardMatchingAsync(
+            new DeadLetterEnvelopeQuery { Tag = DeadLetterQueueConstants.CompensatedTag }, CancellationToken.None);
+        discarded.Affected.ShouldBe(2);
+        (await all()).Count.ShouldBe(3);
     }
 
     [Fact]
@@ -604,5 +682,94 @@ public abstract class RelationalDeadLetterFailureGroupCompliance : DeadLetterFai
 
         await thePersistence.Inbox.MoveToDeadLetterStorageAsync(envelope, Failures.CardDeclined("again"));
         (await theDeadLetters.DeadLetterEnvelopeByIdAsync(envelope.Id))!.ReplayCount.ShouldBe(0);
+    }
+
+    /// <summary>
+    /// GH-5395. Hold a lock that blocks writes to the dead letter history table until the result is disposed,
+    /// or null for a store that cannot open the race window this way
+    /// </summary>
+    protected virtual Task<IAsyncDisposable?> blockDeadLetterHistoryWritesAsync() =>
+        Task.FromResult<IAsyncDisposable?>(null);
+
+    /// <summary>
+    /// Run <paramref name="lockSql"/> on a connection of its own and keep it open until disposed. A
+    /// transactional lock is released by the commit, any other by <paramref name="releaseSql"/>
+    /// </summary>
+    protected async Task<IAsyncDisposable?> holdLockAsync(string lockSql, string? releaseSql = null)
+    {
+        var database = (IMessageDatabase)thePersistence;
+        var conn = await database.DataSource.OpenConnectionAsync();
+        var tx = releaseSql == null ? await conn.BeginTransactionAsync() : null;
+
+        await using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = lockSql;
+            cmd.Transaction = tx;
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        return new HeldLock(conn, tx, releaseSql);
+    }
+
+    private sealed class HeldLock(DbConnection conn, DbTransaction? tx, string? releaseSql) : IAsyncDisposable
+    {
+        public async ValueTask DisposeAsync()
+        {
+            if (tx != null)
+            {
+                await tx.CommitAsync();
+            }
+            else
+            {
+                await using var cmd = conn.CreateCommand();
+                cmd.CommandText = releaseSql;
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            await conn.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task a_dead_letter_marked_replayable_while_the_move_is_running_is_not_lost()
+    {
+        var envelope = await deadLetter(Failures.CardDeclined("raced"));
+
+        var held = await blockDeadLetterHistoryWritesAsync();
+        if (held == null) Assert.Skip("This store has no way to hold the move between its statements");
+
+        Task moving;
+        Task marking;
+        await using (held)
+        {
+            // The move copies the replayable dead letters (none yet) to the inbox, then stops on the history table
+            moving = moveReplayableDeadLettersAsync();
+            await Task.Delay(1.Seconds());
+            moving.IsCompleted.ShouldBeFalse("The move should be waiting on the history table lock");
+
+            // Marked after the copy and before the delete. Some databases block this until the move commits,
+            // so give it a moment and carry on
+            marking = theDeadLetters.ReplayMatchingAsync(new DeadLetterEnvelopeQuery([envelope.Id]),
+                CancellationToken.None);
+            await Task.WhenAny(marking, Task.Delay(1.Seconds()));
+        }
+
+        await moving.WaitAsync(30.Seconds());
+        await marking.WaitAsync(30.Seconds());
+
+        // Wherever the move left it, it has to be somewhere
+        var inbox = await thePersistence.Admin.AllIncomingAsync();
+        var stillDeadLettered = await theDeadLetters.DeadLetterEnvelopeByIdAsync(envelope.Id);
+        (inbox.Any(x => x.Id == envelope.Id) || stillDeadLettered != null)
+            .ShouldBeTrue("The replayed message is in neither the inbox nor the dead letter queue");
+
+        // and the next pass delivers it, recording one replay
+        await moveReplayableDeadLettersAsync();
+
+        (await thePersistence.Admin.AllIncomingAsync()).ShouldContain(x => x.Id == envelope.Id);
+        (await theDeadLetters.DeadLetterEnvelopeByIdAsync(envelope.Id)).ShouldBeNull();
+
+        await thePersistence.Inbox.MoveToDeadLetterStorageAsync(envelope, Failures.CardDeclined("again"));
+        (await theDeadLetters.DeadLetterEnvelopeByIdAsync(envelope.Id))!.ReplayCount.ShouldBe(1);
     }
 }

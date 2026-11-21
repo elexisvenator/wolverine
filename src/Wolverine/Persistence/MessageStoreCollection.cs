@@ -128,8 +128,14 @@ public class MessageStoreCollection : IAgentFamily, IAsyncDisposable
 
     public IReadOnlyList<MultiTenantedMessageStore> MultiTenanted => _multiTenanted;
 
+    // GH-5435. Agent Uris that two different databases turned out to share. Remembered, so a tenant database
+    // discovered later with one of these Uris is qualified too, whatever order the databases were found in
+    private readonly HashSet<Uri> _ambiguousAgentUris = new();
+
     private void categorizeStore(IMessageStore store)
     {
+        disambiguateAgentUri(store);
+
         if (_services.TryFind(store.Uri, out var existing))
         {
             if (store.Role == MessageStoreRole.Main && existing.Role != MessageStoreRole.Main)
@@ -140,6 +146,40 @@ public class MessageStoreCollection : IAgentFamily, IAsyncDisposable
         else
         {
             _services = _services.AddOrUpdate(store.Uri, store);
+        }
+    }
+
+    /// <summary>
+    /// GH-5435. A relational store's agent Uri leaves out the server port, so two tenant databases with one name
+    /// on one host but different ports used to share a Uri. Only the first then got a durability agent, and
+    /// the second database's scheduled messages were never released and its dead nodes' work never recovered.
+    /// When that happens, each of the databases that is not the main store switches to a Uri that carries its
+    /// port. A configuration without the collision keeps the Uri it always had.
+    /// </summary>
+    private void disambiguateAgentUri(IMessageStore store)
+    {
+        if (store.Role == MessageStoreRole.Main || store is not IPortQualifiedAgentUri qualifiable) return;
+
+        if (_ambiguousAgentUris.Contains(store.Uri))
+        {
+            qualifiable.UsePortQualifiedUri();
+            return;
+        }
+
+        if (!_services.TryFind(store.Uri, out var existing) || ReferenceEquals(existing, store)) return;
+
+        // The same database reached twice (one database serving several tenant ids, say) is not a collision
+        if (existing is not IPortQualifiedAgentUri other || other.AgentUriPort == qualifiable.AgentUriPort) return;
+
+        var shared = store.Uri;
+        _ambiguousAgentUris.Add(shared);
+        qualifiable.UsePortQualifiedUri();
+
+        if (existing.Role != MessageStoreRole.Main)
+        {
+            _services = _services.Remove(shared);
+            other.UsePortQualifiedUri();
+            _services = _services.AddOrUpdate(existing.Uri, existing);
         }
     }
 
@@ -433,6 +473,11 @@ public class MessageStoreCollection : IAgentFamily, IAsyncDisposable
     }
 
     public string Scheme => PersistenceConstants.AgentScheme;
+
+    /// <summary>
+    ///     GH-5601: the durability agents only go to nodes running the Durability workload
+    /// </summary>
+    public NodeWorkloads RequiredWorkload => NodeWorkloads.Durability;
     public async ValueTask<IReadOnlyList<Uri>> AllKnownAgentsAsync()
     {
         var stores = await FindAllAsync<IMessageStoreWithAgentSupport>();
@@ -507,8 +552,10 @@ public class MessageStoreCollection : IAgentFamily, IAsyncDisposable
         }
 
         alreadyWarned = true;
+        // GH-5601: two causes now, and the message names both, because they look the same from here: the leader
+        // only sees that no node published the durability marker.
         logger.LogWarning(
-            "No node in this Wolverine cluster can run durability agents, so none were assigned and no outgoing envelope recovery, scheduled message processing or node reassignment will happen for any message store. Every node in the cluster started with Durability.DurabilityAgentEnabled = false. Enable it on at least one node.");
+            "No node in this Wolverine cluster can run durability agents, so none were assigned and no outgoing envelope recovery, scheduled message processing or node reassignment will happen for any message store. Either every node started with Durability.DurabilityAgentEnabled = false, or no live node runs the Durability workload (Durability.Workloads). Start at least one node with DurabilityAgentEnabled and the Durability workload.");
     }
 
     internal async Task<IAgent> StartScheduledJobProcessing(IWolverineRuntime runtime)
@@ -642,6 +689,8 @@ public class MessageStoreCollection : IAgentFamily, IAsyncDisposable
             Range = new TimeRange(request.From, request.Until),
             ExceptionMessageMatch = request.ExceptionMessageMatch,
             FailureGroup = request.FailureGroup,
+            SagaId = request.SagaId,
+            Tag = request.Tag,
             Archived = request.Archived
         };
 
@@ -734,7 +783,7 @@ public class MessageStoreCollection : IAgentFamily, IAsyncDisposable
         var key = endpointMessageTypeKey(endpointUri, messageTypeName);
 
         // First chain registered wins, to agree with the handler that will actually run:
-        // HandlerGraph.HandlerFor(messageType, endpoint) selects ByEndpoint.FirstOrDefault(), and this
+        // HandlerGraph.HandlerFor(messageType, endpoint) selects the first chain bound to the endpoint, and this
         // loop walks the chains in that same order. Routing the envelope to a store chosen by a chain
         // that never executes is how GH-3870 left envelopes stranded in the wrong database.
         if (_endpointMessageTypeIsStickyRouted.Contains(key)) return;

@@ -1,5 +1,11 @@
 # Process Manager via Handlers
 
+::: tip
+Wolverine 7.0 has [event-sourced sagas](/guide/durability/event-sourced-sagas): one class per process, with its state in
+its own event stream on Marten, Polecat or Fisher. They remove the friction listed in section 5 of this page, and are
+the place to start for a new event-sourced process. This recipe still works, and still shows how the pieces fit.
+:::
+
 You can build an event-sourced Process Manager with the Wolverine and Marten features that ship today. No new base class, no new package. This guide shows you how, with a worked sample you can clone.
 
 The pattern is complementary to Wolverine's [Saga](/guide/durability/sagas) support, not a replacement. Saga stays the right tool when you want a single class per process, a framework-managed lifecycle, and simple document-backed state. The pattern described here trades that for event-sourced state, a full audit trail, and handlers you can test as pure functions.
@@ -244,7 +250,7 @@ A plain static class. No `[AggregateHandler]` attribute. The handler returns an 
 
 The reason this is not an `[AggregateHandler]`: `AggregateHandlerAttribute` defaults `OnMissing` to `OnMissing.Simple404`. When you apply it to a handler whose aggregate does not yet exist, the middleware short-circuits before your method runs. No events are appended, no exception is thrown, and the failure is silent. `MartenOps.StartStream` is the idiomatic way to express "this command creates the stream" and it matches what the Wolverine test suite does in `src/Persistence/MartenTests/AggregateHandlerWorkflow/`.
 
-One corollary: a duplicated `StartOrderFulfillment` for the same id fails with a `Marten.Exceptions.ExistingStreamIdCollisionException` ("Stream #{id} already exists in the database"). Wolverine propagates this exception through `InvokeMessageAndWaitAsync` with its original type intact; the transaction rolls back cleanly, so the first start's data remains authoritative. If your trigger source may deliver the start command at least once, catch this exception and convert it to an idempotent "already started, ignoring" response; otherwise let the caller guarantee a unique process id at dispatch time. The sample's [`starting_the_same_process_twice_throws_and_first_start_wins`](https://github.com/JasperFx/wolverine/tree/main/src/Samples/ProcessManagerViaHandlers/ProcessManagerViaHandlers.Tests/OrderFulfillment/when_starting_a_fulfillment.cs) test covers this exact scenario.
+One corollary: a duplicated `StartOrderFulfillment` for the same id fails with a `JasperFx.Events.ExistingStreamIdCollisionException` ("Stream with id '{id}' already exists"). Wolverine propagates this exception through `InvokeMessageAndWaitAsync` with its original type intact; the transaction rolls back cleanly, so the first start's data remains authoritative. If your trigger source may deliver the start command at least once, catch this exception and convert it to an idempotent "already started, ignoring" response; otherwise let the caller guarantee a unique process id at dispatch time. The sample's [`starting_the_same_process_twice_throws_and_first_start_wins`](https://github.com/JasperFx/wolverine/tree/main/src/Samples/ProcessManagerViaHandlers/ProcessManagerViaHandlers.Tests/OrderFulfillment/when_starting_a_fulfillment.cs) test covers this exact scenario.
 
 #### Step 4b: Continue handlers
 
@@ -859,7 +865,7 @@ Start: plain static class, returns `IStartStream` via `MartenOps.StartStream<T>`
 
 This is a hard consequence of `AggregateHandlerAttribute.OnMissing` defaulting to `OnMissing.Simple404`. The attribute is designed around "the aggregate exists, load it, enforce concurrency." It does not naturally model "this command creates the aggregate." `MartenOps.StartStream` is the idiomatic workaround and it is fine once you know it, but you cannot hide the asymmetry from the reader.
 
-One related trap worth flagging: the `ExistingStreamIdCollisionException` raised on a duplicate start inherits from `MartenException`, **not** from `ConcurrencyException`, so a Wolverine retry or error policy scoped to `ConcurrencyException` will not cover duplicate-start failures. Scope the policy to `MartenException` (or to `ExistingStreamIdCollisionException` specifically) if you want to catch them.
+One related trap worth flagging: the `JasperFx.Events.ExistingStreamIdCollisionException` raised on a duplicate start does **not** derive from `ConcurrencyException`, so a Wolverine retry or error policy scoped to `ConcurrencyException` will not cover duplicate-start failures. Scope the policy to `ExistingStreamIdCollisionException` if you want to catch them. (On an HTTP endpoint, Wolverine.Http's default conflict mapping does answer it with a 409.)
 
 ### Silent failure mode if you misapply `[AggregateHandler]` to a start handler
 
@@ -876,6 +882,11 @@ The per-step idempotency guard (`if (state.PaymentConfirmed) yield break;`) depe
 ### No first-class test helper for "wait for scheduled message to fire"
 
 `InvokeMessageAndWaitAsync` waits for the cascading work of a single dispatch. A delayed message held by the scheduler is not tracked by that call. The sample's timeout tests use a polling helper (`WaitForCondition` in the test project) which works fine but is extra code every sample project will reinvent. If you write several timeout tests, consider lifting the helper into a shared test utility.
+
+Wolverine 7.0's [event-sourced sagas](/guide/durability/event-sourced-sagas) remove most of these: one class per
+process, the same method shape for starting and continuing, completion through an event that Wolverine checks before
+every handler, an Inline snapshot registered for you (and Async refused), and `PlayScheduledMessagesAsync()` for
+timeouts.
 
 ## 6. When to Use Saga Instead
 

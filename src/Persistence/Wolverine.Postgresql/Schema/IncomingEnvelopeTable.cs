@@ -1,4 +1,5 @@
-﻿using Weasel.Core;
+﻿using System.Data.Common;
+using Weasel.Core;
 using Weasel.Postgresql;
 using Weasel.Postgresql.Tables;
 using Wolverine.RDBMS;
@@ -30,8 +31,15 @@ internal class IncomingEnvelopeTable : Table
         
         
         AddColumn<DateTimeOffset>(DatabaseConstants.KeepUntil);
+
+        // GH-5167: the envelope's GroupId, so scheduled message management can find, cancel and reschedule the
+        // scheduled messages of one business identifier (booking/{id}). Nullable, so an existing table migrates
+        // by gaining a column that is null for every row already there.
+        AddColumn<string>(DatabaseConstants.GroupId);
         
-        if (durability.InboxStaleTime.HasValue)
+        // GH-5193: always created (unless AlwaysProvisionOptionalSchemaObjects is off), whether or not
+        // InboxStaleTime is set; only the statements that read and write it follow InboxStaleTime
+        if (durability.ProvisionsIncomingTimestamp)
         {
             AddColumn<DateTimeOffset>(DatabaseConstants.Timestamp).DefaultValueByExpression("now()");
         }
@@ -80,5 +88,35 @@ internal class IncomingEnvelopeTable : Table
             Columns = [DatabaseConstants.KeepUntil],
             Predicate = $"{DatabaseConstants.Status} = 'Handled'"
         });
+
+        // GH-5346: the scheduled-message poll asks `status = 'Scheduled' and execution_time <= now
+        // order by execution_time limit N` every ScheduledJobPollingTime, inside the advisory-lock
+        // transaction, and nothing above serves it — a full scan plus a sort of an inbox dominated by
+        // retained Handled rows. SQL Server got this index in GH-4318. Partial on the Scheduled slice
+        // so the poll is an index range scan already in execution_time order, and an empty probe when
+        // nothing is due. The durability pass's due-scheduled load and count and the scheduled-message
+        // admin listing filter on the same slice.
+        Indexes.Add(new IndexDefinition(PostgresqlIdentifier.Shorten($"idx_{DatabaseConstants.IncomingTable}_scheduled"))
+        {
+            Columns = [DatabaseConstants.ExecutionTime],
+            Predicate = $"{DatabaseConstants.Status} = 'Scheduled'"
+        });
+
+        // GH-5167: serves ScheduledMessageQuery.GroupId (query, cancel, reschedule by group), partial on the Scheduled slice
+        Indexes.Add(new IndexDefinition(PostgresqlIdentifier.Shorten($"idx_{DatabaseConstants.IncomingTable}_group_id"))
+        {
+            Columns = [DatabaseConstants.GroupId],
+            Predicate = $"{DatabaseConstants.Status} = 'Scheduled'"
+        });
+    }
+
+    /// <summary>
+    /// GH-5519. Rebuilds a partitioned inbox as an unpartitioned one in a way PostgreSQL accepts, see
+    /// <see cref="IncomingEnvelopeTableDelta" />
+    /// </summary>
+    public override async Task<ISchemaObjectDelta> CreateDeltaAsync(DbDataReader reader, CancellationToken ct = default)
+    {
+        var delta = (TableDelta)await base.CreateDeltaAsync(reader, ct);
+        return new IncomingEnvelopeTableDelta(this, delta.Actual);
     }
 }

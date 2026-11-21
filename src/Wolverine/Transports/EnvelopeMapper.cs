@@ -67,24 +67,15 @@ public interface IEnvelopeMapper
 /// </remarks>
 public abstract class EnvelopeMapper<TIncoming, TOutgoing> : IEnvelopeMapper<TIncoming, TOutgoing>, IEnvelopeMapper
 {
-    // Shared with EnvelopeSerializer.tryReadTimestamp so that the reader always understands what this
-    // writer emits — the two drifting apart is GH-3613.
+    // Retained for persisted messages and senders using the legacy header format.
     private const string DateTimeOffsetFormat = EnvelopeConstants.TransportHeaderDateTimeFormat;
 
     /// <summary>
-    ///     Read a timestamp header written in EITHER of the two shapes Wolverine puts on the wire: this
-    ///     mapper's own <see cref="EnvelopeConstants.TransportHeaderDateTimeFormat" />, or the round-trippable
-    ///     <c>"o"</c> that <see cref="Wolverine.Runtime.Serialization.EnvelopeSerializer" /> writes and that any
-    ///     non-Wolverine producer would use.
-    ///
-    ///     <para>This is step ONE of GH-3645. The writers still emit the legacy format; teaching every reader to
-    ///     accept both has to ship first, or a mixed-version fleet would silently bind <c>null</c> for
-    ///     <c>ScheduledTime</c> / <c>DeliverBy</c> when a newer sender met an older receiver — which is exactly
-    ///     the failure GH-1716 and GH-3613 were. Flipping the writers is a separate, later change.</para>
+    ///     Accept both legacy transport timestamps and the invariant round-trip format used by writers.
     /// </summary>
     internal static bool TryParseTimestamp(string? raw, out DateTimeOffset value)
     {
-        // Tried first: it is still what this mapper writes, so it is the common case on the wire today.
+        // Preserve compatibility with legacy senders and persisted headers.
         if (DateTimeOffset.TryParseExact(raw, DateTimeOffsetFormat, null, DateTimeStyles.AssumeUniversal,
                 out value))
         {
@@ -327,13 +318,26 @@ public abstract class EnvelopeMapper<TIncoming, TOutgoing> : IEnvelopeMapper<TIn
 
     private delegate bool ReadHeader(Envelope env, TIncoming incoming, string key, out string? value);
 
+    /// <summary>
+    /// When true alongside <see cref="preferCopiedIncomingHeaders"/>, <see cref="writeIncomingHeaders"/> copies
+    /// every incoming header, the last occurrence of a repeated key winning. A key missing from the copy is then
+    /// missing from the transport message, so the readers skip the <see cref="tryReadIncomingHeader"/> scan; only a
+    /// key copied with a null value is still read from the message.
+    /// </summary>
+    protected virtual bool incomingHeaderCopyIsComplete => false;
+
     private bool tryReadCopiedOrIncomingHeader(Envelope env, TIncoming incoming, string key, out string? value)
     {
         // HasHeaders first: this probe runs once per reserved property (~20x) per incoming
         // message, and must not be the thing that forces the lazy dictionary into existence
-        if (env.HasHeaders && env.Headers.TryGetValue(key, out value) && value != null)
+        if (env.HasHeaders && env.Headers.TryGetValue(key, out value))
         {
-            return true;
+            if (value != null) return true;
+        }
+        else if (incomingHeaderCopyIsComplete)
+        {
+            value = null;
+            return false;
         }
 
         return tryReadIncomingHeader(incoming, key, out value);
@@ -616,13 +620,13 @@ public abstract class EnvelopeMapper<TIncoming, TOutgoing> : IEnvelopeMapper<TIn
     {
         if (value.HasValue)
         {
-            writeOutgoingHeader(outgoing, key, value.Value.ToUniversalTime().ToString(DateTimeOffsetFormat));
+            writeOutgoingHeader(outgoing, key, value.Value.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture));
         }
     }
 
     protected void writeDateTimeOffset(TOutgoing outgoing, string key, DateTimeOffset value)
     {
-        writeOutgoingHeader(outgoing, key, value.ToUniversalTime().ToString(DateTimeOffsetFormat));
+        writeOutgoingHeader(outgoing, key, value.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture));
     }
 
     protected Guid readGuid(TIncoming incoming, string key)

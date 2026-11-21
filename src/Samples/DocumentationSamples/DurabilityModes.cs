@@ -97,10 +97,6 @@ public class DurabilityModes
 
                 // Optional. This is already 60 seconds under ServerlessWithOutbox
                 opts.Durability.OutboxStaleTime = 1.Minutes();
-
-                // Optional. Adds an index on the outgoing envelope table's
-                // timestamp column for the durability pass to use
-                opts.Durability.EnableOutgoingTimestampIndex = true;
             }).StartAsync();
 
         #endregion
@@ -121,7 +117,7 @@ public class DurabilityModes
 
                 // Take the durability pass lock inside a transaction that stays
                 // open for the pass, so it is taken and released on the same
-                // server connection. Don't use this with Marten's async daemon
+                // server connection
                 opts.Durability.UseTransactionScopedDurabilityPassLock = true;
             }).StartAsync();
 

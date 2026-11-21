@@ -47,6 +47,25 @@ namespace Wolverine.EntityFrameworkCore.Codegen;
     Justification = "EFCore codegen frame provider — closed generics over runtime DbContext / entity types at codegen time. See AOT guide.")]
 internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
 {
+    /// <summary>
+    ///     GH-5572. Completed sagas can be retained, as long as the DbContext maps <see cref="Saga.CompletedAt" />:
+    ///     otherwise the completion would not be saved and the saga would be handled again.
+    /// </summary>
+    public SagaRetentionSupport SagaRetentionSupportFor(Type sagaType, IServiceContainer container)
+    {
+        var dbContextType = DetermineDbContextType(sagaType, container);
+
+        using var nested = container.Services.CreateScope();
+        var context = resolveDbContext(nested, dbContextType);
+        if (context.Model.FindEntityType(sagaType)?.FindProperty(nameof(Saga.CompletedAt)) is null)
+        {
+            throw new InvalidSagaException(
+                $"Completed sagas of type {sagaType.FullNameInCode()} are retained, but {nameof(Saga.CompletedAt)} is not mapped for it in DbContext {dbContextType.FullNameInCode()}. Map the property (and add a migration) to retain completed sagas.");
+        }
+
+        return SagaRetentionSupport.Supported;
+    }
+
     public const string UsingEfCoreTransaction = "uses_efcore_transaction";
     public const string TransactionModeKey = "TransactionMiddlewareMode";
     private ImHashMap<Type, Type?> _dbContextTypes = ImHashMap<Type, Type?>.Empty;
@@ -54,6 +73,41 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
     private ImHashMap<Type, bool> _retryingExecutionStrategies = ImHashMap<Type, bool>.Empty;
 
     public TransactionMiddlewareMode DefaultMode { get; set; } = TransactionMiddlewareMode.Eager;
+
+    /// <summary>
+    ///     Global default isolation level for the explicit transaction Eager mode opens. Null means
+    ///     "let the database provider choose", the behavior before this existed.
+    /// </summary>
+    public System.Data.IsolationLevel? DefaultIsolationLevel { get; set; }
+
+    /// <summary>
+    ///     Resolves the isolation level for a chain: the chain tag (set by TransactionalAttribute.Modify),
+    ///     then a [Transactional] attribute read directly, then <see cref="DefaultIsolationLevel" />.
+    /// </summary>
+    internal System.Data.IsolationLevel? ResolveIsolationLevel(IChain chain)
+    {
+        if (chain.Tags.TryGetValue(TransactionalAttribute.IsolationLevelKey, out var level))
+        {
+            return (System.Data.IsolationLevel)level;
+        }
+
+        foreach (var call in chain.HandlerCalls())
+        {
+            var methodAttr = call.Method.GetCustomAttribute<TransactionalAttribute>();
+            if (methodAttr is { IsIsolationLevelExplicitlySet: true })
+            {
+                return methodAttr.IsolationLevel;
+            }
+
+            var typeAttr = call.HandlerType.GetCustomAttribute<TransactionalAttribute>();
+            if (typeAttr is { IsIsolationLevelExplicitlySet: true })
+            {
+                return typeAttr.IsolationLevel;
+            }
+        }
+
+        return DefaultIsolationLevel;
+    }
 
     public void RegisterAbstraction(Type abstractionType, Type dbContextType)
     {
@@ -447,12 +501,12 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
                 var createContext = createTenantedDbContext(chain, container, dbContextType);
 
                 chain.Middleware.Insert(0, createContext);
-                chain.Middleware.Insert(0, new StartDatabaseTransactionForDbContext(dbContextType, chain.Idempotency));
+                chain.Middleware.Insert(0, new StartDatabaseTransactionForDbContext(dbContextType, chain.Idempotency, ResolveIsolationLevel(chain)));
                 multiTenantTransaction = true;
             }
             else
             {
-                chain.Middleware.Insert(0, new EnrollDbContextInTransaction(dbContextType, chain.Idempotency));
+                chain.Middleware.Insert(0, new EnrollDbContextInTransaction(dbContextType, chain.Idempotency, ResolveIsolationLevel(chain)));
                 enrolledInTransaction = true;
             }
         }
@@ -825,12 +879,12 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
             {
                 var createContext = createTenantedDbContext(chain, container, dbType);
                 chain.Middleware.Insert(0, createContext);
-                chain.Middleware.Insert(0, new StartDatabaseTransactionForDbContext(dbType, chain.Idempotency));
+                chain.Middleware.Insert(0, new StartDatabaseTransactionForDbContext(dbType, chain.Idempotency, ResolveIsolationLevel(chain)));
                 multiTenantTransaction = true;
             }
             else
             {
-                chain.Middleware.Insert(0, new EnrollDbContextInTransaction(dbType, chain.Idempotency));
+                chain.Middleware.Insert(0, new EnrollDbContextInTransaction(dbType, chain.Idempotency, ResolveIsolationLevel(chain)));
                 enrolledInTransaction = true;
             }
         }

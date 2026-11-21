@@ -1,8 +1,10 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using System.Reflection;
 using Microsoft.Extensions.Logging;
 using Wolverine.Runtime;
+using Wolverine.Transports;
 using Wolverine.Runtime.Serialization.Encryption;
 using Wolverine.Util;
 
@@ -14,7 +16,7 @@ internal sealed class FaultPublisher : IFaultPublisher
     private readonly IWolverineRuntime _runtime;
     private readonly ILogger<FaultPublisher> _logger;
     private readonly Counter<int> _publishFailedCounter;
-    private readonly ConcurrentDictionary<Type, Func<object, ExceptionInfo, Envelope, object>> _factories = new();
+    private readonly ConcurrentDictionary<Type, FaultShape> _shapes = new();
 
     public FaultPublisher(
         FaultPublishingPolicy policy,
@@ -59,43 +61,71 @@ internal sealed class FaultPublisher : IFaultPublisher
         if (messageType.IsValueType) return;
 
         var decision = _policy.Resolve(messageType);
+        var routed = decision.Mode != FaultPublishingMode.None &&
+                     (trigger != FaultTrigger.Discarded || decision.Mode == FaultPublishingMode.DlqAndDiscard);
 
-        if (decision.Mode == FaultPublishingMode.None) return;
-        if (trigger == FaultTrigger.Discarded && decision.Mode != FaultPublishingMode.DlqAndDiscard) return;
+        // GH-5553: the sender asked for this message's fault (FaultTo, ReturnFaultToSender, or a saga that handles
+        // Fault<T>). It goes there when the message is dead-lettered, whether or not fault events are on
+        var replyTo = trigger == FaultTrigger.MovedToErrorQueue ? replyAddressOf(original) : null;
+
+        if (!routed && replyTo is null) return;
 
         try
         {
+            // GH-5146: the Fault<T> constructor and the message type name are worked out once per message
+            // type, and only once a fault is actually going to be published
+            var shape = _shapes.GetOrAdd(messageType, FaultShape.For);
+
             var exceptionInfo = ExceptionInfo.From(
                 exception,
                 decision.IncludeExceptionMessage,
                 decision.IncludeStackTrace);
-            var factory = _factories.GetOrAdd(messageType, BuildFactory);
-            var faultMessage = factory(original.Message, exceptionInfo, original);
+            var faultMessage = shape.Create(original.Message, exceptionInfo, original);
 
-            var options = new DeliveryOptions();
-            options.Headers[FaultHeaders.AutoPublished] = "true";
-            options.Headers[FaultHeaders.OriginalId] = original.Id.ToString();
-            options.Headers[FaultHeaders.OriginalType] = messageType.ToMessageTypeName();
-
-            var router = _runtime.RoutingFor(faultMessage.GetType());
-            var outgoing = router.RouteForPublish(faultMessage, options);
-            if (outgoing is null || outgoing.Length == 0)
+            if (routed)
             {
-                _logger.LogDebug(
-                    "No routes configured for auto-published Fault<{MessageType}>; envelope {EnvelopeId} skipped",
-                    messageType.FullName, original.Id);
-                activity?.AddEvent(new ActivityEvent(
-                    WolverineTracing.FaultNoRoute,
-                    tags: new ActivityTagsCollection
+                var options = faultOptions(original, shape);
+                var router = _runtime.RoutingFor(faultMessage.GetType());
+                var outgoing = router.RouteForPublish(faultMessage, options);
+                if (outgoing is null || outgoing.Length == 0)
+                {
+                    _logger.LogDebug(
+                        "No routes configured for auto-published Fault<{MessageType}>; envelope {EnvelopeId} skipped",
+                        messageType.FullName, original.Id);
+                    activity?.AddEvent(new ActivityEvent(
+                        WolverineTracing.FaultNoRoute,
+                        tags: new ActivityTagsCollection
+                        {
+                            [WolverineTracing.MessageType] = messageType.FullName
+                        }));
+                }
+                else
+                {
+                    await lifecycle.PublishAsync(faultMessage, options);
+                    activity?.AddEvent(new ActivityEvent(WolverineTracing.FaultPublished));
+
+                    // GH-5553: both the routes and the reply address, but only once to any one address
+                    if (replyTo is not null && outgoing.Any(x => sameDestination(x.Destination, replyTo)))
                     {
-                        [WolverineTracing.MessageType] = messageType.FullName
-                    }));
-                return;
+                        replyTo = null;
+                    }
+                }
             }
 
-            await lifecycle.PublishAsync(faultMessage, options);
+            if (replyTo is not null)
+            {
+                var replyOptions = faultOptions(original, shape);
 
-            activity?.AddEvent(new ActivityEvent(WolverineTracing.FaultPublished));
+                // GH-5673: the fault of a saga's undo message stops its sequential unwind
+                if (original.HasHeaders && original.Headers.TryGetValue(Persistence.Sagas.SagaUndo.EntryHeader, out var undoEntry))
+                {
+                    replyOptions.Headers[Persistence.Sagas.SagaUndo.EntryHeader] = undoEntry;
+                    replyOptions.IsResponse = true;
+                }
+
+                await lifecycle.EndpointFor(replyTo).SendAsync(faultMessage, replyOptions);
+                activity?.AddEvent(new ActivityEvent(WolverineTracing.FaultPublished));
+            }
         }
         catch (Exception ex)
         {
@@ -112,21 +142,131 @@ internal sealed class FaultPublisher : IFaultPublisher
         }
     }
 
-    // Reflective construction is fine: this only fires on terminal failures, never on the hot path.
-    private static Func<object, ExceptionInfo, Envelope, object> BuildFactory(Type messageType)
+    private static readonly ConcurrentDictionary<Type, FaultShape> _staticShapes = new();
+
+    /// <summary>
+    /// GH-5556. A Fault&lt;T&gt; for <paramref name="message" />, built as a published fault is
+    /// </summary>
+    internal static object CreateFault(object message, ExceptionInfo exceptionInfo, Envelope envelope)
+        => CreateFault(message.GetType(), message, exceptionInfo, envelope);
+
+    /// <summary>
+    /// GH-5556. A Fault&lt;T&gt; of <paramref name="messageType" />, which <paramref name="message" /> is or derives from
+    /// </summary>
+    internal static object CreateFault(Type messageType, object message, ExceptionInfo exceptionInfo, Envelope envelope)
+        => _staticShapes.GetOrAdd(messageType, FaultShape.For).Create(message, exceptionInfo, envelope);
+
+    // Two local queues reach the same handlers in this process, so a fault routed to one local queue is not sent
+    // again to another
+    private static bool sameDestination(Uri? routed, Uri replyTo)
     {
-        var faultType = typeof(Fault<>).MakeGenericType(messageType);
-        return (msg, info, env) => Activator.CreateInstance(
-            faultType,
-            msg,
-            info,
-            env.Attempts,
-            DateTimeOffset.UtcNow,
-            env.CorrelationId,                                      // string?
-            env.ConversationId,                                     // Guid
-            env.TenantId,                                           // string?
-            env.Source,                                             // string?
-            FilterEncryptionHeaders(env.Headers))!;
+        if (routed is null) return false;
+        if (routed.Equals(replyTo)) return true;
+
+        return routed.Scheme == TransportConstants.Local && replyTo.Scheme == TransportConstants.Local;
+    }
+
+    private static DeliveryOptions faultOptions(Envelope original, FaultShape shape)
+    {
+        var options = new DeliveryOptions();
+        options.Headers[FaultHeaders.AutoPublished] = "true";
+        options.Headers[FaultHeaders.OriginalId] = original.Id.ToString();
+        options.Headers[FaultHeaders.OriginalType] = shape.MessageTypeName;
+        return options;
+    }
+
+    /// <summary>
+    /// GH-5553. Where the sender asked for the fault of <paramref name="original" />: the address in its
+    /// <see cref="FaultHeaders.ReplyTo" /> header, or its reply address for <see cref="FaultHeaders.ReplyToSender" />.
+    /// Null when it asked for nothing, or for an address that cannot be used.
+    /// </summary>
+    private Uri? replyAddressOf(Envelope original)
+    {
+        if (!original.HasHeaders || !original.Headers.TryGetValue(FaultHeaders.ReplyTo, out var value) ||
+            string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        if (value == FaultHeaders.ReplyToSender)
+        {
+            // A receiver fills in its own address when an envelope arrives with no reply address, and sending the
+            // fault there would only send it back to this service
+            if (original.ReplyUri is null || original.ReplyUri.Equals(original.Destination))
+            {
+                _logger.LogWarning(
+                    "Envelope {EnvelopeId} ({MessageType}) asked for its fault to go back to the sender, but it carries no reply address of the sender's. No fault was sent back",
+                    original.Id, original.MessageType);
+                return null;
+            }
+
+            return original.ReplyUri;
+        }
+
+        if (Uri.TryCreate(value, UriKind.Absolute, out var uri)) return uri;
+
+        _logger.LogWarning(
+            "Envelope {EnvelopeId} ({MessageType}) asked for its fault to go to '{ReplyTo}', which is not an absolute address. No fault was sent there",
+            original.Id, original.MessageType, value);
+        return null;
+    }
+
+    /// <summary>
+    ///     What <see cref="PublishIfEnabledAsync" /> needs to know about one message type, worked out once.
+    ///     The Fault&lt;T&gt; constructor is bound once into a <see cref="ConstructorInvoker" /> rather than
+    ///     resolved again by <see cref="Activator.CreateInstance(Type, object[])" /> on every failure.
+    /// </summary>
+    private sealed class FaultShape
+    {
+        private static readonly Type[] ConstructorArgumentTail =
+        [
+            typeof(ExceptionInfo), typeof(int), typeof(DateTimeOffset), typeof(string), typeof(Guid),
+            typeof(string), typeof(string), typeof(IReadOnlyDictionary<string, string?>)
+        ];
+
+        private readonly ConstructorInvoker _constructor;
+
+        private FaultShape(ConstructorInvoker constructor, string messageTypeName)
+        {
+            _constructor = constructor;
+            MessageTypeName = messageTypeName;
+        }
+
+        public string MessageTypeName { get; }
+
+        // Only called for a reference type that is not itself a Fault<T>; PublishIfEnabledAsync filters both
+        public static FaultShape For(Type messageType)
+        {
+            return new FaultShape(ConstructorInvoker.Create(findConstructor(messageType)),
+                messageType.ToMessageTypeName());
+        }
+
+        // Reflective construction is fine: this only fires on terminal failures, never on the hot path.
+        private static ConstructorInfo findConstructor(Type messageType)
+        {
+            var faultType = typeof(Fault<>).MakeGenericType(messageType);
+            Type[] argumentTypes = [messageType, ..ConstructorArgumentTail];
+            return faultType.GetConstructor(argumentTypes)
+                   ?? throw new InvalidOperationException($"Unable to find the primary constructor of {faultType}");
+        }
+
+        public object Create(object message, ExceptionInfo info, Envelope envelope)
+        {
+            var arguments = new object?[]
+            {
+                message,
+                info,
+                envelope.Attempts,
+                DateTimeOffset.UtcNow,
+                envelope.CorrelationId, // string?
+                envelope.ConversationId, // Guid
+                envelope.TenantId, // string?
+                envelope.Source, // string?
+                FilterEncryptionHeaders(envelope.Headers)
+            };
+
+            return _constructor.Invoke(arguments.AsSpan());
+        }
     }
 
     // Strip wolverine.encryption.* keys when materializing Fault<T>.Headers.

@@ -34,7 +34,7 @@ namespace Wolverine.Bobcat;
 /// Every member is public, not protected, so a test's own helpers in another class can drive it too.
 /// </para>
 /// </remarks>
-public abstract class WolverineSpec : CritterStackSpec
+public abstract partial class WolverineSpec : CritterStackSpec
 {
     protected WolverineSpec(IHost host, string? storeName = null) : this(new WolverineScenario(host, storeName))
     {
@@ -105,7 +105,12 @@ public abstract class WolverineSpec : CritterStackSpec
         => Scenario.WhenPublished(message, configureTracking, options);
 
     /// <inheritdoc cref="WolverineScenario.WhenScheduledMessagesAreExecuted" />
-    public Task WhenScheduledMessagesAreExecuted(TimeSpan? timeout = null) => Scenario.WhenScheduledMessagesAreExecuted(timeout);
+    public Task WhenScheduledMessagesAreExecuted(TimeSpan? timeout = null, bool playInline = false)
+        => Scenario.WhenScheduledMessagesAreExecuted(timeout, playInline);
+
+    /// <inheritdoc cref="WolverineScenario.WhenTimePasses(TimeSpan, TimeSpan?, bool)" />
+    public Task WhenTimePasses(TimeSpan duration, TimeSpan? timeout = null, bool playInline = false)
+        => Scenario.WhenTimePasses(duration, timeout, playInline);
 
     /// <inheritdoc cref="WolverineScenario.GivenReceived" />
     // An arranged message is run evidence, never the act: the Document role puts its type in the specification's resolved

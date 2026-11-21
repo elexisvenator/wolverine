@@ -59,6 +59,29 @@ public class HttpFSharpFrameTests
     }
 
     [Fact]
+    public void the_endpoint_registry_leaves_the_native_aot_rooting_block_out_of_fsharp()
+    {
+        // GH-5644. The sample assembles the registry as `codegen write --language fsharp` does, rooting block
+        // switched on. The block is C# only: the F# compiler ignores [ModuleInitializer], and the block's
+        // fully qualified sibling names do not resolve from inside their own namespace in F# (FS0039).
+        Code.ShouldContain("type GeneratedHttpEndpointRegistry()");
+        Code.ShouldNotContain("HttpAotRoots");
+        Code.ShouldNotContain("ModuleInitializer");
+    }
+
+    [Fact]
+    public void the_endpoint_registry_is_assembled_with_its_rooting_block_switched_on()
+    {
+        // GH-5644. Without this, the test above could pass only because the block was never asked for. The same
+        // endpoints and registry rendered as C# carry it, sibling registry and generated endpoints included.
+        var csharp = HttpFSharpCodegenSample.GenerateCSharpCode();
+
+        csharp.ShouldContain("class HttpAotRoots");
+        csharp.ShouldContain("typeof(global::Internal.Generated.WolverineHandlers.GeneratedHttpEndpointRegistry)");
+        csharp.ShouldContain("typeof(global::Internal.Generated.WolverineHandlers.GET_fsharp_hello)");
+    }
+
+    [Fact]
     public void write_endpoint_types_uses_runtime_type_resolution()
     {
         // typeof<> in F# cannot resolve F# module types (only class/record/DU types).
@@ -101,9 +124,59 @@ public class HttpFSharpFrameTests
 
         // 4. The release of an unanswered claim is a C# `finally`, which F# cannot express here: `do!` is
         //    illegal in a computation expression's finally. It is split into the end of the `try` and a
-        //    rethrowing `with`, so the guard appears TWICE and `finally` never does.
-        Code.Split("do! _deduplicatedResponses.ReleaseUnansweredAsync").Length.ShouldBe(3);
+        //    rethrowing `with`, so the guard appears TWICE per endpoint and `finally` never does.
+        Code.Split("do! _deduplicatedResponses.ReleaseUnansweredAsync").Length.ShouldBe(5);
         Code.ShouldNotContain("finally");
         Code.ShouldContain("System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw()");
+    }
+
+    [Fact]
+    public void deduplicated_with_response_passes_store_body_only_when_it_is_off()
+    {
+        Code.ShouldContain("(httpContext, scopedDeduplicationId, thingCreated_response, 404), null)");
+        Code.ShouldContain("(httpContext, scopedDeduplicationId, thingCreated_response, 404, false), null)");
+    }
+
+    private static readonly Lazy<string> _readYourWrites =
+        new(HttpFSharpCodegenSample.GenerateReadYourWritesCode, LazyThreadSafetyMode.ExecutionAndPublication);
+
+    [Fact]
+    public void wait_for_projection_reads_the_request_token_before_the_endpoint()
+    {
+        // GH-5401
+        var code = _readYourWrites.Value;
+        const string wait =
+            "do! Wolverine.Http.ConsistencyTokenHeaders.WaitForRequestTokenAsync(httpContext, _documentStore, [| typeof<Wolverine.Http.FSharpContracts.PointsView> |], 5000, messageContext, httpContext.RequestAborted)";
+
+        code.ShouldContain(wait);
+        code.IndexOf(wait, StringComparison.Ordinal)
+            .ShouldBeLessThan(code.IndexOf("ReadYourWritesEndpoints.Post(", StringComparison.Ordinal));
+
+        // The read's own timeout
+        code.ShouldContain("[| typeof<Wolverine.Http.FSharpContracts.PointsView> |], 2000, messageContext");
+    }
+
+    [Fact]
+    public void wait_for_projection_waits_after_the_commit_and_writes_the_headers()
+    {
+        // GH-5401
+        var code = _readYourWrites.Value;
+        const string wait =
+            "let! projectionWait = Wolverine.Persistence.EventSourcing.ReadYourWrites.WaitForAppendedEventsAsync(_documentStore, documentSession, ";
+        const string headers = "Wolverine.Http.ConsistencyTokenHeaders.Write(httpContext, projectionWait)";
+
+        var commit = code.IndexOf("do! documentSession.SaveChangesAsync(", StringComparison.Ordinal);
+        commit.ShouldBeGreaterThan(0);
+        code.IndexOf(wait, StringComparison.Ordinal).ShouldBeGreaterThan(commit);
+        code.IndexOf(headers, StringComparison.Ordinal).ShouldBeGreaterThan(code.IndexOf(wait, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void a_query_session_from_the_document_session_is_an_fsharp_upcast()
+    {
+        // GH-5401: the read endpoint's IQuerySession is the chain's document session, which C# casts
+        _readYourWrites.Value.ShouldContain(
+            "ReadYourWritesEndpoints.Get(id, (documentSession :> Marten.IQuerySession))");
+        _readYourWrites.Value.ShouldNotContain("((Marten.IQuerySession)");
     }
 }

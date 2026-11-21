@@ -33,6 +33,11 @@ Running on PostgreSQL and seeing frequent **"Lost advisory-lock connection"**, *
 :::
 
 
+::: tip
+To keep the durability agents, listeners or projections off some of your nodes -- an HTTP-only tier, say -- see
+[Node Roles](/guide/durability/node-roles).
+:::
+
 ## Solo Mode
 
 Let's say that you're working on an individual development machine and frequently stopping and starting the application.
@@ -112,10 +117,12 @@ using var host = await Host.CreateDefaultBuilder()
 <!-- endSnippet -->
 
 ::: warning
-Turning this on provisions a new `load_factor` column on the `wolverine_nodes` table. If you're running with
-`AutoCreate.None` -- or in a process that doesn't have DDL rights against your database -- apply the schema migration
-*before* you flip the flag on. Every statement that names that column is gated on the flag too, so leaving it off
-migrates nothing and reads nothing.
+Since Wolverine 7.0, the relational message stores always create the nullable `load_factor` column on the
+`wolverine_nodes` table, so turning this on is a configuration change only. Every statement that names that column is
+still gated on the flag, so leaving it off reads and writes nothing. If you call `opts.RestoreV6Defaults()` or set
+`opts.Durability.AlwaysProvisionOptionalSchemaObjects = false`, the column is only created when this flag is on: then, if
+you're running with `AutoCreate.None` -- or in a process that doesn't have DDL rights against your database -- apply the
+schema migration *before* you flip the flag on.
 :::
 
 ### You Have to Supply the Load Monitor
@@ -276,9 +283,9 @@ These metrics can be used to understand when a Wolverine system is distressed wh
 
 Wolverine emits observable gauge metrics for the size of the persisted inbox, outbox, and scheduled message counts:
 
-1. `wolverine-inbox-count` - number of persisted, `Incoming` envelopes in the durable inbox
-2. `wolverine-outbox-count` - number of persisted, `Outgoing` envelopes in the durable outbox
-3. `wolverine-scheduled-count` - number of persisted, `Scheduled` envelopes in the durable inbox
+1. `wolverine.inbox.count` - number of persisted, `Incoming` envelopes in the durable inbox
+2. `wolverine.outbox.count` - number of persisted, `Outgoing` envelopes in the durable outbox
+3. `wolverine.scheduled.count` - number of persisted, `Scheduled` envelopes in the durable inbox
 
 In all cases, if you are using some sort of multi-tenancy where envelopes are stored in separate databsases per tenant,
 the metric names above will be suffixed with ".[database name]".
@@ -350,7 +357,7 @@ on the database's role**:
 
 | Store | Polled by | Starts |
 |-------|-----------|--------|
-| Main and ancillary stores | **Every node** | Immediately at startup |
+| Main and ancillary stores | **Every node** running the `Messaging` [workload](/guide/durability/node-roles) | Immediately at startup |
 | Tenant databases (database-per-tenant) | **Only the node that owns that database's durability agent** | Once agent assignment completes |
 
 Either way a due message executes exactly once. Where every node polls, the poll takes a per-database lock

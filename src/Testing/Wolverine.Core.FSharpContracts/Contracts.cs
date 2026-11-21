@@ -156,3 +156,71 @@ public class CountingSaga : Saga
         }
     }
 }
+
+// -----------------------------------------------------------------------------
+// GH-5556: a saga with a Compensate method gets a Fault<T> chain whose
+// CompensateSagaFrame must render as F#.
+// -----------------------------------------------------------------------------
+
+/// <summary>Starts a <see cref="StockSaga" />.</summary>
+public record StartStock(string Id);
+
+/// <summary>Handled by <see cref="StockSaga" />, and compensated when it fails.</summary>
+public record ReserveStock(string Id);
+
+/// <summary>Cascaded by <see cref="StockSaga" />'s Compensate method.</summary>
+public record StockReleased(string Id);
+
+/// <summary>A minimal saga with a Compensate method over the in-memory store.</summary>
+public class StockSaga : Saga
+{
+    public string? Id { get; set; }
+
+    public static StockSaga Start(StartStock command)
+    {
+        return new StockSaga { Id = command.Id };
+    }
+
+    public void Handle(ReserveStock command)
+    {
+    }
+
+    public StockReleased Compensate(ReserveStock failed, ExceptionInfo ex)
+    {
+        MarkCompleted();
+        return new StockReleased(Id!);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// GH-5665: a saga that records its message history gets a RecordSagaHistoryFrame
+// in its start, continue and retained-NotFound branches, which must render as F#.
+// -----------------------------------------------------------------------------
+
+/// <summary>Starts a <see cref="HistoryRecordingSaga" />.</summary>
+public record StartHistoryRecording(string Id);
+
+/// <summary>Handled by <see cref="HistoryRecordingSaga" />, and by its NotFound once it completed.</summary>
+public record ContinueHistoryRecording(string Id);
+
+/// <summary>A minimal retained saga that records its message history over the in-memory store.</summary>
+[RecordSagaHistory]
+[RetainWhenCompleted(Days = 1)]
+public class HistoryRecordingSaga : Saga
+{
+    public string? Id { get; set; }
+
+    public static HistoryRecordingSaga Start(StartHistoryRecording command)
+    {
+        return new HistoryRecordingSaga { Id = command.Id };
+    }
+
+    public void Handle(ContinueHistoryRecording command)
+    {
+        MarkCompleted();
+    }
+
+    public static void NotFound(ContinueHistoryRecording command)
+    {
+    }
+}

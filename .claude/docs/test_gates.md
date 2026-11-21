@@ -9,7 +9,7 @@ the Docker services each suite needs, and what can safely run side by side on on
 Every gate is a Nuke target, run from the root of the worktree under test:
 
 ```bash
-BOBCAT_RUN_TAG={plan}/{node} ./build.sh <Target> --framework net9.0
+BOBCAT_RUN_TAG={plan}/{node} ./build.sh <Target> --framework net10.0
 ```
 
 - **Exit code 0 is green.** A target fails if any of its projects fails.
@@ -18,7 +18,7 @@ BOBCAT_RUN_TAG={plan}/{node} ./build.sh <Target> --framework net9.0
   (`build/SupervisedTests.cs`): Microsoft.Testing.Platform workers, a fresh-process retry within a
   budget, stall detection, a heartbeat, and the `[Trait("Category", "Flaky")]` exclusion. That is
   the same run CI does; the GitHub workflows call the same targets.
-- `--framework net9.0` matches CI (`.nuke/parameters.json`). Projects that only target net10.0
+- `--framework net10.0` matches CI (`.nuke/parameters.json`). Projects that only target net10.0
   (the Alba-based suites, Polecat) pick net10.0 on their own.
 - **Set `BOBCAT_RUN_TAG` exactly.** It is the only thing that ties the run to the plan node, and the
   gate matches it literally. Do not invent a tag, shorten it or add a timestamp; use the one the plan
@@ -35,6 +35,7 @@ stoat gate run {plan}/{node}                        # from the worktree; the nod
 ./build.sh LocalGate                                # by hand: the suites, then the extras
 ./build.sh LocalGateSuites                          # the suites alone
 ./build.sh LocalGateSuites --gate-only Marten Http  # only suites whose project name contains one of these
+./build.sh LocalGate --gate-with AzureServiceBus    # the whole gate plus the opt-in Azure Service Bus suite
 ./build.sh LocalGate --framework all                # every framework each suite declares (EF Core 9 and 10)
 ```
 
@@ -46,9 +47,8 @@ stoat gate run {plan}/{node}                        # from the worktree; the nod
   CIMartenTenancy, the SQL Server, Polecat, ASB and AWS shards) are one unit here. Each unit's
   supervisor is configured exactly as its CI target's is (`configureSupervisor` in
   `build/SupervisedTests.cs`), and leaves its ledger in `artifacts/test-ledger/LocalGate.*.json`.
-- **Framework.** `.nuke/parameters.json` pins `net9.0`, as in CI; a suite that does not target it runs
-  on its newest. CI's EF Core 10 job (`CIEfCoreNet10`) is only covered by `--framework all` or
-  `--framework net10.0`.
+- **Framework.** `.nuke/parameters.json` pins `net10.0`, as in CI; a suite that does not target it runs
+  on its newest. `--framework all` runs every framework a suite declares (net10.0 and net11.0).
 - **Longest first, under one worker budget** (`--gate-workers`, default half the cores). Durations
   are kept in `.bobcat/gate-durations.json` for the next run's order.
 - **Extras**, which `LocalGate` runs after the suites, one after another, as the ordinary targets
@@ -56,6 +56,10 @@ stoat gate run {plan}/{node}                        # from the worktree; the nod
   `CICodegenTest`, then `CICodegenDrift`. The codegen pair rewrites the generated tree; drift goes last
   and regenerates it, so a green run leaves the tree as it was. A red one leaves the regenerated files
   for you to read (`git checkout -- .` puts them back). Every extra runs even when an earlier one is red.
+- **Opt-in suites.** `Wolverine.AzureServiceBus.Tests` is left out of a default run (the log says it was
+  skipped as opt-in). Include it only when the change touches `src/Transports/Azure`: add
+  `--gate-with AzureServiceBus` to the whole gate, or run it alone with `--gate-only AzureServiceBus`. It is
+  still in the table, not in `NotGated`, so `VerifyLocalGateCoverage` counts it as gated.
 - **The list** is the table at the top of `build/LocalGate.cs`; `build/gates.json` is generated from it
   (`./build.sh LocalGateManifest`). `VerifyLocalGateCoverage` (part of `./build.sh ci`) fails when a
   test project in `wolverine.slnx` is in neither the table nor its `NotGated` list, or when
@@ -110,11 +114,11 @@ code and commit.
 
 | Suite | Command | Docker services |
 |---|---|---|
-| CoreTests | `./build.sh CoreTests --framework net9.0` | none |
-| PostgresqlTests (with PersistenceTests) | `./build.sh CIPostgresql --framework net9.0` and `./build.sh CIPersistence --framework net9.0` (two shards of PostgresqlTests; both make the whole suite) | postgresql, sqlserver, rabbitmq |
-| MartenTests | `./build.sh CIMartenDistribution --framework net9.0`, `./build.sh CIMartenTenancy --framework net9.0` and `./build.sh CIMarten --framework net9.0` (three shards of one project; all three make the whole suite) | postgresql |
-| EfCoreTests | `./build.sh CIEfCore --framework net9.0` | postgresql, sqlserver, rabbitmq |
-| SqlServerTests | `./build.sh CISqlServer --framework net9.0` | sqlserver |
+| CoreTests | `./build.sh CoreTests --framework net10.0` | none |
+| PostgresqlTests (with PersistenceTests) | `./build.sh CIPostgresql --framework net10.0`, `./build.sh CIPostgresqlFeatures --framework net10.0` and `./build.sh CIPersistence --framework net10.0` (three shards of PostgresqlTests; all three make the whole suite) | postgresql, sqlserver, rabbitmq |
+| MartenTests | `./build.sh CIMartenDistribution --framework net10.0`, `./build.sh CIMartenTenancy --framework net10.0` and `./build.sh CIMarten --framework net10.0` (three shards of one project; all three make the whole suite) | postgresql |
+| EfCoreTests (with EfCoreTests.MultiTenancy) | `./build.sh CIEfCore --framework net10.0` and `./build.sh CIEfCoreMultiTenancy --framework net10.0` | postgresql, sqlserver, rabbitmq |
+| SqlServerTests | `./build.sh CISqlServer --framework net10.0` | sqlserver |
 
 `CoreTests` is the one target that compiles the **whole solution** first (`Compile`, after
 `Restore`/`Init`, which also empties `artifacts/` and `results/`); the `CI*` targets build only their
@@ -126,22 +130,22 @@ own projects.
 |---|---|---|---|
 | `CoreTests` | CoreTests | none | full-solution compile first |
 | `CIMessageRouting` | MessageRoutingTests | rabbitmq | `./build.sh ci` runs this after CoreTests |
-| `CIPostgresql` / `CIPersistence` | PostgresqlTests shards (+ PersistenceTests (net9.0) in `CIPersistence`) | postgresql (+ sqlserver, rabbitmq in `CIPersistence`) | |
+| `CIPostgresql` / `CIPostgresqlFeatures` / `CIPersistence` | PostgresqlTests shards (+ PersistenceTests (net10.0) in `CIPersistence`) | postgresql (+ sqlserver, rabbitmq in `CIPersistence`) | |
 | `CISqlServer` | SqlServerTests | sqlserver | 4 workers, one database per lane (`wolverine_w0..`) |
 | `CIMySql` | MySqlTests | mysql | |
 | `CIOracle` | OracleTests | oracle | the slowest image to become ready |
 | `CISqlite` | SqliteTests | none | |
 | `CIFisher` | FisherTests, InMemoryTests | none | |
-| `CIEfCore` / `CIEfCoreNet10` | EfCoreTests (+ EfCoreTests.MultiTenancy on net10.0) | postgresql, sqlserver, rabbitmq | |
+| `CIEfCore` / `CIEfCoreMultiTenancy` | EfCoreTests; EfCoreTests.MultiTenancy (net10.0, own job) | postgresql, sqlserver, rabbitmq | |
 | `CIMartenDistribution` / `CIMartenTenancy` / `CIMarten` | MartenTests shards (+ MartenSubscriptionTests in `CIMarten`) | postgresql | |
 | `CIPolecat` / `CIPolecatWorkflow` / `CIPolecatSagas` | PolecatTests shards (+ PolecatIncidentService.Tests in `CIPolecat`) | sqlserver | net10.0 |
 | `CICosmosDb` | CosmosDbTests, CosmosDbTests.LeaderElection | none from compose | starts its own emulator through Testcontainers (Docker required, dynamic ports) |
-| `CIRavenDb` | RavenDbTests, RavenDbTests.LeaderElection | none | embedded RavenDB server; net9.0 |
+| `CIRavenDb` | RavenDbTests, RavenDbTests.LeaderElection | none | embedded RavenDB server; net10.0 |
 | `CIClaimCheck` | Wolverine.ClaimCheck.*.Tests | postgresql, sqlserver, fake-gcs-server, nats | |
 | `CIAmazonS3` | Wolverine.AmazonS3.Tests | localstack | |
 | `CIAzureBlobStorage` | Wolverine.AzureBlobStorage.Tests | azurite | |
 | `CIAWSSqs` / `CIAWSSqsCompliance` / `CIAWSSns` (`CIAWS` runs all three) | Wolverine.AmazonSqs.Tests, Wolverine.AmazonSns.Tests | localstack, postgresql | |
-| `CIAzureServiceBusLeader` / `CIAzureServiceBusRouting` / `CIAzureServiceBus` | Wolverine.AzureServiceBus.Tests shards | asb-emulator, postgresql | asb-emulator brings asb-sql |
+| `CIAzureServiceBusLeader` / `CIAzureServiceBusRouting` / `CIAzureServiceBus` | Wolverine.AzureServiceBus.Tests shards | asb-emulator, asb-emulator-2, postgresql | each emulator brings its SQL backend; asb-emulator-2 is a tenant namespace for GH-5196 |
 | `CIRabbitMQ` | Wolverine.RabbitMQ.Tests | rabbitmq, postgresql, sqlserver | |
 | `CICircuitBreaking` | CircuitBreakingTests | rabbitmq, postgresql | |
 | `CIKafka` | Wolverine.Kafka.Tests | kafka, postgresql | |
@@ -150,10 +154,11 @@ own projects.
 | `CIPulsar` | Wolverine.Pulsar.Tests | pulsar, postgresql | |
 | `CIRedis` | Wolverine.Redis.Tests | postgresql | |
 | `CIMQTT` | Wolverine.MQTT.Tests | postgresql, sqlserver | |
-| `CIMQTT5` | Wolverine.Mqtt5.Tests | postgresql, sqlserver | |
 | `CIHttp` | Wolverine.Http.Tests | postgresql | |
 | `CIHttpAspVersioning` | Wolverine.Http.AspVersioning.Tests | none | net10.0 |
+| `CIHttpCompat` | Wolverine.Http.Compat.Tests | none | runs net10.0 and net11.0 itself (GH-5147) |
 | `CIGrpc` | Wolverine.Grpc.Tests | none | |
+| `CIAspireHosting` | Wolverine.Aspire.Hosting.Tests | none from compose | starts the AspireWith* sample AppHosts through Aspire.Hosting.Testing, which run their own Pulsar / LocalStack / Pub/Sub emulator containers on random ports; net10.0 |
 | `CIOtel` | TracingTests | rabbitmq | |
 | `CIBobcat` | Wolverine.Bobcat.Tests, Wolverine.Bobcat.Http.Tests, IncidentService.Tests, ProcessManagerViaHandlers.Tests | postgresql, sqlserver | Bobcat.Xunit spec projects |
 | `CIExtensions` | Wolverine.AI, DataAnnotationsValidation, FluentValidation, MemoryPack, MessagePack and Protobuf tests | none | |
@@ -175,6 +180,100 @@ worktree's stack was running. Now every worktree on the box shares whichever sta
 Bringing a stack down is the box owner's call, not a gate's: `docker compose down` in one worktree
 stops only that worktree's containers, but other worktrees may be using them.
 
+### Fresh starts: SQL Server and the Azure Service Bus emulator (GH-5532)
+
+Both pile up state on a box where they live for days: the emulator's SQL backend slowed the ASB suite
+to about 2 minutes per test, and a 5-day-old SQL Server with hundreds of leftover schemas sat at 300%
+CPU. So a run that **owns** one of them starts it fresh: `docker compose -p wolverine up -d
+--force-recreate --renew-anon-volumes <services>`, then the usual readiness probes, before its first
+test (`StartServicesFresh` in `build/FreshContainers.cs`).
+
+| Target | Starts fresh |
+|--------|--------------|
+| `CISqlServer`, `CISqlServerTransport` | `sqlserver` |
+| `CIPolecat*` shards | `sqlserver` |
+| `CIAzureServiceBus`, `CIAzureServiceBusLeader`, `CIAzureServiceBusRouting` | `asb-sql`, `asb-emulator`, plus `asb-sql-2` and `asb-emulator-2` when they are already running. Each shard then starts that second pair if it is not up: `strict_tenancy_5196` uses it as a tenant's own namespace (GH-5196) |
+| `TestAllPersistence` | `sqlserver` (through the `FreshContainers` target, before `DockerUp`) |
+| `TestAllTransports` | the ASB containers, as above (same) |
+| `LocalGate` / `LocalGateSuites` | whichever of the two the selected suites need (any suite with `sqlserver` or `asb-emulator` among its compose services, lanes included), once, after the build and before any unit provisions a database |
+
+Nothing else starts anything fresh: not `DockerUp` (plenty of targets that do not own these services
+depend on it), not the other CI targets that merely use SQL Server, and never a plain `dotnet test`.
+It happens once per service per build, at the start (a degraded service can also be recreated mid-run,
+see the next section). And it is skipped, with a warning and the service reused as it is, when:
+
+- **`--no-fresh-containers`** is passed, or `WOLVERINE_NO_FRESH_CONTAINERS=1` is set: for a developer
+  who wants to keep their data.
+- **Someone is using it.** SQL Server has a session from another client process (a running test host
+  keeps its pooled connections open), or a `Wolverine.AzureServiceBus.Tests` process is running. Every
+  Stoat worker on the box shares the `wolverine-*` containers, and recreating one under another run's
+  tests fails them.
+- **It is not this compose project's container**: another repository's container holding the port.
+- **Another run started it fresh within the last 10 minutes.**
+
+Two runs cannot recreate the same service at once: each holds an exclusive file lock,
+`~/.wolverine/locks/fresh-sqlserver.lock` or `fresh-asb.lock`, through the recreate and the readiness
+wait (a second run waits up to 15 minutes for it). The OS releases it if the build dies. The lock file
+also records when the service was last started fresh, which is what the 10 minute rule reads.
+
+Recreating SQL Server drops every database on it, `wolverine_w0..N-1` lanes included; the runs that
+use them create them after the fresh start, as they always have.
+
+### Recreating a degraded service mid-run (GH-5545)
+
+A run that started SQL Server or the ASB emulator fresh can also recreate it in the middle of the run,
+when the run degrades on it, and carry on. This is for a service that still answers but crawls: SQL
+Server spinning in RESOURCE MONITOR under Docker VM memory pressure, or the emulator's SQL backend full
+of state. Neither fails a test, so a stall threshold never sees it.
+
+Two signals have to agree:
+
+1. **Bobcat's** (JasperFx/bobcat#824, Bobcat.Supervisor 1.1.0): the last 5 completed tests with a known
+   duration each ran more than 10x it, or a test stalled (5 minutes). Bobcat then pauses the run: it
+   kills the workers so nothing is mid-test.
+2. **The service's own probe**, every 15 seconds while the run goes (`build/ServiceHeal.cs`): the last 3
+   probes all unhealthy. SQL Server: a new connection plus a query on `sys.dm_exec_requests` slower than
+   3 seconds, failing, or finding requests waiting 5 seconds or more on `RESOURCE_SEMAPHORE_QUERY_COMPILE`
+   or `RESOURCE_SEMAPHORE`. The emulator: its management api (5300, and 5301 when the second pair runs)
+   slower than 5 seconds, failing, or answering 503.
+
+Slow tests on a service whose probes are healthy recreate nothing: the run resumes. After 2 of those the
+run stops pausing and only reports, so a run that is slow for some other reason is not paused every 5
+tests.
+
+When both agree, the run recreates the service (`--force-recreate --renew-anon-volumes`, readiness
+probes), creates again what the recreate dropped (SqlServerTests' `wolverine_w0..N-1` lanes, or a gate
+suite's own database), and resumes. Every recreate is logged with `!!!! GH-5545: RECREATING ...` and the
+evidence, and shows in the run's report under "Tracks healed" with the pace before and after.
+
+The rules:
+
+- **Only a run that started the service fresh itself.** Not with `--no-fresh-containers` or
+  `WOLVERINE_NO_FRESH_CONTAINERS=1`, not a container another run started fresh a few minutes earlier,
+  not one that was in use when the run started, and never another project's container.
+- **Never under someone else.** The same guards as a fresh start, checked again under the same file
+  lock: another client's SQL Server session or a running `Wolverine.AzureServiceBus.Tests` process
+  stops it (after up to 30 seconds for the run's own killed workers to go). Then the run is **aborted**
+  rather than left to crawl: its results are not worth having.
+- **At most twice per service per run.** A third degradation aborts the run, naming the service.
+
+| Target | May recreate mid-run |
+|--------|----------------------|
+| `CISqlServer`, `CISqlServerTransport`, `CIPolecat*`, `TestAllPersistence` | `sqlserver` |
+| `CIAzureServiceBus*`, `TestAllTransports` | the ASB containers |
+| `LocalGate` / `LocalGateSuites` | the ASB containers, through the `asb-emulator` track. SQL Server only when no two units use it at once: one SQL Server suite (`--gate-only SqlServerTests`), or every SQL Server suite on the `sqlserver` track. In a full gate most SQL Server suites have a database of their own and hold no track, so they run side by side and SQL Server is only reported |
+
+The tests in flight when Bobcat paused the run are retried alone on fresh workers, the rest resume in
+their lanes. **This is not a retry of failed tests.** Nothing here looks at a test's verdict, and a test
+that fails after the recreate is a failure like any other. The retry budget is untouched and none of
+these attempts can make a test read as flaky. The point is that results from a degraded service say
+nothing about the code, so the run throws away the part of the run that was against it and runs it
+again against a healthy one.
+
+Bobcat needs known durations to read the signal. CI targets get CI's from `previous-durations/`;
+LocalGate keeps its own in `.bobcat/test-durations/`, written by every unit that ran clean (no abort,
+no degradation, no recreate), so the first gate run on a box can only detect a stall.
+
 ## Running suites side by side
 
 For Stoat's resource declarations (JasperFx/stoat#101):
@@ -191,8 +290,9 @@ For Stoat's resource declarations (JasperFx/stoat#101):
   on SQL Server (the Postgres equivalent, `postgresDatabasePerLane`, is not used by any target today),
   so two runs that use lanes collide on those names.
 - **Suites with no service** (`CoreTests`, `CISqlite`, `CIFisher`, `CIRavenDb`, `CIGrpc`,
-  `CIHttpAspVersioning`, `CIExtensions`) only compete for CPU and memory. `CICosmosDb` starts its own
-  emulator on dynamic ports, so it does not collide either, but the emulator is heavy.
+  `CIHttpAspVersioning`, `CIHttpCompat`, `CIExtensions`) only compete for CPU and memory. `CICosmosDb` starts its own
+  emulator on dynamic ports, so it does not collide either, but the emulator is heavy. `CIAspireHosting` is the
+  same: Aspire starts each broker and emulator itself, on random host ports.
 - **One target per worktree at a time.** The build writes `bin/` and `obj/` in place, and `CoreTests`
   compiles the whole solution, so two gates in one worktree race on the same outputs.
 - **CPU.** The supervisor clamps a target's workers to half the machine's cores, so a box running

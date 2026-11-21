@@ -3,14 +3,16 @@ using Npgsql;
 using Wolverine.RDBMS;
 using Wolverine.Marten.Persistence.Operations;
 using Wolverine.Persistence.Durability;
+using Wolverine.Persistence.Sagas;
 using Wolverine.Postgresql;
 using Wolverine.RDBMS.MultiTenancy;
 using Wolverine.Runtime;
 using MultiTenantedMessageStore = Wolverine.Persistence.Durability.MultiTenantedMessageStore;
+using Wolverine.RDBMS.Outbox;
 
 namespace Wolverine.Marten;
 
-internal class MartenEnvelopeTransaction : IEnvelopeTransaction
+internal class MartenEnvelopeTransaction : IEnvelopeTransaction, ISagaHistoryTransaction
 {
     private readonly MessageContext _context;
 
@@ -20,21 +22,11 @@ internal class MartenEnvelopeTransaction : IEnvelopeTransaction
     public MartenEnvelopeTransaction(IDocumentSession session, MessageContext context)
     {
         _context = context;
-        if (context.Storage is PostgresqlMessageStore store)
-        {
-            Store = store;
-            _nodeId = store.Durability.OutgoingOwnerId;
-        }
-        else if (context.Storage is MultiTenantedMessageStore { Main: PostgresqlMessageStore s })
-        {
-            Store = s;
-            _nodeId = s.Durability.OutgoingOwnerId;
-        }
-        else
-        {
-            throw new InvalidOperationException(
-                "This Wolverine application is not using Postgresql + Marten as the backing message persistence");
-        }
+        // GH-5144: resolved the same way the session factory resolves it
+        Store = DocumentSessionOutboxSupport.TryResolveMessageStore<PostgresqlMessageStore>(context.Storage)
+                ?? throw new InvalidOperationException(
+                    "This Wolverine application is not using Postgresql + Marten as the backing message persistence");
+        _nodeId = Store.Durability.OutgoingOwnerId;
 
         Session = session;
     }
@@ -66,6 +58,21 @@ internal class MartenEnvelopeTransaction : IEnvelopeTransaction
     {
         return ValueTask.CompletedTask;
     }
+
+    // GH-5665: the saga's history row is queued in the session that saves the saga
+
+    public Task<bool> TryPersistSagaHistoryAsync(SagaHistoryRecord record, CancellationToken token)
+    {
+        Session.QueueOperation(new StoreSagaHistory(Store, record));
+        return Task.FromResult(true);
+    }
+
+    public Task<bool> TryDeleteSagaHistoryAsync(string sagaType, string sagaId, string? tenantId,
+        CancellationToken token)
+    {
+        Session.QueueOperation(new StoreSagaHistory(Store, sagaType, sagaId, tenantId));
+        return Task.FromResult(true);
+    }
     
     public async Task<bool> TryMakeEagerIdempotencyCheckAsync(Envelope envelope, DurabilitySettings settings,
         CancellationToken cancellation)
@@ -90,7 +97,7 @@ internal class MartenEnvelopeTransaction : IEnvelopeTransaction
 
         // Npgsql runs a command in its connection's open transaction, which is the session's
         await using var command = builder.Compile();
-        command.Connection = Session.Connection;
+        command.Connection = await Session.GetConnectionAsync(cancellation);
 
         try
         {

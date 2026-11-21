@@ -5,13 +5,16 @@ namespace Wolverine.Http;
 
 /// <summary>
 /// GH-4742. Deduplicate this endpoint on an idempotency key and answer a repeat of the same request with the
-/// first response: its status, body and <c>Location</c>. A key reused for a different request gets 422, and a
-/// repeat while the first is still running gets 409, unless <see cref="ClaimInTransaction" /> is set.
+/// first response: its status, body and <c>Location</c>, or without the body when <see cref="StoreBody" /> is
+/// false. A key reused for a different request gets 422, and a repeat while the first is still running gets 409,
+/// unless <see cref="ClaimInTransaction" /> is set.
 ///
 /// <para>
 /// Unlike <c>[Deduplicated]</c>, which refuses a repeat, this tells a client whose connection dropped
 /// mid-request what it created. The two cannot be combined. The key is the caller's; the request is compared by
-/// a hash of the bytes sent (method, path, query string and body), so a retry must resend the same bytes.
+/// a hash of the bytes sent (method, path, query string and body), so a retry must resend the same bytes. A
+/// multipart body is compared by its parts, so a retry may use a new boundary, and a form-encoded body by its fields.
+/// The antiforgery token field is left out of a form.
 /// </para>
 ///
 /// <para>
@@ -38,21 +41,48 @@ public class DeduplicatedWithResponseAttribute : ModifyHttpChainAttribute
     /// </param>
     public DeduplicatedWithResponseAttribute(DeduplicationScope scope)
     {
-        Scope = scope;
+        _scope = scope;
     }
 
-    public DeduplicationScope Scope { get; }
+    /// <summary>
+    /// GH-5617. Take the scope, and anything else this attribute leaves unset, from
+    /// <see cref="WolverineHttpOptions.DeduplicateWithResponse" />, so an endpoint can change one setting, such as
+    /// <c>[DeduplicatedWithResponse(StoreBody = false)]</c>, without restating the rest. An endpoint that no
+    /// <c>DeduplicateWithResponse()</c> call covers is refused at startup, as it has no scope.
+    /// </summary>
+    public DeduplicatedWithResponseAttribute()
+    {
+    }
+
+    /// <summary>
+    /// Who a key belongs to, or <see cref="DeduplicationScope.None" /> when it comes from
+    /// <see cref="WolverineHttpOptions.DeduplicateWithResponse" />.
+    /// </summary>
+    public DeduplicationScope Scope => _scope ?? DeduplicationScope.None;
+
+    private readonly DeduplicationScope? _scope;
 
     /// <inheritdoc cref="DeduplicatedWithResponseRequirement.Source" />
-    public ValueSource Source { get; set; } = ValueSource.Anything;
+    public ValueSource Source
+    {
+        get => _source ?? ValueSource.Anything;
+        set => _source = value;
+    }
 
     /// <inheritdoc cref="DeduplicatedWithResponseRequirement.Key" />
     public string? Key { get; set; }
 
     /// <inheritdoc cref="DeduplicatedWithResponseRequirement.Required" />
-    public bool Required { get; set; } = true;
+    public bool Required
+    {
+        get => _required ?? true;
+        set => _required = value;
+    }
 
-    /// <summary>Claim lifetime in seconds; 0 uses <see cref="DurabilitySettings.DeduplicationWindow" />.</summary>
+    /// <summary>
+    /// Claim lifetime in seconds; 0 takes the window from <see cref="WolverineHttpOptions.DeduplicateWithResponse" />,
+    /// else <see cref="DurabilitySettings.DeduplicationWindow" />.
+    /// </summary>
     public int WindowInSeconds { get; set; }
 
     /// <inheritdoc cref="DeduplicatedWithResponseRequirement.ClaimInTransaction" />
@@ -66,9 +96,20 @@ public class DeduplicatedWithResponseAttribute : ModifyHttpChainAttribute
         set => _claimInTransaction = value;
     }
 
+    /// <inheritdoc cref="DeduplicatedWithResponseRequirement.StoreBody" />
+    public bool StoreBody
+    {
+        get => _storeBody ?? true;
+        set => _storeBody = value;
+    }
+
     // Null until somebody actually writes ClaimInTransaction on the attribute, so an endpoint that said nothing can
-    // inherit WolverineHttpOptions.DefaultClaimInTransaction while one that said false keeps false
+    // inherit WolverineHttpOptions.DefaultClaimInTransaction while one that said false keeps false. GH-5617: the same
+    // for Source, Required and StoreBody, which an endpoint may take from WolverineHttpOptions.DeduplicateWithResponse()
     private bool? _claimInTransaction;
+    private ValueSource? _source;
+    private bool? _required;
+    private bool? _storeBody;
 
     public override void Modify(HttpChain chain, GenerationRules rules)
     {
@@ -79,14 +120,14 @@ public class DeduplicatedWithResponseAttribute : ModifyHttpChainAttribute
         }
 
         // The rest is validated with the chain, once every attribute has been applied.
-        chain.DeduplicatedWithResponse = new DeduplicatedWithResponseRequirement
+        chain.DeduplicatedWithResponse = new DeduplicatedWithResponseRequirement(_scope)
         {
-            Scope = Scope,
-            Source = Source,
+            ExplicitSource = _source,
             Key = Key,
-            Required = Required,
+            ExplicitRequired = _required,
             Window = WindowInSeconds == 0 ? null : TimeSpan.FromSeconds(WindowInSeconds),
-            ExplicitClaimInTransaction = _claimInTransaction
+            ExplicitClaimInTransaction = _claimInTransaction,
+            ExplicitStoreBody = _storeBody
         };
     }
 }

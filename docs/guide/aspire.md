@@ -58,13 +58,13 @@ The `...UsingNamedConnection()` methods aren't Aspire specific at all. Anything 
 | [RabbitMQ](/guide/messaging/transports/rabbitmq/) | `UseRabbitMqUsingNamedConnection(name)` | `AddRabbitMQ(name)` |
 | [Kafka](/guide/messaging/transports/kafka) | `UseKafkaUsingNamedConnection(name)` | `AddKafka(name)` |
 | [Azure Service Bus](/guide/messaging/transports/azureservicebus/) | `UseAzureServiceBusUsingNamedConnection(name)` | `AddAzureServiceBus(name)` |
-| [Amazon SQS](/guide/messaging/transports/sqs/) | `UseAmazonSqsTransportUsingNamedConnection(name)` | `AddLocalStack(name)` or `AddFlociAws(name)` (emulators only) |
-| [Amazon SNS](/guide/messaging/transports/sns) | `UseAmazonSnsTransportUsingNamedConnection(name)` | `AddLocalStack(name)` or `AddFlociAws(name)` (emulators only) |
+| [Amazon SQS](/guide/messaging/transports/sqs/) | `UseAmazonSqsTransportUsingNamedConnection(name)` | `AddLocalStack(name)` (WolverineFx.Aspire.Hosting.LocalStack) or `AddFlociAws(name)` (emulators only) |
+| [Amazon SNS](/guide/messaging/transports/sns) | `UseAmazonSnsTransportUsingNamedConnection(name)` | `AddLocalStack(name)` (WolverineFx.Aspire.Hosting.LocalStack) or `AddFlociAws(name)` (emulators only) |
 | [NATS](/guide/messaging/transports/nats) | `UseNatsUsingNamedConnection(name)` | `AddNats(name)` |
 | [Redis](/guide/messaging/transports/redis) | `UseRedisTransportUsingNamedConnection(name)` | `AddRedis(name)` |
-| [Pulsar](/guide/messaging/transports/pulsar) | `UsePulsarUsingNamedConnection(name)` | none yet |
+| [Pulsar](/guide/messaging/transports/pulsar) | `UsePulsarUsingNamedConnection(name)` | `AddPulsar(name)` (WolverineFx.Aspire.Hosting.Pulsar) |
 | [MQTT](/guide/messaging/transports/mqtt) | `UseMqttUsingNamedConnection(name)` | `AddMosquitto(name)` (CommunityToolkit) |
-| [GCP Pub/Sub](/guide/messaging/transports/gcp-pubsub/) | `UsePubsubUsingNamedConnection(projectId, name)` | `AddFlociGcp(name)` (emulator only) |
+| [GCP Pub/Sub](/guide/messaging/transports/gcp-pubsub/) | `UsePubsubUsingNamedConnection(projectId, name)` | `AddPubsubEmulator(name, projectId)` (WolverineFx.Aspire.Hosting.Pubsub) or `AddFlociGcp(name)` (emulators only) |
 
 Every transport above that supports more than one broker also has an
 `AddNamed{Transport}BrokerUsingNamedConnection(brokerName, connectionStringName)` method for applications talking
@@ -130,8 +130,70 @@ The "Named Connection Strings" table comes first, and `describe` still shows it 
 ## Traces, Metrics and Health Checks
 
 The Aspire dashboard only shows what your services export to it over OpenTelemetry, and it won't see anything from
-Wolverine unless you register Wolverine's `ActivitySource` and `Meter`s. The usual place to do that is the "service
-defaults" project that every service in the Aspire solution references. Here's the one the
+Wolverine unless you register Wolverine's `ActivitySource` and `Meter`s.
+
+### WolverineFx.ServiceDefaults <Badge type="tip" text="7.0" />
+
+The `WolverineFx.ServiceDefaults` package does all of that for the whole Critter Stack in one call:
+
+```bash
+dotnet add package WolverineFx.ServiceDefaults
+```
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+
+// AddCritterStackServiceDefaults(), then UseWolverine()
+builder.UseWolverineFromAspire(opts =>
+{
+    opts.PersistMessagesWithPostgresqlUsingNamedConnection("wolverinedb");
+    opts.UseRabbitMqUsingNamedConnection("rabbitmq").AutoProvision();
+});
+
+var app = builder.Build();
+
+// GET /health and GET /alive
+app.MapCritterStackDefaultEndpoints();
+
+app.Run();
+```
+
+and in the AppHost, point Aspire at the readiness endpoint:
+
+```csharp
+builder.AddProject<Projects.MyService>("service")
+    .WithReference(postgres)
+    .WithReference(rabbitmq)
+    .WithHttpHealthCheck("/health");
+```
+
+`builder.AddCritterStackServiceDefaults()` is the same thing without `UseWolverine()`, for a Marten, Polecat or
+Fisher service that doesn't use Wolverine, or when you'd rather call `UseWolverine()` yourself. It registers:
+
+* OpenTelemetry logging, tracing and metrics, exported over OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (the
+  Aspire AppHost sets it for every project resource; run outside of Aspire, nothing is exported).
+* Every Critter Stack `ActivitySource` and `Meter`: `Wolverine*`, `Marten*`, `Polecat*`, `Fisher*` and
+  `CritterWatch*` (the patterns are on `CritterStackTelemetry.ActivitySources` and `CritterStackTelemetry.Meters` if
+  you configure OpenTelemetry yourself), plus the application's own `ApplicationName` source and ASP.NET Core and
+  `HttpClient` instrumentation, with the health endpoints left out of the traces.
+* The health checks below. `/health` runs all of them, `/alive` only the ones tagged `live`:
+
+| Check | Tag | Reports |
+|---|---|---|
+| `self` | `live` | the process is responsive |
+| `wolverine` | `ready` | the Wolverine runtime has started and isn't shutting down |
+| `wolverine-listeners` | `ready` | the [listeners](/guide/health-checks#listener-status-mapping) are accepting messages |
+| `wolverine-transports` | `ready` | the [broker connections](/guide/health-checks#transport-connections) of every transport with a health check |
+
+In an application without Wolverine the three Wolverine checks report `Healthy` with a note.
+
+The two halves are also available separately as `ConfigureCritterStackOpenTelemetry()` and
+`AddCritterStackHealthChecks()`, if you only want half of it.
+
+### Writing your own service defaults
+
+If you'd rather keep the Aspire template's "service defaults" project that every service in the Aspire solution
+references, register the sources and meters there. Here's the one the
 [RabbitMQ](https://github.com/JasperFx/wolverine/tree/main/src/Samples/AspireWithRabbitMq) and
 [Kafka](https://github.com/JasperFx/wolverine/tree/main/src/Samples/AspireWithKafka) Aspire samples share:
 
@@ -169,9 +231,9 @@ public static class ServiceDefaultsExtensions
                 metrics.AddAspNetCoreInstrumentation()
                     .AddHttpClientInstrumentation()
 
-                    // Wolverine publishes its metrics from a Meter named "Wolverine:{ServiceName}",
-                    // so this has to be a wildcard. A bare AddMeter("Wolverine") matches nothing
-                    .AddMeter("Wolverine*");
+                    // Wolverine publishes its metrics from a Meter named "Wolverine" (7.0+);
+                    // the service is identified by the resource (OTEL_SERVICE_NAME) and the "source" tag
+                    .AddMeter("Wolverine");
             })
             .WithTracing(tracing =>
             {
@@ -224,8 +286,10 @@ public static class ServiceDefaultsExtensions
 <sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/AspireServiceDefaults/Extensions.cs#L12-L95' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_aspire_service_defaults' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
-Note that Wolverine names its `Meter` "Wolverine:{ServiceName}", so `AddMeter("Wolverine*")` has to be a wildcard.
-A bare `AddMeter("Wolverine")` matches nothing.
+As of 7.0 Wolverine names its `Meter` exactly `Wolverine`, so `AddMeter("Wolverine")` is enough. Before 7.0 it was
+`Wolverine:{ServiceName}` and needed the `AddMeter("Wolverine*")` wildcard. Wolverine's `ServiceName` defaults from
+the `OTEL_SERVICE_NAME` variable that the AppHost sets for each resource, so the `source` tag on Wolverine's metrics
+matches the resource name the dashboard shows.
 
 Each service then calls `builder.AddServiceDefaults()` and `app.MapDefaultEndpoints()`, and the AppHost polls the
 `/health` endpoint with `WithHttpHealthCheck("/health")`.

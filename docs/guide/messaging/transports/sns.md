@@ -108,9 +108,11 @@ await host.StartAsync();
 
 ## Connecting with Aspire or a Named Connection String <Badge type="tip" text="6.52" />
 
-Let's say you're developing locally under [.NET Aspire](/guide/aspire) against an AWS emulator. The LocalStack
-(`AddLocalStack()`) and CommunityToolkit Floci (`AddFlociAws()`) hosting integrations put the emulator's service URL,
-something like `http://localhost:4566`, at `ConnectionStrings:<resource name>`:
+Let's say you're developing locally under [.NET Aspire](/guide/aspire) against an AWS emulator. Wolverine's own
+LocalStack hosting integration (`AddLocalStack()` from `WolverineFx.Aspire.Hosting.LocalStack`, see
+[the SQS page](/guide/messaging/transports/sqs/#running-localstack-from-an-aspire-apphost)) and the CommunityToolkit
+Floci one (`AddFlociAws()`) put the emulator's service URL, something like `http://localhost:4566`, at
+`ConnectionStrings:<resource name>`:
 
 ```csharp
 // In the AppHost
@@ -276,7 +278,7 @@ using var host = await Host.CreateDefaultBuilder()
             .AutoProvision()
 
             // How should Wolverine route a message whose TenantId is null or
-            // unknown? FallbackToDefault (the default) uses the shared connection;
+            // unknown? FallbackToDefault (the 6.x default) uses the shared connection;
             // TenantIdRequired throws; IgnoreUnknownTenants silently drops it.
             .TenantIdBehavior(TenantedIdBehavior.FallbackToDefault)
 
@@ -325,7 +327,8 @@ through its own paired SQS client, so the SNS and SQS tenant connections line up
 
 `TenantIdBehavior(...)` controls what happens when a message has a null or unregistered tenant id:
 
-* `FallbackToDefault` (the default) — publish it to the shared/default connection (the one passed to `UseAmazonSnsTransport`).
+* `DeadLetterUnknownTenants` (the default since 7.0) — a message with no tenant id goes to the default broker; a message for an unregistered tenant id is moved to dead letter storage and sent nowhere (with no message store, the send throws).
+* `FallbackToDefault` (the 6.x default, restored by `RestoreV6Defaults()`) — publish it to the shared/default connection (the one passed to `UseAmazonSnsTransport`).
 * `TenantIdRequired` — throw; every message must carry a known tenant id.
 * `IgnoreUnknownTenants` — silently drop the message.
 

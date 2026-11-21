@@ -9,6 +9,7 @@ using Marten.Events;
 using Marten.Services;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -100,6 +101,8 @@ public class deduplicated_with_response_on_marten : IAsyncLifetime
         var repeat = await postAsync("/marten-deduplicated-response/orders", request, key, 201);
 
         (await repeat.ReadAsTextAsync()).ShouldBe(await first.ReadAsTextAsync());
+        first.Context.Response.Headers.ContainsKey("Idempotent-Replayed").ShouldBeFalse();
+        repeat.Context.Response.Headers["Idempotent-Replayed"].ToString().ShouldBe("true");
 
         // Answered before the endpoint ran, not by its commit failing on the claim
         MartenDeduplicatedResponseEndpoints.Runs(request.Name).ShouldBe(1);
@@ -210,6 +213,7 @@ public class deduplicated_with_response_on_marten : IAsyncLifetime
         // Only the winner keeps a header its own endpoint set: the loser's work rolled back, and so did its response
         responses.Count(x => x.Context.Response.Headers.ContainsKey(MartenDeduplicatedResponseEndpoints.AttemptHeader))
             .ShouldBe(1);
+        responses.Count(x => x.Context.Response.Headers.ContainsKey("Idempotent-Replayed")).ShouldBe(1);
 
         await using var session = theHost.Services.GetRequiredService<IDocumentStore>().QuerySession();
         (await session.Query<DeduplicatedOrderDocument>().CountAsync(x => x.Name == request.Name,
@@ -303,6 +307,7 @@ public class deduplicated_with_response_on_marten : IAsyncLifetime
         (await responses[1].ReadAsTextAsync()).ShouldBe(await responses[0].ReadAsTextAsync());
         responses[1].Context.Response.Headers.Location.ToString()
             .ShouldBe(responses[0].Context.Response.Headers.Location.ToString());
+        responses.Count(x => x.Context.Response.Headers.ContainsKey("Idempotent-Replayed")).ShouldBe(1);
 
         await using var session = theHost.Services.GetRequiredService<IDocumentStore>().QuerySession();
         (await session.Query<DeduplicatedAccount>().CountAsync(x => x.Name == command.Name,
@@ -402,6 +407,62 @@ public class deduplicated_with_response_on_marten : IAsyncLifetime
         (await findClaimAsync(key)).ShouldBeNull();
 
         await postAsync("/marten-deduplicated-response/missing", request, key, 404);
+        MartenDeduplicatedResponseEndpoints.Runs(request.Name).ShouldBe(2);
+    }
+
+    [Fact]
+    public async Task a_result_union_is_claimed_inside_the_commit_and_replayed()
+    {
+        var key = Guid.NewGuid().ToString();
+        var request = new DeduplicatedOrder("result-" + key);
+
+        var first = await postAsync("/marten-deduplicated-response/result", request, key, 201);
+        var repeat = await postAsync("/marten-deduplicated-response/result", request, key, 201);
+
+        (await repeat.ReadAsTextAsync()).ShouldBe(await first.ReadAsTextAsync());
+        repeat.Context.Response.Headers.Location.ToString()
+            .ShouldBe(first.Context.Response.Headers.Location.ToString());
+        MartenDeduplicatedResponseEndpoints.Runs(request.Name).ShouldBe(1);
+
+        sourceFor("/marten-deduplicated-response/result").ShouldNotContain(".TryClaimAsync(");
+    }
+
+    [Fact]
+    public async Task with_store_body_off_the_claim_written_inside_the_commit_has_no_body()
+    {
+        var key = Guid.NewGuid().ToString();
+        var request = new DeduplicatedOrder("secret-" + key);
+
+        var first = await postAsync("/marten-deduplicated-response/secret", request, key, 201);
+        (await first.ReadAsJsonAsync<DeduplicatedSecret>()).ShouldNotBeNull().Secret.ShouldNotBeNullOrEmpty();
+
+        var location = first.Context.Response.Headers.Location.ToString();
+        location.ShouldStartWith("/marten-deduplicated-response/orders/");
+
+        var stored = (await findClaimAsync(key)).ShouldNotBeNull().Response.ShouldNotBeNull();
+        stored.StatusCode.ShouldBe(201);
+        stored.Location.ShouldBe(location);
+        stored.Body.ShouldBeNull();
+
+        var repeat = await postAsync("/marten-deduplicated-response/secret", request, key, 201);
+
+        (await repeat.ReadAsTextAsync()).ShouldBeEmpty();
+        repeat.Context.Response.Headers.Location.ToString().ShouldBe(location);
+        MartenDeduplicatedResponseEndpoints.Runs(request.Name).ShouldBe(1);
+
+        sourceFor("/marten-deduplicated-response/secret").ShouldNotContain(".TryClaimAsync(");
+    }
+
+    [Fact]
+    public async Task the_failure_arm_of_a_result_union_claims_nothing_and_its_retry_runs()
+    {
+        var key = Guid.NewGuid().ToString();
+        var request = new DeduplicatedOrder(MartenDeduplicatedResponseEndpoints.Absent + key);
+
+        await postAsync("/marten-deduplicated-response/result", request, key, 404);
+        (await findClaimAsync(key)).ShouldBeNull();
+
+        await postAsync("/marten-deduplicated-response/result", request, key, 404);
         MartenDeduplicatedResponseEndpoints.Runs(request.Name).ShouldBe(2);
     }
 
@@ -638,6 +699,99 @@ public class deduplicated_with_response_on_marten : IAsyncLifetime
 
         (await blue.ReadAsTextAsync()).ShouldNotBe(await red.ReadAsTextAsync());
         (await redAgain.ReadAsTextAsync()).ShouldBe(await red.ReadAsTextAsync());
+    }
+
+    [Fact]
+    public async Task a_claim_written_inside_the_commit_is_counted_once_it_commits()
+    {
+        using var outcomes = new DeduplicationOutcomeListener(theHost);
+        var key = Guid.NewGuid().ToString();
+        var request = new DeduplicatedOrder("counted-" + key);
+
+        await postAsync("/marten-deduplicated-response/orders", request, key, 201);
+        await postAsync("/marten-deduplicated-response/orders", request, key, 201);
+
+        outcomes.On("/marten-deduplicated-response/orders").ShouldBe(["claimed", "replayed"]);
+    }
+
+    [Fact]
+    public async Task the_loser_of_a_concurrent_commit_counts_only_as_a_replay()
+    {
+        using var outcomes = new DeduplicationOutcomeListener(theHost);
+        var key = Guid.NewGuid().ToString();
+        var request = new DeduplicatedOrder("counted-race-" + key);
+
+        await Task.WhenAll(
+            postAsync("/marten-deduplicated-response/race", request, key, 201),
+            postAsync("/marten-deduplicated-response/race", request, key, 201));
+
+        MartenDeduplicatedResponseEndpoints.RaceReached(request.Name).ShouldBe(2);
+
+        outcomes.On("/marten-deduplicated-response/race").Order().ShouldBe(["claimed", "replayed"]);
+    }
+
+    [Fact]
+    public async Task a_failure_inside_the_commit_after_its_own_claim_committed_counts_as_claimed()
+    {
+        using var outcomes = new DeduplicationOutcomeListener(theHost);
+        var key = Guid.NewGuid().ToString();
+        var request = new DeduplicatedOrder("counted-after-commit-" + key);
+
+        await failingPostAsync("/marten-deduplicated-response/after-commit-failure", request, key);
+        await postAsync("/marten-deduplicated-response/after-commit-failure", request, key, 201);
+
+        outcomes.On("/marten-deduplicated-response/after-commit-failure").ShouldBe(["claimed", "replayed"]);
+    }
+
+    [Fact]
+    public async Task on_claim_and_release_a_failure_after_the_database_commit_counts_as_claimed()
+    {
+        using var outcomes = new DeduplicationOutcomeListener(theHost);
+        var key = Guid.NewGuid().ToString();
+        var request = new DeduplicatedOrder("counted-after-commit-default-" + key);
+
+        await failingPostAsync("/marten-deduplicated-response/after-commit-failure-default", request, key);
+        await postAsync("/marten-deduplicated-response/after-commit-failure-default", request, key, 409);
+
+        outcomes.On("/marten-deduplicated-response/after-commit-failure-default").ShouldBe(["claimed", "in_progress"]);
+    }
+
+    [Fact]
+    public async Task a_request_without_a_key_counts_no_outcome_when_claiming_inside_the_commit()
+    {
+        using var outcomes = new DeduplicationOutcomeListener(theHost);
+
+        await theHost.Scenario(x =>
+        {
+            x.Post.Json(new DeduplicatedOrder("counted-no-key")).ToUrl("/marten-deduplicated-response/optional-key");
+            x.StatusCodeShouldBe(201);
+        });
+
+        outcomes.On("/marten-deduplicated-response/optional-key").ShouldBeEmpty();
+
+        await postAsync("/marten-deduplicated-response/optional-key", new DeduplicatedOrder("counted-key"),
+            Guid.NewGuid().ToString(), 201);
+
+        outcomes.On("/marten-deduplicated-response/optional-key").ShouldBe(["claimed"]);
+    }
+
+    [Fact]
+    public async Task a_first_request_that_fails_counts_no_outcome_when_claiming_inside_the_commit()
+    {
+        using var outcomes = new DeduplicationOutcomeListener(theHost);
+
+        var missing = Guid.NewGuid().ToString();
+        await postAsync("/marten-deduplicated-response/missing", new DeduplicatedOrder("counted-missing-" + missing),
+            missing, 404);
+        outcomes.On("/marten-deduplicated-response/missing").ShouldBeEmpty();
+
+        var key = Guid.NewGuid().ToString();
+        var request = new DeduplicatedOrder("counted-fail-once-" + key);
+
+        await failingPostAsync("/marten-deduplicated-response/fail-once", request, key);
+        await postAsync("/marten-deduplicated-response/fail-once", request, key, 201);
+
+        outcomes.On("/marten-deduplicated-response/fail-once").ShouldBe(["claimed"]);
     }
 
     private IReplayableDeduplicationStore replayableStore()
@@ -923,6 +1077,32 @@ public static class MartenDeduplicatedResponseEndpoints
         // The work commits, but the answer is a 404: nothing is claimed, so a retry runs again
         PostOrder(request, session);
         return null;
+    }
+
+    public const string Absent = "absent-";
+
+    [DeduplicatedWithResponse(DeduplicationScope.User, ClaimInTransaction = true)]
+    [WolverinePost("/marten-deduplicated-response/result")]
+    public static Results<Created<DeduplicatedOrderCreated>, NotFound> PostResult(DeduplicatedOrder request,
+        IDocumentSession session)
+    {
+        if (request.Name.StartsWith(Absent))
+        {
+            _runs.AddOrUpdate(request.Name, 1, (_, count) => count + 1);
+            return TypedResults.NotFound();
+        }
+
+        var created = PostOrder(request, session);
+        return TypedResults.Created($"/marten-deduplicated-response/orders/{created.Id}", created);
+    }
+
+    [DeduplicatedWithResponse(DeduplicationScope.User, ClaimInTransaction = true, StoreBody = false)]
+    [WolverinePost("/marten-deduplicated-response/secret")]
+    public static Created<DeduplicatedSecret> PostSecret(DeduplicatedOrder request, IDocumentSession session)
+    {
+        var created = PostOrder(request, session);
+        return TypedResults.Created($"/marten-deduplicated-response/orders/{created.Id}",
+            new DeduplicatedSecret(created.Id, Guid.NewGuid().ToString()));
     }
 
     [DeduplicatedWithResponse(DeduplicationScope.User, ClaimInTransaction = true, Required = false)]

@@ -40,6 +40,12 @@ partial class Build : NukeBuild
     readonly Solution Solution;
     
     [Parameter]readonly string Framework;
+
+    /// <summary>Pack only: overrides the package version (e.g. 7.0.0-local.1) without editing Directory.Build.props.</summary>
+    [Parameter("Package version for Pack, overriding Directory.Build.props")] readonly string Version;
+
+    /// <summary>Pack only: the output directory (a local NuGet feed) that packages are written to. Defaults to ./artifacts.</summary>
+    [Parameter("Output directory / local NuGet feed for Pack")] readonly string Feed;
     [Parameter] readonly string PostgresConnectionString ="Host=localhost;Port=5433;Database=postgres;Username=postgres;password=postgres";
 
     [Parameter] readonly string SqlServerConnectionString =
@@ -78,9 +84,13 @@ partial class Build : NukeBuild
     //
     // VerifyLocalGateCoverage too: a test project that is in neither LocalGate's table nor its
     // NotGated list, or a stale build/gates.json, is reported on every push. GH-5125.
+    //
+    // VerifyProjectReferenceFrameworks as well: a reference to a project that declares a single
+    // <TargetFramework> builds that project twice at once under Compile's -f net10.0, the intermittent
+    // MSB3030 on its apphost. GH-5622.
     Target CI => _ => _
-        .DependsOn(VerifyCITargetCoverage, VerifyTrackedSessionTimeouts, VerifyLocalGateCoverage, CoreTests,
-            CIMessageRouting);
+        .DependsOn(VerifyCITargetCoverage, VerifyTrackedSessionTimeouts, VerifyLocalGateCoverage,
+            VerifyProjectReferenceFrameworks, CoreTests, CIMessageRouting);
 
     Target Test => _ => _
         .DependsOn(CoreTests, TestExtensions, Commands, PolicyTests, HttpTests);
@@ -97,7 +107,8 @@ partial class Build : NukeBuild
         .ProceedAfterFailure()
         .Executes(() =>
         {
-            RunTestProject(Solution.Testing.CoreTests);
+            // BuildTests: the build's own decisions, such as when a run may recreate a degraded service (GH-5545)
+            RunTestProjects([Solution.Testing.CoreTests, Solution.Testing.BuildTests]);
         });
    
     Target PolicyTests => _ => _
@@ -160,7 +171,7 @@ partial class Build : NukeBuild
         .ProceedAfterFailure()
         .Executes(() =>
         {
-            // net10.0-only (Alba 9), so the net9.0-pinned Compile skips it
+            // net10.0-only (Alba 9), so a Compile pinned to another framework skips it
             BuildTestProjects(Solution.Http.Wolverine_Http_Tests);
             RunTestProject(Solution.Http.Wolverine_Http_Tests);
         });
@@ -227,7 +238,14 @@ partial class Build : NukeBuild
             // environment (e.g. ASPNETCORE_ENVIRONMENT=Development on CI) intact instead of letting
             // launchSettings.json override it; Development turns on DI scope validation, which also
             // guards the GH-2911 fix.
+            //
+            // GH-5523: http.yml sets Development for the whole job; a local run (./build.sh OpenApiCommand)
+            // gets the same unless the caller chose an environment. Without it the sample is a Production app,
+            // which in 7.0 loads pre-generated code, and TodoWebService commits none.
+            var environment = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") ?? "Development";
+
             DotNetRun(c => c
+                .SetProcessEnvironmentVariable("ASPNETCORE_ENVIRONMENT", environment)
                 .SetProjectFile(project)
                 .SetConfiguration(Configuration)
                 .EnableNoLaunchProfile()
@@ -236,6 +254,7 @@ partial class Build : NukeBuild
 
             // The fuzzy --route filter, which emits only the matching paths and their schemas
             DotNetRun(c => c
+                .SetProcessEnvironmentVariable("ASPNETCORE_ENVIRONMENT", environment)
                 .SetProjectFile(project)
                 .SetConfiguration(Configuration)
                 .EnableNoBuild()
@@ -287,7 +306,7 @@ partial class Build : NukeBuild
         .ProceedAfterFailure()
         .Executes(() =>
         {
-            // net10.0-only (Alba 9), so the net9.0-pinned Compile skips it
+            // net10.0-only (Alba 9), so a Compile pinned to another framework skips it
             BuildTestProjects(Solution.Samples.TodoWebService.TodoWebServiceTests);
             RunTestProject(Solution.Samples.TodoWebService.TodoWebServiceTests);
         });
@@ -297,7 +316,7 @@ partial class Build : NukeBuild
         .ProceedAfterFailure()
         .Executes(() =>
         {
-            // net10.0-only (Alba 9), so the net9.0-pinned Compile skips it
+            // net10.0-only (Alba 9), so a Compile pinned to another framework skips it
             BuildTestProjects(Solution.Samples.TestHarness.BankingService_Tests);
             RunTestProject(Solution.Samples.TestHarness.BankingService_Tests);
         });
@@ -307,7 +326,7 @@ partial class Build : NukeBuild
         .ProceedAfterFailure()
         .Executes(() =>
         {
-            // net10.0-only (Alba 9), so the net9.0-pinned Compile skips it
+            // net10.0-only (Alba 9), so a Compile pinned to another framework skips it
             BuildTestProjects(Solution.Samples.Middleware.AppWithMiddleware_Tests);
             RunTestProject(Solution.Samples.Middleware.AppWithMiddleware_Tests);
         });
@@ -317,7 +336,7 @@ partial class Build : NukeBuild
         .ProceedAfterFailure()
         .Executes(() =>
         {
-            // net10.0-only (Alba 9), so the net9.0-pinned Compile skips it
+            // net10.0-only (Alba 9), so a Compile pinned to another framework skips it
             BuildTestProjects(Solution.Samples.EFCoreSample.ItemService_Tests);
             RunTestProject(Solution.Samples.EFCoreSample.ItemService_Tests);
         });
@@ -331,18 +350,22 @@ partial class Build : NukeBuild
         new[]
             {
                 Solution.Wolverine,
+                Solution.Wolverine_Analyzers,
                 Solution.Wolverine_RuntimeCompilation,
                 Solution.Wolverine_HealthChecks,
+                Solution.Wolverine_ServiceDefaults,
                 Solution.Transports.RabbitMQ.Wolverine_RabbitMQ,
                 Solution.Transports.Azure.Wolverine_AzureServiceBus,
                 Solution.Transports.AWS.Wolverine_AmazonSqs,
                 Solution.Transports.AWS.Wolverine_AmazonSns,
+                Solution.Transports.AWS.Wolverine_Aspire_Hosting_LocalStack,
                 Solution.Transports.MQTT.Wolverine_MQTT,
-                Solution.Transports.MQTT.Wolverine_Mqtt5,
                 Solution.Transports.Kafka.Wolverine_Kafka,
                 Solution.Transports.Pulsar.Wolverine_Pulsar,
+                Solution.Transports.Pulsar.Wolverine_Aspire_Hosting_Pulsar,
                 Solution.Transports.GCP.Wolverine_Pubsub,
                 Solution.Transports.GCP.Wolverine_Pubsub_Http,
+                Solution.Transports.GCP.Wolverine_Aspire_Hosting_Pubsub,
                 Solution.Persistence.Wolverine_RDBMS,
                 Solution.Persistence.PostgreSQL.Wolverine_Postgresql,
                 Solution.Persistence.Marten.Wolverine_Marten,
@@ -427,19 +450,28 @@ partial class Build : NukeBuild
         {
             foreach (var project in NugetProjects)
             {
-                DotNetPack(s => s
-                    .SetProject(project)
-                    .SetOutputDirectory("./artifacts")
-                    .SetConfiguration(Configuration.Release));
+                DotNetPack(s =>
+                {
+                    s = s
+                        .SetProject(project)
+                        .SetOutputDirectory(string.IsNullOrEmpty(Feed) ? "./artifacts" : Feed)
+                        .SetConfiguration(Configuration.Release);
+                    return string.IsNullOrEmpty(Version) ? s : s.SetVersion(Version);
+                });
             }
         });
 
     Target DockerUp => _ => _
         .Executes(() =>
         {
-            // Shares ComposeUp with the CI targets so this path gets the same registry-timeout
-            // retry — it pulls every image in the compose file, so it is the most exposed of all.
-            ComposeUp("compose up -d", "all services");
+            // Goes through LaunchDockerServices (and so ComposeUp) like the CI targets: the same
+            // registry-timeout retry, which matters most here because it pulls every image in the
+            // compose file, and the same reuse of a service whose host port already answers. On a
+            // shared machine a fixed port can be held by another repository's container (Weasel's
+            // Oracle on 1521, say), and a bare `up -d` of every service failed on it. Every service
+            // in the file publishes a port except asb-sql and asb-sql-2, which come up as the
+            // emulators' depends_on.
+            LaunchDockerServices(composeServicePorts().Keys.OrderBy(x => x).ToArray());
             WaitForDatabaseToBeReady();
         });
 

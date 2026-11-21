@@ -27,6 +27,25 @@ partial class Build
     }
 
     /// <summary>
+    /// The compose project every build target uses, whatever directory the checkout lives in.
+    ///
+    /// <para>Compose names a project after its directory by default, so each git worktree was its
+    /// own project (<c>wolverine-runner-wv-gate-transports</c>, say) while the host ports in
+    /// docker-compose.yml are fixed. A worktree's <c>docker compose up -d</c> then tried to create a
+    /// second RabbitMQ, Postgres, SQL Server and so on beside the main checkout's
+    /// <c>wolverine-*</c> containers and failed with "port is already allocated". Pinning the name
+    /// makes every checkout on a machine share one stack, and <c>up -d</c> idempotent against it. The
+    /// main checkout's directory is already <c>wolverine</c>, as is the CI runner's, so nothing changes
+    /// there. <c>COMPOSE_PROJECT_NAME</c>, when set, still wins, for anyone who wants a stack of
+    /// their own.</para>
+    /// </summary>
+    static string ComposeProjectName =>
+        Environment.GetEnvironmentVariable("COMPOSE_PROJECT_NAME") is { Length: > 0 } name ? name : "wolverine";
+
+    /// <summary>`compose -p {project} {args}`: every compose invocation in the build goes through this.</summary>
+    static string composeArgs(string args) => $"compose -p {ComposeProjectName} {args}";
+
+    /// <summary>
     /// How many times <see cref="ComposeUp"/> will try `docker compose up -d` before giving up.
     /// </summary>
     const int DockerComposeAttempts = 3;
@@ -59,7 +78,7 @@ partial class Build
         Log.Information("Starting docker services: {Services}", serviceList);
 
         // Pass each service as a separate argument to avoid quoting issues
-        ComposeUp("compose up -d " + serviceList, serviceList);
+        ComposeUp(composeArgs("up -d " + serviceList), serviceList);
     }
 
     static bool portAnswers(int port)
@@ -199,6 +218,8 @@ partial class Build
             WaitForLocalStackToBeReady();
         if (services.Contains("asb-emulator"))
             WaitForAzureServiceBusEmulatorToBeReady();
+        if (services.Contains("asb-emulator-2"))
+            WaitForAzureServiceBusEmulatorToBeReady("asb-emulator-2", 5674, 5301);
         if (services.Contains("kafka"))
             WaitForKafkaToBeReady();
         if (services.Contains("gcp-pubsub"))
@@ -337,8 +358,8 @@ partial class Build
 
         try
         {
-            runDiagnostic(composeTool(), $"compose ps {composeService}");
-            runDiagnostic(composeTool(), $"compose logs --tail=200 {composeService}");
+            runDiagnostic(composeTool(), composeArgs($"ps {composeService}"));
+            runDiagnostic(composeTool(), composeArgs($"logs --tail=200 {composeService}"));
 
             // Linux-only, and the runner is the only place this matters -- a developer machine has
             // no OOM killer story worth telling here.
@@ -358,7 +379,7 @@ partial class Build
     void restartService(string name, string composeService)
     {
         Log.Warning("Restarting the {Service} container ({ComposeService}) and probing once more", name, composeService);
-        runDiagnostic(composeTool(), $"compose restart {composeService}");
+        runDiagnostic(composeTool(), composeArgs($"restart {composeService}"));
     }
 
     /// <summary>
@@ -590,24 +611,25 @@ partial class Build
     /// 2.0.1, which warms up more slowly. CI pulls fresh every run and gets 2.0.1; a developer machine
     /// keeps whatever it pulled months ago. The images are pinned now for exactly that reason.</para>
     /// </summary>
-    void WaitForAzureServiceBusEmulatorToBeReady()
+    void WaitForAzureServiceBusEmulatorToBeReady(string composeService = "asb-emulator", int amqpPort = 5673,
+        int managementPort = 5300)
     {
         using var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(10) };
 
         // Any management request will do. While warming, the emulator answers 503 to all of them; once warm
         // it answers something else (200/400/401 depending on auth and api-version), so readiness does not
         // depend on getting the ATOM api-version right here.
-        const string managementProbe = "http://localhost:5300/$Resources/topics";
+        var managementProbe = $"http://localhost:{managementPort}/$Resources/topics";
 
         // Deliberately fatal, via the same shared path as every other gate. This used to log a warning
         // and carry on, so an emulator that never came up at all still fed the entire suite into a
         // broker that could not serve it — and the resulting failures read as flaky tests rather than
         // as infrastructure that never started.
-        awaitService("Azure Service Bus emulator", "asb-emulator", TimeSpan.FromMinutes(3), () =>
+        awaitService(composeService == "asb-emulator" ? "Azure Service Bus emulator" : $"Azure Service Bus emulator ({composeService})", composeService, TimeSpan.FromMinutes(3), () =>
         {
             using (var tcpClient = new System.Net.Sockets.TcpClient())
             {
-                tcpClient.Connect("localhost", 5673);
+                tcpClient.Connect("localhost", amqpPort);
             }
 
             var response = http.GetAsync(managementProbe).GetAwaiter().GetResult();
@@ -616,7 +638,7 @@ partial class Build
             // answers 200; asserting 200 would hang for the whole budget and then fail the job. This
             // distinction cost a day to find — do not tighten it.
             return response.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable
-                ? "the management api on 5300 is still warming up (503)"
+                ? $"the management api on {managementPort} is still warming up (503)"
                 : null;
         });
     }
@@ -660,8 +682,36 @@ partial class Build
     //
     // CIPersistence is deliberately the larger of the two only because PersistenceTests cannot be split
     // out without a third runner; it is still roughly half of what the single job used to carry.
+    //
+    // It outgrew the cap again with the 7.0 work (sagas, deduplication, recurring timers, failure groups,
+    // tenancy): by 2026-11-20 green runs took 13-15m, ten of the last 37 took 17.5-19.7m, and #5688's
+    // first run was cancelled at the cap on a runner ~1.4x slower across the board, 8 tests short. So a
+    // third runner, CIPostgresqlFeatures, takes the Agents, Bugs, Durability, MultiTenancy and Sagas
+    // namespaces plus the four deduplication classes in the root namespace. Measured from the green
+    // rerun of that job (2026-11-20, job 136430545824), seconds of test time:
+    //
+    //   CIPostgresql           unchanged                                              ~7-10m job
+    //   CIPostgresqlFeatures   Agents 52, Bugs 54, Durability 28, MultiTenancy 55,
+    //                          Sagas 53, deduplication classes 87                      ~329s
+    //   CIPersistence          PersistenceTests 126 + the rest of the root namespace 224 ~350s
+    //
+    // CIPersistence still excludes BOTH lists, so a newly added PostgresqlTests class or namespace
+    // still runs somewhere.
 
     AbsolutePath PostgresqlTests => RootDirectory / "src" / "Persistence" / "PostgresqlTests" / "PostgresqlTests.csproj";
+
+    static readonly string[] PostgresqlFeaturesShard =
+    [
+        "PostgresqlTests.Agents",                                              // 52.3s
+        "PostgresqlTests.Bugs",                                                // 54.1s
+        "PostgresqlTests.Durability",                                          // 27.5s
+        "PostgresqlTests.MultiTenancy",                                        // 55.1s
+        "PostgresqlTests.Sagas",                                               // 53.1s
+        "PostgresqlTests.deduplication_store_compliance",                      // 29.1s / 44 tests
+        "PostgresqlTests.an_identity_the_inbox_already_handled_is_a_duplicate", // 27.8s / 22 tests
+        "PostgresqlTests.logical_message_deduplication",                       // 19.0s / 15 tests
+        "PostgresqlTests.replayable_deduplication_store_compliance"            // 10.7s / 14 tests
+    ];
 
     static readonly string[] PostgresqlShard =
     [
@@ -673,7 +723,8 @@ partial class Build
     ];
 
     /// <summary>
-    /// PersistenceTests, plus every PostgresqlTests test not claimed by <see cref="CIPostgresql"/>.
+    /// PersistenceTests, plus every PostgresqlTests test not claimed by <see cref="CIPostgresql"/> or
+    /// <see cref="CIPostgresqlFeatures"/>.
     /// </summary>
     Target CIPersistence => _ => _
         .ProceedAfterFailure()
@@ -682,12 +733,29 @@ partial class Build
             var persistenceTests = RootDirectory / "src" / "Persistence" / "PersistenceTests" / "PersistenceTests.csproj";
 
             BuildTestProjects(PostgresqlTests);
-            // Pin PersistenceTests to net9.0 in CI; csproj targets net9.0;net10.0.
-            BuildTestProjectsWithFramework("net9.0", persistenceTests);
+            // Pin PersistenceTests to net10.0 in CI; csproj targets net10.0;net11.0.
+            BuildTestProjectsWithFramework("net10.0", persistenceTests);
             StartDockerServices("postgresql", "sqlserver", "rabbitmq");
 
-            RunTestProject(persistenceTests, frameworkOverride: "net9.0");
-            RunTestProject(PostgresqlTests, testFilter: excludeNamespaces(PostgresqlShard));
+            RunTestProject(persistenceTests, frameworkOverride: "net10.0");
+            RunTestProject(PostgresqlTests,
+                testFilter: excludeNamespaces([.. PostgresqlShard, .. PostgresqlFeaturesShard]));
+        });
+
+    /// <summary>
+    /// PostgresqlTests shard: the agent, bug regression, durability, multi-tenancy and saga namespaces,
+    /// and the deduplication classes.
+    /// </summary>
+    Target CIPostgresqlFeatures => _ => _
+        .ProceedAfterFailure()
+        .Executes(() =>
+        {
+            // Bugs.Bug_1942_replay_dlq_to_buffered_or_inline replays dead letters to a RabbitMQ listener.
+            LaunchDockerServices("postgresql", "rabbitmq");
+            BuildTestProjects(PostgresqlTests);
+            AwaitDockerServices("postgresql", "rabbitmq");
+
+            RunTestProject(PostgresqlTests, testFilter: includeNamespaces(PostgresqlFeaturesShard));
         });
 
     /// <summary>
@@ -834,15 +902,15 @@ partial class Build
 
     void runSqlServerShard(Func<WorkerTest, bool> testFilter)
     {
-        // SQL Server's boot is one of the slower container starts; overlap it with the compile
-        // instead of paying the two serially.
-        LaunchDockerServices("sqlserver");
+        // This run owns SQL Server, so it starts it fresh (GH-5532). That waits until the recreated
+        // server answers, so it no longer overlaps the compile; a reused server costs nothing.
         BuildTestProjects(SqlServerTests);
-        AwaitDockerServices("sqlserver");
+        StartServicesFresh("sqlserver");
 
         // The sibling databases the multi-tenancy and NSB dedicated-db suites create are lane-scoped via
         // LaneDatabases.Name, so lanes cannot collide on them.
-        RunTestProject(SqlServerTests, testFilter: testFilter, workers: 4, sqlServerDatabasePerLane: true);
+        // GH-5545: and it may recreate SQL Server mid-run (lane databases included) when the run degrades on it.
+        RunTestProject(SqlServerTests, testFilter: testFilter, workers: 4, sqlServerDatabasePerLane: true, heal: ["sqlserver"]);
     }
 
     /// <summary>
@@ -1009,23 +1077,15 @@ partial class Build
                                             "EfCoreTests.MultiTenancy.csproj";
 
     /// <param name="framework">
-    /// Which target framework the two EF suites run on, or null to inherit <c>--framework</c>.
-    /// Both projects multi-target net9.0;net10.0 and <c>Directory.Packages.props</c> resolves EF Core 9
-    /// for net9.0 and EF Core 10 for net10.0, so the framework IS the EF Core major version under test.
-    /// CI passes <c>--framework net9.0</c> globally (tests.yml), which is why <see cref="CIEfCore" />
-    /// alone never exercised EF 10 in CI even though both suites have multi-targeted since #3540.
-    /// See GH-4635.
+    /// Which target framework the EF suites run on, or null to inherit <c>--framework</c>.
+    /// EfCoreTests multi-targets net10.0;net11.0, but <c>Directory.Packages.props</c> holds EF Core on 10.x
+    /// for both until Npgsql.EntityFrameworkCore.PostgreSQL 11 ships GA (GH-5134), so there is no separate
+    /// EF Core 11 lane yet; CI passes <c>--framework net10.0</c> globally (tests.yml). See GH-4635.
+    /// EfCoreTests.MultiTenancy is net10.0-only: its MultiTenancyCompliance base hosts through Alba,
+    /// and Alba 9 has no net11.0 target.
     /// </param>
-    void runEfCoreSuites(string framework)
+    void runEfCoreProjects(string framework, params AbsolutePath[] suites)
     {
-        // EfCoreTests.MultiTenancy is net10.0-only: its MultiTenancyCompliance base hosts through Alba,
-        // and Alba 9 has no net9.0 target. It runs in the EF Core 10 lane only, rather than being
-        // silently promoted to net10.0 here and run twice.
-        var chosen = framework ?? Framework;
-        AbsolutePath[] suites = declaredFrameworks(EfCoreMultiTenancyTests).Contains(chosen)
-            ? [EfCoreTests, EfCoreMultiTenancyTests]
-            : [EfCoreTests];
-
         BuildTestProjectsWithFramework(framework, suites);
         // RabbitMQ is required by Bug_2588_ef_core_durable_outbox_with_conventional_routing,
         // which exercises EF Core + RabbitMQ conventional routing + durable outbox policy.
@@ -1035,20 +1095,22 @@ partial class Build
         RunTestProjects(suites.Select(x => (string)x).ToArray(), frameworkOverride: framework);
     }
 
+    /// <summary>
+    /// EfCoreTests. EfCoreTests.MultiTenancy runs in <see cref="CIEfCoreMultiTenancy" />: the pair ran right up
+    /// against the 20 minute job cap in one job (EfCoreTests about 12 minutes, EfCoreTests.MultiTenancy about 8,
+    /// plus build and container start) and was cancelled by it. See #3350.
+    /// </summary>
     Target CIEfCore => _ => _
         .ProceedAfterFailure()
-        .Executes(() => runEfCoreSuites(null));
+        .Executes(() => runEfCoreProjects(null, EfCoreTests));
 
     /// <summary>
-    /// GH-4635. The same two EF suites on net10.0 / EF Core 10. A SEPARATE matrix job rather than a
-    /// second framework inside <see cref="CIEfCore" />: this matrix is minute-bound, not wall-clock
-    /// bound, and doubling an existing lane's work is the one thing the 20 minute cap is there to
-    /// prevent. As its own job the EF 10 run costs wall clock only against the other 34 jobs already
-    /// running in parallel.
+    /// EfCoreTests.MultiTenancy on net10.0 (it has no net11.0 target), as its own matrix job so neither EF Core
+    /// job comes near the 20 minute cap. See <see cref="CIEfCore" />.
     /// </summary>
-    Target CIEfCoreNet10 => _ => _
+    Target CIEfCoreMultiTenancy => _ => _
         .ProceedAfterFailure()
-        .Executes(() => runEfCoreSuites("net10.0"));
+        .Executes(() => runEfCoreProjects("net10.0", EfCoreMultiTenancyTests));
 
     // ─── Transport CI Targets ──────────────────────────────────────────
 
@@ -1056,7 +1118,7 @@ partial class Build
     //
     // CIAWS used to run the SQS project and then the SNS project back to back in a single job, which chronically
     // blew past the 20 minute job timeout on CI runners. It is now split three ways so the shards run as parallel
-    // jobs. Measured locally (Release, net9.0, serial, LocalStack in docker):
+    // jobs. Measured locally (Release, net9.0 at the time, serial, LocalStack in docker):
     //
     //   whole SQS project  199 tests  6m27s   <- the real hog
     //   whole SNS project  118 tests  1m30s
@@ -1132,14 +1194,23 @@ partial class Build
             var processManager = RootDirectory / "src" / "Samples" / "ProcessManagerViaHandlers" /
                                  "ProcessManagerViaHandlers.Tests" / "ProcessManagerViaHandlers.Tests.csproj";
 
-            BuildTestProjects(tests, httpTests, storeOnlyTests, specWriterTests, incidents, processManager);
+            // GH-5553 / GH-5554 / GH-5556: the saga fault and compensation specifications, Acceptance specs until built
+            var sagaFaults = RootDirectory / "src" / "Samples" / "SagaFaults" / "SagaFaults.Specs" / "SagaFaults.Specs.csproj";
+
+            // GH-5415: the event-sourced saga specifications, on Marten, Polecat and Fisher
+            var eventSourcedSagas = RootDirectory / "src" / "Samples" / "EventSourcedSagas" / "EventSourcedSagas.Specs" / "EventSourcedSagas.Specs.csproj";
+
+            // GH-5672 / GH-5673 / GH-5674: the workflow samples of the sagas vs durable workflows evaluation
+            var sagaWorkflows = RootDirectory / "src" / "Samples" / "SagaWorkflows" / "SagaWorkflows.Specs" / "SagaWorkflows.Specs.csproj";
+
+            BuildTestProjects(tests, httpTests, storeOnlyTests, specWriterTests, incidents, processManager, sagaFaults, eventSourcedSagas, sagaWorkflows);
 
             // The store-agnostic specs (GH-4892, GH-4920, GH-4921) run on Marten, Polecat AND Fisher, and
             // Polecat needs SQL Server. Without it every Polecat fixture fails to start, which surfaced as a
             // NullReferenceException in DisposeAsync rather than as the connection failure it was.
             StartDockerServices("postgresql", "sqlserver");
 
-            RunTestProjects([tests, httpTests, storeOnlyTests, specWriterTests, incidents, processManager]);
+            RunTestProjects([tests, httpTests, storeOnlyTests, specWriterTests, incidents, processManager, sagaFaults, eventSourcedSagas, sagaWorkflows]);
         });
 
     Target CIKafka => _ => _
@@ -1159,18 +1230,6 @@ partial class Build
         .Executes(() =>
         {
             var tests = RootDirectory / "src" / "Transports" / "MQTT" / "Wolverine.MQTT.Tests" / "Wolverine.MQTT.Tests.csproj";
-
-            BuildTestProjects(tests);
-            StartDockerServices("postgresql", "sqlserver");
-
-            RunTestProject(tests);
-        });
-
-    Target CIMQTT5 => _ => _
-        .ProceedAfterFailure()
-        .Executes(() =>
-        {
-            var tests = RootDirectory / "src" / "Transports" / "MQTT" / "Wolverine.Mqtt5.Tests" / "Wolverine.Mqtt5.Tests.csproj";
 
             BuildTestProjects(tests);
             StartDockerServices("postgresql", "sqlserver");
@@ -1272,6 +1331,21 @@ partial class Build
             RunTestProject(tests, frameworkOverride: "net10.0");
         });
 
+    // GH-5147: Wolverine.Http against ASP.NET Core 11 (CSRF default, async DataAnnotations, [ShortCircuit],
+    // OpenAPI 3.2). Runs on both frameworks whatever --framework says, because the behaviour under test is
+    // deliberately different between them. No database or broker.
+    Target CIHttpCompat => _ => _
+        .Executes(() =>
+        {
+            var tests = RootDirectory / "src" / "Http" / "Wolverine.Http.Compat.Tests" / "Wolverine.Http.Compat.Tests.csproj";
+
+            foreach (var framework in new[] { "net10.0", "net11.0" })
+            {
+                BuildTestProjectsWithFramework(framework, tests);
+                RunTestProject(tests, frameworkOverride: framework);
+            }
+        });
+
     Target CIRabbitMQ => _ => _
         .ProceedAfterFailure()
         .Executes(() =>
@@ -1336,9 +1410,25 @@ partial class Build
             var ravenDbTests = RootDirectory / "src" / "Persistence" / "RavenDbTests" / "RavenDbTests.csproj";
             var leaderElectionTests = RootDirectory / "src" / "Persistence" / "LeaderElection" / "RavenDbTests.LeaderElection" / "RavenDbTests.LeaderElection.csproj";
 
-            BuildTestProjectsWithFramework("net9.0", ravenDbTests, leaderElectionTests);
+            BuildTestProjectsWithFramework("net10.0", ravenDbTests, leaderElectionTests);
 
-            RunTestProjects([ravenDbTests, leaderElectionTests], frameworkOverride: "net9.0");
+            RunTestProjects([ravenDbTests, leaderElectionTests], frameworkOverride: "net10.0");
+        });
+
+    /// <summary>
+    /// GH-5603/5604/5605: Wolverine's Aspire hosting integrations (WolverineFx.Aspire.Hosting.*). Each test starts a
+    /// sample AppHost through Aspire.Hosting.Testing, so the broker or emulator runs in a container Aspire starts
+    /// on random host ports. No docker-compose service is needed or touched.
+    /// </summary>
+    Target CIAspireHosting => _ => _
+        .ProceedAfterFailure()
+        .Executes(() =>
+        {
+            var tests = RootDirectory / "src" / "Testing" / "Wolverine.Aspire.Hosting.Tests" / "Wolverine.Aspire.Hosting.Tests.csproj";
+
+            BuildTestProjects(tests);
+
+            RunTestProject(tests);
         });
 
     Target CIGrpc => _ => _
@@ -1580,8 +1670,8 @@ partial class Build
     {
         var project = RootDirectory / "src" / "Testing" / projectName / $"{projectName}.csproj";
 
-        DotNet($"build {project} --configuration {Configuration} --framework net9.0");
-        DotNet($"run --project {project} --no-build --configuration {Configuration} --framework net9.0");
+        DotNet($"build {project} --configuration {Configuration} --framework net10.0");
+        DotNet($"run --project {project} --no-build --configuration {Configuration} --framework net10.0");
     }
 
     /// <summary>
@@ -1594,7 +1684,7 @@ partial class Build
         var output = RootDirectory / "src" / "Testing" / projectName / "bin" / outputFolder;
 
         DotNet(
-            $"publish {project} --configuration {Configuration} --framework net9.0 --use-current-runtime --output {output}");
+            $"publish {project} --configuration {Configuration} --framework net10.0 --use-current-runtime --output {output}");
 
         var binaryName = EnvironmentInfo.IsWin ? $"{projectName}.exe" : projectName;
         ProcessTasks.StartProcess(output / binaryName, workingDirectory: RootDirectory)
@@ -1682,7 +1772,7 @@ partial class Build
 
             foreach (var project in projects)
             {
-                DotNet($"build {project} --configuration {Configuration} --framework net9.0");
+                DotNet($"build {project} --configuration {Configuration} --framework net10.0");
             }
 
             foreach (var project in projects)
@@ -1698,7 +1788,7 @@ partial class Build
 
                 ProcessTasks
                     .StartProcess("dotnet",
-                        $"run --configuration {Configuration} --framework net9.0 --no-build -- codegen write",
+                        $"run --configuration {Configuration} --framework net10.0 --no-build -- codegen write",
                         workingDirectory: project)
                     .AssertZeroExitCode();
             }
@@ -1768,13 +1858,13 @@ partial class Build
             }
 
             // AFTER the wipe, so the assembly under test genuinely has no generated types in it.
-            DotNet($"build {project} --configuration {Configuration} --framework net9.0");
+            DotNet($"build {project} --configuration {Configuration} --framework net10.0");
 
             // From the project's own directory, for the same working-directory reason the drift gate
             // documents above.
             ProcessTasks
                 .StartProcess("dotnet",
-                    $"run --configuration {Configuration} --framework net9.0 --no-build -- codegen test",
+                    $"run --configuration {Configuration} --framework net10.0 --no-build -- codegen test",
                     workingDirectory: project)
                 .AssertZeroExitCode();
 
@@ -1791,7 +1881,7 @@ partial class Build
     // minutes were broker timeouts, so splitting would have spread a real defect across three jobs and
     // hidden it a second time. GH-3789 removed those timeouts, so what is left is genuine capacity.
     //
-    // Measured, not guessed (Release, net9.0, serial, freshly recreated emulator in docker):
+    // Measured, not guessed (Release, net9.0 at the time, serial, freshly recreated emulator in docker):
     // 300 tests, 806s of test-body time across 42 classes, 14m36s wall clock. Two properties of that
     // measurement shaped the split:
     //
@@ -1828,16 +1918,22 @@ partial class Build
     static readonly string[] AsbLeaderShard =
     [
         "Wolverine.AzureServiceBus.Tests.leader_election",            // 212.3s / 15 tests — 26% of the suite
-        "Wolverine.AzureServiceBus.Tests.StatefulResourceSmokeTests"  //  68.0s /  6 tests
+        "Wolverine.AzureServiceBus.Tests.StatefulResourceSmokeTests", //  68.0s /  6 tests
+        // 209s / 2 tests on CI (#5574's CIAzureServiceBus log): the most expensive class left in the "everything
+        // else" shard, which was still at 19m18s of the 20 minute cap after strict_tenancy_5196 moved out.
+        "Wolverine.AzureServiceBus.Tests.Bugs.Bug_1933_multi_tenant_conventional_routing"
     ];
 
     /// <summary>
-    /// ASB shard 2: the whole ConventionalRouting namespace, plus native scheduling to balance it.
+    /// ASB shard 2: the whole ConventionalRouting namespace, plus native scheduling and the GH-5196 strict
+    /// tenancy tests to balance it. strict_tenancy_5196 landed in the "everything else" shard, which already ran
+    /// 18-19.5 minutes on main, and pushed it past the 20 minute job cap; this shard and the leader shard ran ~9.
     /// </summary>
     static readonly string[] AsbRoutingShard =
     [
         "Wolverine.AzureServiceBus.Tests.ConventionalRouting",        // 221.6s / 22 tests — a real namespace
-        "Wolverine.AzureServiceBus.Tests.using_native_scheduling"     //  55.9s /  5 tests
+        "Wolverine.AzureServiceBus.Tests.using_native_scheduling",    //  55.9s /  5 tests
+        "Wolverine.AzureServiceBus.Tests.strict_tenancy_5196"         // GH-5196, uses the second emulator pair
     ];
 
     void runAzureServiceBusShard(Func<WorkerTest, bool> testFilter)
@@ -1848,9 +1944,15 @@ partial class Build
         // Postgres is needed for leader election tests. Started for every shard rather than only the
         // one holding leader_election: durability-backed tests are spread across all three, and the
         // container is cheap next to the emulator's warm-up.
-        StartDockerServices("asb-emulator", "postgresql");
+        // This run owns the emulators, so it starts both pairs fresh (GH-5532). GH-5196: strict_tenancy_5196 uses the
+        // second pair (asb-emulator-2, Servers' tenant connection strings) as a tenant's own namespace, so every shard
+        // starts it: the "everything else" shard holds that class today, and a rebalance must not strand it.
+        // One Azure Service Bus run on the box at a time, when a shard is run locally (build/AzureServiceBusLock.cs)
+        using var asbLock = acquireAzureServiceBusLock();
+        StartServicesFresh("asb-emulator", "asb-emulator-2", "postgresql");
 
-        RunTestProject(tests, testFilter: testFilter);
+        // GH-5545: and it may recreate the emulators mid-run when the run degrades on them.
+        RunTestProject(tests, testFilter: testFilter, heal: ["asb"]);
     }
 
     /// <summary>
@@ -1930,9 +2032,10 @@ partial class Build
     void runPolecatShard(Func<WorkerTest, bool> testFilter)
     {
         BuildTestProjectsWithFramework("net10.0", PolecatTests);
-        StartDockerServices("sqlserver");
+        // PolecatTests owns SQL Server for the run, so it starts it fresh (GH-5532).
+        StartServicesFresh("sqlserver");
 
-        RunTestProject(PolecatTests, frameworkOverride: "net10.0", testFilter: testFilter);
+        RunTestProject(PolecatTests, frameworkOverride: "net10.0", testFilter: testFilter, heal: ["sqlserver"]);
     }
 
     /// <summary>

@@ -39,7 +39,7 @@ public class CodegenWriteFSharpCli
 
         try
         {
-            var (exitCode, output) = await RunDotnetAsync(appDir, "run --framework net9.0 -- codegen write --language fsharp");
+            var (exitCode, output) = await RunDotnetAsync(appDir, "run --framework net10.0 -- codegen write --language fsharp");
 
             // A transient F# build crash / file lock can fail the embedded `dotnet run` build; retry once.
             if (exitCode != 0 && (output.Contains("FS0193") || output.Contains("internal error")
@@ -47,7 +47,7 @@ public class CodegenWriteFSharpCli
                                                             || output.Contains("MSB3883")))
             {
                 if (Directory.Exists(generatedDir)) Directory.Delete(generatedDir, recursive: true);
-                (exitCode, output) = await RunDotnetAsync(appDir, "run --framework net9.0 -- codegen write --language fsharp");
+                (exitCode, output) = await RunDotnetAsync(appDir, "run --framework net10.0 -- codegen write --language fsharp");
             }
 
             _output.WriteLine(output);
@@ -82,6 +82,11 @@ public class CodegenWriteFSharpCli
             var registry = await File.ReadAllTextAsync(registryFile, TestContext.Current.CancellationToken);
             registry.ShouldContain("inherit Wolverine.Runtime.Handlers.HandlerRegistry()");
             registry.ShouldContain("typeof<WolverineBehaviouralFSharpApp.BehaviouralPingHandler>");
+
+            // GH-5644. The CLI sets the target language before assembling, so the registry's Native AOT rooting
+            // block (C# only, and not valid F# as rendered) is left out.
+            registry.ShouldNotContain("AotRoots");
+            registry.ShouldNotContain("ModuleInitializer");
         }
         finally
         {

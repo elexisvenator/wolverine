@@ -181,9 +181,61 @@ public interface ITrackedSession
     /// <summary>
     /// Attempt to "play" any messages that were scheduled by *only* the initial IHost
     /// </summary>
+    /// <remarks>
+    /// GH-5700. A message for a local queue is delivered to that queue as if its time had come, so the endpoint's
+    /// retries, dead-lettering and a saga's <c>Compensate</c> methods apply, and the returned session waits for all of
+    /// it. A message for any other endpoint is sent there. Before 7.0, a local message ran inline and its
+    /// exception was thrown at the test: pass <c>playInline: true</c> to keep that.
+    /// </remarks>
     /// <param name="timeout"></param>
     /// <returns></returns>
     Task<ITrackedSession> PlayScheduledMessagesAsync(TimeSpan timeout);
+
+    /// <inheritdoc cref="PlayScheduledMessagesAsync(TimeSpan)" />
+    /// <param name="timeout">How long the returned session waits for what the replay caused.</param>
+    /// <param name="playInline">
+    /// Run a message for a local queue inline, through <c>InvokeAsync()</c>, as Wolverine did before 7.0: only inline
+    /// retries run, there is no dead-lettering or compensation, and the failure is thrown at the test
+    /// </param>
+    Task<ITrackedSession> PlayScheduledMessagesAsync(TimeSpan timeout, bool playInline)
+        => playInline
+            ? throw new NotSupportedException($"{GetType().FullName} cannot play scheduled messages inline")
+            : PlayScheduledMessagesAsync(timeout);
+
+    /// <summary>
+    /// GH-5664. Let <paramref name="advanceBy" /> pass on the session's <see cref="Clock" />, and play only the messages
+    /// scheduled by the initial IHost that come due within that window, in due order. That includes a message scheduled
+    /// while the window plays, such as a saga's next poll, when it is due before the window ends. Everything due later
+    /// stays scheduled, and calling this again on the session it returns continues from where this one stopped.
+    /// </summary>
+    /// <remarks>
+    /// The clock is the application's own <see cref="TimeProvider" /> when the host registers one the session can move
+    /// (a public <c>Advance(TimeSpan)</c> method, as on <c>FakeTimeProvider</c>), or the clock given to
+    /// <see cref="TrackedSessionConfiguration.UseClock" />, so a saga reads the due time of the message it is handling.
+    /// Otherwise the session keeps a clock of its own, which the application does not read. Testing only: nothing in
+    /// the runtime reads the session's clock.
+    /// <para>
+    /// GH-5700. A message for a local queue is delivered to that queue as if its time had come, so the endpoint's
+    /// retries, dead-lettering and a saga's <c>Compensate</c> methods apply, and the window waits for all of it before
+    /// it plays the next due message. A failure is not thrown at the test. Pass <c>playInline: true</c> to run local
+    /// messages inline instead.
+    /// </para>
+    /// </remarks>
+    /// <param name="advanceBy">How much time passes. Call it by name, <c>PlayScheduledMessagesAsync(advanceBy: 1.Hours())</c>, since a single positional TimeSpan is the timeout of the overload that plays everything.</param>
+    /// <param name="timeout">How long the returned session waits for what the window caused. This session's timeout by default.</param>
+    /// <param name="playInline">
+    /// Run a message for a local queue inline, through <c>InvokeAsync()</c>: only inline retries run, there is no
+    /// dead-lettering or compensation, and the failure is thrown at the test
+    /// </param>
+    /// <returns>A new session holding what the window played and caused</returns>
+    Task<ITrackedSession> PlayScheduledMessagesAsync(TimeSpan advanceBy, TimeSpan? timeout = null, bool playInline = false)
+        => throw new NotSupportedException($"{GetType().FullName} cannot advance time");
+
+    /// <summary>
+    /// GH-5664. The session's virtual "now", which <see cref="PlayScheduledMessagesAsync(TimeSpan, TimeSpan?, bool)" /> moves
+    /// forward. It is carried to the session that call returns.
+    /// </summary>
+    TimeProvider Clock => TimeProvider.System;
 }
 
 #endregion
