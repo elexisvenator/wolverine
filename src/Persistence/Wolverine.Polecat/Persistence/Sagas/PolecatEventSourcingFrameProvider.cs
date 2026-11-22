@@ -45,12 +45,13 @@ internal partial class PolecatPersistenceFrameProvider : IEventSourcingFrameProv
     public Frame BuildFetchLatestFrame(Type aggregateType, Variable identity)
         => new Wolverine.Persistence.EventSourcing.Codegen.FetchLatestAggregateFrame(aggregateType, identity, typeof(IDocumentSession));
 
+    // The Polecat integration has no natural key read and no mapped keys
     public Frame? BuildFetchLatestByNaturalKeyFrame(Type aggregateType, Variable naturalKey)
-        => throw new NotImplementedException();
+        => null;
 
     public IReadOnlyList<Type> DetermineMappedNaturalKeyTypes(Type aggregateType, IChain chain,
         IServiceContainer container)
-        => throw new NotImplementedException();
+        => [];
 
     public Frame BuildLoadBoundaryFrame(Type modelType) => new LoadBoundaryFrame(modelType);
 
