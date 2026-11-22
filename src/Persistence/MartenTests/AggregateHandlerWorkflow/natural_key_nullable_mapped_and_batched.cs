@@ -393,7 +393,6 @@ public class NkProduct
 }
 
 #region sample_wolverine_marten_mapped_natural_key
-// An async read model of the product stream, reachable by the product's key
 public class NkProductStock
 {
     public Guid Id { get; set; }
@@ -464,7 +463,6 @@ public static class NkProductHandler
         => new(command.Quantity);
 
     #region sample_wolverine_marten_mapped_natural_key_handler
-    // Loaded through the product's lookup, at its current state, before the daemon has caught up
     public static NkProductRestocked Handle(RestockNkProductStock command, [WriteAggregate] NkProductStock stock)
     {
         LastStockSeen = stock.Stock;
